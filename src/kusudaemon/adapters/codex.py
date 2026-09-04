@@ -40,12 +40,6 @@ from pathlib import Path
 
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from .cli_agent import CommandAgentAdapter
-
-try:
-    tomllib = importlib.import_module("tomllib")
-except ModuleNotFoundError:  # pragma: no cover — py<3.11
-    tomllib = importlib.import_module("tomli")  # type: ignore[no-redef]
-
 from .trace_output import extract_visible_output
 
 _WORKER_SCRIPT = Path(__file__).with_name("_agent_worker.py")
@@ -178,9 +172,16 @@ def _normalize_base_url(base_url: str | None) -> str:
 def mcp_server_overrides(path: str) -> list[str]:
     """Read `[mcp_servers.*]` tables from a Codex TOML file as `-c` overrides."""
     try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return []
+    try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, getattr(tomllib, "TOMLDecodeError", Exception)):
         return []
     servers = data.get("mcp_servers") if isinstance(data, dict) else None
     if not isinstance(servers, dict):

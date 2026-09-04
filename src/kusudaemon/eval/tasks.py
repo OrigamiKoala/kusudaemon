@@ -152,6 +152,27 @@ def _meeting_notes() -> str:
     )
 
 
+def make_t2_large_corpus_task(n_units: int = 60) -> EvalTask:
+    return EvalTask(
+        task_id="t2-large-corpus" if n_units == 60 else f"t2-large-corpus-{n_units}",
+        goal=f"Write a summary primer across the {n_units} chapters in the corpus.",
+        expected_tier="T2",
+        estimate={
+            "files_touched": "few",
+            "artifacts": 5,
+            "answerable_without_exploration": True,
+            "questions": [],
+            "objections": [],
+        },
+        plan=_corpus_plan([(f"sec-{i}", f"Summarize section {i}") for i in range(5)]),
+        corpus="# Textbook\n\n" + ("Section text filler.\n\n" * 100),
+        spine_units=tuple(
+            (f"unit-{i:04d}", f"Section {i}", i, i, 2000)
+            for i in range(n_units)
+        ),
+    )
+
+
 def build_tasks() -> tuple[EvalTask, ...]:
     return (
         EvalTask(
@@ -237,24 +258,7 @@ def build_tasks() -> tuple[EvalTask, ...]:
                 ),
             },
         ),
-        EvalTask(
-            task_id="t2-large-corpus",
-            goal="Write a summary primer across the 60 chapters in the corpus.",
-            expected_tier="T2",
-            estimate={
-                "files_touched": "few",
-                "artifacts": 5,
-                "answerable_without_exploration": True,
-                "questions": [],
-                "objections": [],
-            },
-            plan=_corpus_plan([(f"sec-{i}", f"Summarize section {i}") for i in range(5)]),
-            corpus="# Textbook\n\n" + ("Section text filler.\n\n" * 100),
-            spine_units=tuple(
-                (f"unit-{i:02d}", f"Section {i}", i, i, 2000)
-                for i in range(60)
-            ),
-        ),
+        make_t2_large_corpus_task(60),
         EvalTask(
             task_id="t3-refactor",
             goal=T3_REFACTOR_GOAL,
@@ -268,6 +272,36 @@ def build_tasks() -> tuple[EvalTask, ...]:
             },
             plan=_workspace_plan(lambda i: f"Document the refactored layout of area {i}."),
             workspace=_t3_workspace_files(),
+        ),
+        EvalTask(
+            task_id="t2-misclassified",
+            goal="Tidy up the helper module across the workspace.",
+            expected_tier="T1",
+            estimate={
+                "files_touched": "few",
+                "artifacts": 1,
+                "answerable_without_exploration": True,
+                "questions": [],
+                "objections": [],
+            },
+            plan=_corpus_plan([("c1", "Tidy up part 1."), ("c2", "Tidy up part 2.")]),
+            corpus="# Workspace notes\n\nNotes on helpers.\n",
+            spine_units=(("unit-01", "Helper 1", 0, 0, 300), ("unit-02", "Helper 2", 1, 1, 300)),
+        ),
+        EvalTask(
+            task_id="t3-regenerate",
+            goal="Reorganize the core data pipeline modules and write the documentation.",
+            expected_tier="T2",
+            estimate={
+                "files_touched": "few",
+                "artifacts": 2,
+                "answerable_without_exploration": True,
+                "questions": [],
+                "objections": [],
+            },
+            plan=_corpus_plan([("c1", "Pipeline section 1."), ("c2", "Pipeline section 2.")]),
+            corpus="# Pipeline\n\nPipeline details.\n",
+            spine_units=(("unit-01", "Section 1", 0, 0, 400), ("unit-02", "Section 2", 1, 1, 400)),
         ),
     )
 

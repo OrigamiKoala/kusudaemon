@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 import time
@@ -248,9 +249,19 @@ def _require_existing_run(root: str, run_id: str) -> Path | None:
     return run_dir
 
 
+def _attach_cli_logger() -> None:
+    logger = logging.getLogger("kusudaemon.pipeline.run")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+
 def cmd_run(argv: argparse.Namespace) -> int:
     if argv.detach:
         return cmd_run_detach(argv)
+    _attach_cli_logger()
     from .run import run_from_args
 
     return run_from_args(_run_argv(argv, run_id=argv.run_id))
@@ -574,6 +585,7 @@ def cmd_resume(argv: argparse.Namespace) -> int:
     # would otherwise silently start a fresh, empty run (§D0b).
     if _require_existing_run(argv.runs_root, argv.run_id) is None:
         return 1
+    _attach_cli_logger()
     from .run import run_from_args
 
     return run_from_args(["--runs-root", argv.runs_root, "--run-id", argv.run_id])

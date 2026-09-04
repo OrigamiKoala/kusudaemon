@@ -101,10 +101,13 @@ class _InMemoryWriterAdapter:
         return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
 
 
-def _counting_writer_factory(run_dir: Path, counter: list[int]):
+def _counting_writer_factory(run_dir: Path, counter: list[int], task: EvalTask | None = None):
     def factory(node):
         counter[0] += 1
-        content = f"eval artifact body for {node.id}.\n\n{node.brief}\n"
+        if task is not None and getattr(task, "task_id", "") == "t2-misclassified" and node.id == "single":
+            content = "word " * 40000
+        else:
+            content = f"eval artifact body for {node.id}.\n\n{node.brief}\n"
         return _InMemoryWriterAdapter(node_artifact_path(run_dir, node.id), content)
 
     return factory
@@ -260,10 +263,35 @@ def _canned_responses(
     review phase's three windowed verdict calls. Resume: only the T2
     review re-run; T0/T1/T3 resume with no provider traffic at all."""
     if resume:
-        if task.expected_tier == "T2":
+        if task.expected_tier == "T2" and task.task_id != "t3-regenerate":
             return [PASS_VERDICT] * _T2_REVIEW_CALLS
         return []
-    responses: list[dict[str, Any]] = [task.estimate]
+    if task.task_id == "t2-misclassified":
+        responses: list[dict[str, Any]] = [task.estimate]
+        if plan_payload is not None:
+            responses.append(plan_payload)
+        responses.extend([PASS_VERDICT] * _T2_REVIEW_CALLS)
+        return responses
+    if task.task_id == "t3-regenerate":
+        regen_verdict = {
+            "items": [
+                {
+                    "id": "defect-1",
+                    "pass": False,
+                    "defect": "Contradiction requires full rewrite",
+                    "class": "regenerate",
+                    "node_ids": ["c1", "c2"],
+                    "check": "contract",
+                }
+            ],
+            "verdict": "fail",
+        }
+        responses = [task.estimate]
+        if plan_payload is not None:
+            responses.append(plan_payload)
+        responses.append(regen_verdict)
+        return responses
+    responses = [task.estimate]
     if plan_payload is not None:
         responses.append(plan_payload)
     if task.expected_tier == "T2":
@@ -284,7 +312,7 @@ async def _run_driver(
         run_dir,
         provider=provider,  # type: ignore[arg-type]
         options=_options(task, work_object),
-        writer_adapter_factory=_counting_writer_factory(run_dir, dispatches),
+        writer_adapter_factory=_counting_writer_factory(run_dir, dispatches, task=task),
         research_adapter_factory=_never_called_research_factory,
         probe_adapter_factory=_never_called_research_factory,
         poll_interval=0.02,

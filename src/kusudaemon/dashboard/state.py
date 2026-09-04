@@ -28,6 +28,7 @@ resolves the same file, so no surface owns a run.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -163,6 +164,7 @@ class _TraceCacheEntry:
     # trace 25042 bytes, new episode 28028 — the chat window showed the
     # old attempt's entries plus a garbage tail).
     inode: int | None = None
+    head_digest: str | None = None
 
 
 def _now() -> float:
@@ -1697,13 +1699,31 @@ class RunState:
         # new file happens to be LARGER than the old one — the old
         # size-only check stitched the new file's bytes from the old offset
         # onto the previous attempt's entries (§2026-08-13).
+        # Fast path: new entry, inode changed, or file shrank.
         if cached is None or cached.inode != inode or size < cached.offset:
             cached = _TraceCacheEntry()
             cached.inode = inode
+        elif cached.offset > 0 and cached.head_digest is not None:
+            # Correctness backstop (§0.4): verify head bytes digest to catch inode reuse.
+            try:
+                with path.open("rb") as fh:
+                    prefix = fh.read(min(cached.offset, 4096))
+                if hashlib.sha256(prefix).hexdigest() != cached.head_digest:
+                    cached = _TraceCacheEntry()
+                    cached.inode = inode
+            except OSError:
+                cached = _TraceCacheEntry()
+                cached.inode = inode
+
         if size > cached.offset:
+            is_initial = (cached.offset == 0)
             with path.open("rb") as fh:
                 fh.seek(cached.offset)
                 chunk = fh.read()
+                if is_initial:
+                    fh.seek(0)
+                    head_bytes = fh.read(min(size, 4096))
+                    cached.head_digest = hashlib.sha256(head_bytes).hexdigest()
             if chunk.endswith(b"\n"):
                 consumed = cached.offset + len(chunk)
                 new_raw = chunk.decode("utf-8", errors="replace")

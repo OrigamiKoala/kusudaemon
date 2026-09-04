@@ -829,6 +829,8 @@ class RecursiveDriver:
                 "status": status,
             }
         )
+        if os.environ.get("KUSUDAEMON_CRASH_AT") == phase:
+            os._exit(137)
         if self._check_cost_ceiling():
             return RunReport(status="halted", phase=phase, detail="halted on cost ceiling")
         return RunReport(status=status, phase=phase)

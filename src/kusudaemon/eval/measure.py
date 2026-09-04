@@ -275,6 +275,7 @@ def escalation_precision(measurements: list[dict[str, Any]]) -> dict[str, Any]:
         "precision": round(correct / total, 3),
         "escalated_runs": total - correct,
         "triggers": dict(sorted(triggers.items())),
+        "unwired_triggers": ["split_accepted"],
     }
 
 

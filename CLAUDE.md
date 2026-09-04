@@ -17,8 +17,10 @@ pip install -e ".[gptme]"
 
 Run the full test suite (stdlib `unittest`, no pytest, no network, no agent binary, no API key required):
 ```bash
-python3 -m unittest discover -s tests -p "test_*.py" -v
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
+
+The suite enforces zero pytest imports and a checked-in reachability floor (>=1100 tests in `test_suite_reachable.py`). Phase 1 Layer 1 mechanism benchmarks run hermetically under `tests/test_layer1_*.py` (crash matrix, context boundedness, gate soundness, reviewer precision with `KUSUDAEMON_LIVE_REVIEW=1`, planner coverage, and provider fault injection).
 
 Run a single test file (`tests/` has no `__init__.py`, so target it via `discover`, not a dotted module path):
 ```bash

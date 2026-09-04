@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import sys
+import tempfile
+import unittest
 from pathlib import Path
 from typing import Any
-import pytest
+from unittest import mock
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.adapters.base import AgentAdapter
 from kusudaemon.environment.base import Environment
@@ -94,46 +102,58 @@ class _LocalTestEnv(Environment):
         return 0, "", ""
 
 
-def test_keyless_run_end_to_end(tmp_path: Path, monkeypatch):
-    import asyncio
-    # Strip any OpenAI/external API keys from the environment to test keyless run
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+class KeylessRunTest(unittest.TestCase):
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.tmp_path = Path(td.name)
 
-    run_dir = tmp_path / "test_keyless"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    def test_keyless_run_end_to_end(self) -> None:
+        # Strip external API keys
+        env_patch = {k: None for k in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]}
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")}
+        patcher = mock.patch.dict(os.environ, clean_env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    adapter = _ScriptedCLIAdapter(run_dir)
-    env = _LocalTestEnv()
+        run_dir = self.tmp_path / "test_keyless"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    role_provider = BackendRoleProvider(
-        backend="opencode",
-        run_dir=run_dir,
-        env=env,
-        adapter_factory=lambda phase: adapter,
-        model="opencode/deepseek-v4-flash-free",
-    )
+        adapter = _ScriptedCLIAdapter(run_dir)
+        env = _LocalTestEnv()
 
-    options = RunOptions(
-        goal="Write a brief doc",
-        source_text="Sample input text for keyless run.",
-        backend="opencode",
-        tier_override="T1",
-        no_intake=True,
-    )
+        role_provider = BackendRoleProvider(
+            backend="opencode",
+            run_dir=run_dir,
+            env=env,
+            adapter_factory=lambda phase: adapter,
+            model="opencode/deepseek-v4-flash-free",
+        )
 
-    driver = RecursiveDriver(
-        run_dir,
-        provider=role_provider,
-        options=options,
-        env=env,
-        writer_adapter_factory=lambda node: adapter,
-    )
+        options = RunOptions(
+            goal="Write a brief doc",
+            source_text="Sample input text for keyless run.",
+            backend="opencode",
+            tier_override="T1",
+            no_intake=True,
+        )
 
-    report = asyncio.run(driver.run())
-    assert report.status == "done"
+        driver = RecursiveDriver(
+            run_dir,
+            provider=role_provider,
+            options=options,
+            env=env,
+            writer_adapter_factory=lambda node: adapter,
+        )
 
-    # Verify artifact output
-    output_path = run_dir / "out" / "single.md"
-    assert output_path.exists()
-    assert "Section 1" in output_path.read_text(encoding="utf-8")
+        report = asyncio.run(driver.run())
+        self.assertEqual(report.status, "done")
+
+        # Verify artifact output
+        output_path = run_dir / "out" / "single.md"
+        self.assertTrue(output_path.exists())
+        self.assertIn("Section 1", output_path.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

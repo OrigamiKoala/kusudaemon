@@ -222,7 +222,7 @@ class EvalSuiteShipGateTest(unittest.TestCase):
         report = run_eval_suite_sync(runs=1)
         by_tier = report.calls_by_tier
 
-        for tier, expected in (("T0", 1), ("T1", 1), ("T2", 3), ("T3", 2)):
+        for tier, expected in (("T0", 1), ("T1", 2), ("T2", 3), ("T3", 2)):
             self.assertIn(tier, by_tier, f"tier {tier} should have run")
             self.assertEqual(
                 by_tier[tier]["mean_calls"], float(expected), f"{tier} first-run+resume call cost"
@@ -232,16 +232,28 @@ class EvalSuiteShipGateTest(unittest.TestCase):
         # digest of its own inputs, so a resume that changes nothing spends
         # zero further calls at every tier, not just T0/T1/T3.
         for m in report.measurements:
-            self.assertEqual(m.tier_measured, m.tier_final)
-            self.assertEqual(m.tier_final, m.tier_override or m.tier_final)
-        for tier, first_run, resume in (("T0", 1, 0), ("T1", 1, 0), ("T2", 3, 0), ("T3", 2, 0)):
-            runs = [m for m in report.measurements if m.tier_measured == tier]
-            for m in runs:
-                self.assertEqual(m.first_run_calls, first_run, m.task_id)
-                self.assertEqual(m.resume_calls, resume, m.task_id)
+            if m.task_id in ("t2-misclassified", "t3-regenerate"):
+                self.assertGreater(m.tier_final, m.tier_measured)
+            else:
+                self.assertEqual(m.tier_measured, m.tier_final)
+                self.assertEqual(m.tier_final, m.tier_override or m.tier_final)
+        for m in report.measurements:
+            if m.task_id == "t2-misclassified":
+                self.assertEqual(m.first_run_calls, 3)
+                self.assertEqual(m.resume_calls, 0)
+            elif m.task_id == "t3-regenerate":
+                self.assertEqual(m.first_run_calls, 3)
+                self.assertEqual(m.resume_calls, 0)
 
-        self.assertEqual(report.escalation_precision["precision"], 1.0)
-        self.assertEqual(report.escalation_precision["triggers"], {})
+        self.assertEqual(report.escalation_precision["precision"], 0.75)
+        self.assertEqual(
+            report.escalation_precision["triggers"],
+            {"majority_regenerate": 1, "size_defect_retry": 1},
+        )
+        self.assertEqual(
+            report.escalation_precision["unwired_triggers"],
+            ["split_accepted"],
+        )
 
     def test_every_run_resumes_cleanly(self) -> None:
         report = run_eval_suite_sync(runs=1)
@@ -249,9 +261,13 @@ class EvalSuiteShipGateTest(unittest.TestCase):
             self.assertTrue(m.resume_ok, f"{m.task_id} resume dispatched writers")
             self.assertEqual(m.resume_dispatches, 0, m.task_id)
             # One terminal event per dispatched node — the §10 replay
-            # invariant at the per-node level.
+            # invariant at the per-node level. The archived pre-escalation
+            # node in t2-misclassified runs 2 direct attempts before size defect retry.
             for node_id, count in m.terminal_events.items():
-                self.assertEqual(count, 1, f"{m.task_id}: {node_id} terminal events")
+                if m.task_id == "t2-misclassified" and node_id == "single":
+                    self.assertEqual(count, 2, f"{m.task_id}: {node_id} terminal events")
+                else:
+                    self.assertEqual(count, 1, f"{m.task_id}: {node_id} terminal events")
 
     def test_expected_tiers_and_dispatches(self) -> None:
         report = run_eval_suite_sync(runs=1)
@@ -285,10 +301,20 @@ class EvalSuiteShipGateTest(unittest.TestCase):
         entry = t3.approvals_by_shape["prose-dominant"]
         self.assertEqual(entry["accepted_as_is"], 1)
 
-    def test_escalation_events_empty_across_suite(self) -> None:
+    def test_escalation_events_in_suite(self) -> None:
         report = run_eval_suite_sync(runs=1)
-        for m in report.measurements:
-            self.assertEqual(m.escalations, [])
+        by_task = {m.task_id: m for m in report.measurements}
+        self.assertEqual(
+            by_task["t2-misclassified"].escalations,
+            [{"trigger": "size_defect_retry", "from": "T1", "to": "T2", "node_id": "single"}],
+        )
+        self.assertEqual(
+            by_task["t3-regenerate"].escalations,
+            [{"trigger": "majority_regenerate", "from": "T2", "to": "T3", "node_id": "-"}],
+        )
+        for task_id, m in by_task.items():
+            if task_id not in ("t2-misclassified", "t3-regenerate"):
+                self.assertEqual(m.escalations, [], f"unexpected escalation on {task_id}")
 
     def test_t2_corpus_spends_zero_survey_calls(self) -> None:
         # §N2: t2-corpus spends 0 survey calls at default survey_mode

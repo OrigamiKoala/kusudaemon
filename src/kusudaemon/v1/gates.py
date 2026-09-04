@@ -123,11 +123,11 @@ def _evaluate_one(gate: str, text: str) -> GateResult:
 
 
 def _gate_exists(gate: str, arg: str, text: str) -> GateResult:
-    # Always true here: by the time evaluate_gates runs, the artifact has
-    # already been read from disk into `text` (round_loop reads "" when the
-    # file is missing, which `nonempty` catches). `exists` documents intent
-    # on the node without duplicating that file check.
-    return GateResult(gate=gate, passed=True)
+    if arg:
+        passed = Path(arg).exists()
+        return GateResult(gate=gate, passed=passed, detail="" if passed else f"file {arg!r} does not exist")
+    passed = text is not None
+    return GateResult(gate=gate, passed=passed, detail="" if passed else "artifact does not exist")
 
 
 def _gate_nonempty(gate: str, arg: str, text: str) -> GateResult:
@@ -306,7 +306,7 @@ def _gate_latex_balanced(gate: str, arg: str, text: str) -> GateResult:
         closes = text.count(close_delim)
         if opens != closes:
             details.append(f"{open_delim}/{close_delim} unbalanced ({opens} vs {closes})")
-    # \begin{X} ... \end{X} pairs.
+    # \begin{X} ... \end{X} pairs and proper nesting.
     begin_counts: dict[str, int] = {}
     end_counts: dict[str, int] = {}
     for env in re.findall(r"\\begin\{([^}]+)\}", text):
@@ -319,6 +319,24 @@ def _gate_latex_balanced(gate: str, arg: str, text: str) -> GateResult:
                 f"\\begin{{{env}}}={begin_counts.get(env, 0)} vs "
                 f"\\end{{{env}}}={end_counts.get(env, 0)}"
             )
+
+    env_matches = re.finditer(r"\\(begin|end)\{([^}]+)\}", text)
+    env_stack: list[str] = []
+    nested_error = False
+    for m in env_matches:
+        kind, env = m.group(1), m.group(2)
+        if kind == "begin":
+            env_stack.append(env)
+        elif kind == "end":
+            if not env_stack or env_stack[-1] != env:
+                expected = env_stack[-1] if env_stack else "none"
+                details.append(f"misnested \\end{{{env}}} (expected \\end{{{expected}}})")
+                nested_error = True
+                break
+            env_stack.pop()
+    if not nested_error and env_stack and not any("unclosed" in d for d in details):
+        details.append(f"unclosed environments: {', '.join(env_stack)}")
+
     if details:
         return GateResult(gate=gate, passed=False, detail="; ".join(details))
     return GateResult(gate=gate, passed=True)
@@ -350,7 +368,12 @@ def _gate_refs_resolve(gate: str, arg: str, text: str) -> GateResult:
     anchors = {
         re.sub(r"^#+\s*", "", line).strip().lower() for line in headings
     }
-    anchors |= {match.lower().strip() for match in re.findall(r"\[#?([^\]]+)\]", text)}
+    raw_brackets = re.findall(r"\[#?([^\]]+)\]", text)
+    anchors |= {
+        match.lower().strip()
+        for match in raw_brackets
+        if not match.lower().startswith(("ref:", "ref "))
+    }
     unresolved: list[str] = []
     for ref_anchor in refs:
         anchor = ref_anchor.lower().strip()

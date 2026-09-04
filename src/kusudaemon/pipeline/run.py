@@ -12,11 +12,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from ..environment.base import Environment
 from ..roles.factory import make_role_provider
@@ -200,7 +204,13 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
     # a relative runs_root anchored to whatever cwd this process happened
     # to be launched from.
     run_dir = resolve_runs_root(runs_root_arg) / run_id
-    print(f"run dir: {run_dir}")
+    if os.environ.get("KUSUDAEMON_TEST_VERBOSE"):
+        if not logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setLevel(logging.INFO)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+    logger.info("run dir: %s", run_dir)
 
     work_object = None
     if args.workspace:
@@ -270,11 +280,16 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
         env=env,
     )
     report = asyncio.run(driver.run())
-    print(f"pipeline: status={report.status} phase={report.phase} tree={report.tree_counts}")
+    logger.info("pipeline: status=%s phase=%s tree=%s", report.status, report.phase, report.tree_counts)
     if report.detail:
-        print(f"detail: {report.detail}")
+        logger.info("detail: %s", report.detail)
     return 0 if report.status in ("done", "halted") else 1
 
 
 if __name__ == "__main__":
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
     raise SystemExit(run_from_args())

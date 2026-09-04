@@ -11,11 +11,13 @@ any external network."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.client import HTTPConnection
@@ -552,23 +554,32 @@ class ThinkingCursorTest(_ServerTestCase):
         # bytes from that offset onward were stitched on — the chat window
         # showed the previous attempt's history plus a garbage tail.
         # Observed live: old trace 25042 bytes, new episode 28028 bytes.
-        trace = self.run_dir / "scratch" / "1" / "trace.jsonl"
-        old_size = trace.stat().st_size
-        _, first = self._get("/api/node/1/thinking?since=0")
-        self.assertEqual(first["total"], 5)
-        # A fresh episode: the file is unlinked and recreated (new inode),
-        # and this time it ends up LARGER than the old one.
-        trace.unlink()
-        new_lines = [
-            json.dumps({"type": "message", "role": "assistant", "content": f"new turn {i} with substantially longer content than the old turns"})
-            for i in range(4)
-        ]
-        trace.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        self.assertGreater(trace.stat().st_size, old_size, "test requires the new trace to be larger than the old one")
-        _, second = self._get("/api/node/1/thinking?since=0")
-        self.assertEqual(second["total"], 4)
-        texts = [e["text"] for e in second["entries"]]
-        self.assertTrue(all(t.startswith("new turn") for t in texts), f"stitched onto the old parse: {texts}")
+        # Force inode reuse to exercise the bug and digest-verification backstop
+        # consistently across platforms.
+        real_stat = Path.stat
+
+        def _fixed_ino(p_self, *a, **kw):
+            st = real_stat(p_self, *a, **kw)
+            return os.stat_result(tuple(st)[:1] + (999,) + tuple(st)[2:])
+
+        with mock.patch.object(Path, "stat", _fixed_ino):
+            trace = self.run_dir / "scratch" / "1" / "trace.jsonl"
+            old_size = trace.stat().st_size
+            _, first = self._get("/api/node/1/thinking?since=0")
+            self.assertEqual(first["total"], 5)
+            # A fresh episode: the file is unlinked and recreated (same mocked inode),
+            # and this time it ends up LARGER than the old one.
+            trace.unlink()
+            new_lines = [
+                json.dumps({"type": "message", "role": "assistant", "content": f"new turn {i} with substantially longer content than the old turns"})
+                for i in range(4)
+            ]
+            trace.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            self.assertGreater(trace.stat().st_size, old_size, "test requires the new trace to be larger than the old one")
+            _, second = self._get("/api/node/1/thinking?since=0")
+            self.assertEqual(second["total"], 4)
+            texts = [e["text"] for e in second["entries"]]
+            self.assertTrue(all(t.startswith("new turn") for t in texts), f"stitched onto the old parse: {texts}")
 
     def test_node_thinking_includes_timestamp_and_token_fields(self) -> None:
         from kusudaemon.v0.run_dir import node_trace_path

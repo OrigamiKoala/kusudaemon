@@ -1,0 +1,11 @@
+{
+  "precision": 0.80,
+  "recall": 0.80,
+  "per_class_recall": {
+    "contract_rule_violated": 0.75,
+    "duplicate_content": 0.75,
+    "coverage_gap": 0.75,
+    "register_drift": 0.75
+  },
+  "mean_tokens_per_call": 4500.0
+}
