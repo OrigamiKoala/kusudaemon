@@ -42,7 +42,8 @@ kusudaemon resume <run-id>                                   # resume after inte
 kusudaemon bench --workspace ./ --goal "..." --backend opencode --arm C --json # benchmark task (TESTING.md §2)
 ```
 
-External benchmarks (HarnessBench, long-form generation, Terminal-Bench) have a
+External benchmarks (HarnessBench all 8 classes, LongGenBench, WritingBench,
+HelloBench, Terminal-Bench via Harbor, GAIA, SWE-bench Verified) have a
 step-by-step setup and run guide in `BENCHMARKING.md`; `TESTING.md` holds the
 experimental design those runs implement.
 

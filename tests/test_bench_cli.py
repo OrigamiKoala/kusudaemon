@@ -306,5 +306,144 @@ class TestBenchCLI(unittest.TestCase):
         self.assertIn("Connection refused", data["halt_reason"])
 
 
+    def _run_arm_a(self, extra_argv: list[str]) -> list[str]:
+        """Run arm A with a fake runner and return the command it built."""
+        executed: list[list[str]] = []
+
+        def fake_runner(cmd, cwd, capture_output, text):
+            executed.append(cmd)
+            return DummyCompletedProcess(returncode=0)
+
+        parser = build_pipeline_parser()
+        args = parser.parse_args([
+            "bench",
+            "--workspace", str(self.ws_dir),
+            "--goal", "Round goal",
+            "--arm", "A",
+            "--output", str(Path(self.tmp_dir) / "arm_a_round.json"),
+            "--json",
+        ] + extra_argv)
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdout", buf):
+            cmd_bench(args, subprocess_runner=fake_runner)
+        return executed[0]
+
+    def test_arm_a_first_round_starts_a_fresh_session(self) -> None:
+        cmd = self._run_arm_a(["--backend", "opencode", "--model", "m", "--round", "1"])
+        self.assertNotIn("--continue", cmd)
+        self.assertNotIn("--session", cmd)
+
+    def test_arm_a_later_round_continues_the_session(self) -> None:
+        """Multi-round benchmark tasks require the bare CLI to carry its own
+        conversation across rounds -- HarnessBench 007-session-memory grades
+        exactly that. Without this the arm can only pass by being handed the
+        answer in its prompt."""
+        cmd = self._run_arm_a([
+            "--backend", "opencode", "--model", "m",
+            "--session-id", "sess-abc", "--round", "2",
+        ])
+        self.assertIn("--continue", cmd)
+
+    def test_arm_a_explicit_session_id_flag_is_opt_in(self) -> None:
+        with unittest.mock.patch.dict(
+            "os.environ", {"KUSUDAEMON_BENCH_SESSION_FLAG": "session"}
+        ):
+            cmd = self._run_arm_a([
+                "--backend", "opencode", "--model", "m",
+                "--session-id", "sess-abc", "--round", "2",
+            ])
+        self.assertIn("--session", cmd)
+        self.assertIn("sess-abc", cmd)
+        self.assertNotIn("--continue", cmd)
+
+    def test_arm_a_record_carries_session_and_round(self) -> None:
+        executed: list[list[str]] = []
+
+        def fake_runner(cmd, cwd, capture_output, text):
+            executed.append(cmd)
+            return DummyCompletedProcess(returncode=0)
+
+        output_file = Path(self.tmp_dir) / "arm_a_meta.json"
+        parser = build_pipeline_parser()
+        args = parser.parse_args([
+            "bench",
+            "--workspace", str(self.ws_dir),
+            "--goal", "g",
+            "--arm", "A", "--backend", "opencode", "--model", "m",
+            "--session-id", "sess-xyz", "--round", "3",
+            "--output", str(output_file), "--json",
+        ])
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdout", buf):
+            cmd_bench(args, subprocess_runner=fake_runner)
+        data = json.loads(output_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["session_id"], "sess-xyz")
+        self.assertEqual(data["round"], 3)
+
+
+    def _approval_driver_factory(self, timeout: float):
+        """A driver that posts a real approval and waits for it, exactly as the
+        intake/pilot/document-review phases do."""
+        from kusudaemon.pipeline import approvals as approval_store
+
+        class ApprovalDriver:
+            def __init__(self, run_dir, provider=None, options=None, env=None):
+                self.run_dir = run_dir
+
+            async def run(self):
+                record = approval_store.Approval.create(
+                    "intake_questions",
+                    title="Intake round 1",
+                    message="questions",
+                    input_label="",
+                    context={"round": 1},
+                    questions=[{"id": "q1", "text": "scope?", "default_assumption": "all"}],
+                )
+                approval_store.append(self.run_dir, record)
+                approval_store.wait_for_resolution(
+                    self.run_dir, record.approval_id, poll_interval=0.02, timeout=timeout
+                )
+                return RunReport(status="done", phase="assemble", detail="",
+                                 tree_counts={"done": 1})
+
+        return lambda run_dir, provider=None, options=None, env=None: ApprovalDriver(run_dir)
+
+    def _bench_with_approval_driver(self, timeout: float, extra: list[str]) -> dict:
+        output_file = Path(self.tmp_dir) / f"approval_{'-'.join(extra) or 'default'}.json"
+        parser = build_pipeline_parser()
+        args = parser.parse_args([
+            "bench",
+            "--workspace", str(self.ws_dir),
+            "--goal", "Solve task",
+            "--arm", "C", "--backend", "gptme",
+            "--runs-root", str(self.runs_root),
+            "--output", str(output_file), "--json",
+        ] + extra)
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdout", buf):
+            cmd_bench(args, driver_factory=self._approval_driver_factory(timeout))
+        return json.loads(output_file.read_text(encoding="utf-8"))
+
+    def test_unattended_bench_resolves_approvals_instead_of_hanging(self) -> None:
+        """A benchmark run has no operator, and the driver's approval wait has
+        no timeout by design. Three phases block on one (intake T1+, pilot T3,
+        document-review triage T2+), so without a resolver the run hangs until
+        the benchmark's own wall-clock cap kills it -- no graded result and no
+        halt reason. Every hermetic driver test already supplies this Approver;
+        the headless bench path must too."""
+        data = self._bench_with_approval_driver(10.0, [])
+        self.assertTrue(data["resolved"])
+        self.assertIsNone(data["halt_reason"])
+        self.assertFalse(data["attended"])
+
+    def test_attended_bench_leaves_approvals_for_a_human(self) -> None:
+        """Counterpart proving the test above is not vacuous: with --attended
+        nobody answers, and the wait expires."""
+        data = self._bench_with_approval_driver(0.5, ["--attended"])
+        self.assertFalse(data["resolved"])
+        self.assertIsNotNone(data["halt_reason"])
+        self.assertTrue(data["attended"])
+
+
 if __name__ == "__main__":
     unittest.main()

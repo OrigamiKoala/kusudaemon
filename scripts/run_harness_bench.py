@@ -250,8 +250,8 @@ def run_one(
     seed: int,
     backend: str,
     model: str,
-    budget_tokens: int,
-    max_rounds: int,
+    budget_tokens: int | None,
+    max_rounds: int | None,
     tier: str,
     extra_env: dict[str, str],
     verbose: bool,
@@ -263,8 +263,9 @@ def run_one(
         "KUSU_BENCH_BACKEND": backend,
         "KUSU_BENCH_MODEL": model,
         "KUSU_BENCH_SEED": str(seed),
-        "KUSU_BENCH_BUDGET_TOKENS": str(budget_tokens),
-        "KUSU_BENCH_MAX_ROUNDS": str(max_rounds),
+        # Empty means "no ceiling"; the wrapper omits the flag entirely.
+        "KUSU_BENCH_BUDGET_TOKENS": "" if budget_tokens is None else str(budget_tokens),
+        "KUSU_BENCH_MAX_ROUNDS": "" if max_rounds is None else str(max_rounds),
         "KUSU_BENCH_TIER": tier,
         "KUSU_BENCH_NAME": "harness-bench",
         # kusudaemon resolves provider.json/.env from cwd; the wrapper runs
@@ -433,9 +434,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default=DEFAULT_BACKEND)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--tier", default="auto")
-    p.add_argument("--budget-tokens", type=int, default=120000,
-                   help="Per-task token ceiling (TESTING.md §4).")
-    p.add_argument("--max-rounds", type=int, default=60)
+    p.add_argument("--budget-tokens", type=int, default=None,
+                   help="Optional per-task token ceiling. Unset by default: "
+                        "HarnessBench imposes no token budget, and kusudaemon "
+                        "treats an unset ceiling as unbounded. Runs stay bounded "
+                        "by --max-rounds and --harness-timeout-sec. Set this only "
+                        "when you want a graceful, recorded budget halt.")
+    p.add_argument("--max-rounds", type=int, default=None,
+                   help="Optional round ceiling. Unset by default, so the "
+                        "kusudaemon CLI's own default (100) applies.")
     p.add_argument("--harness-timeout-sec", type=int, default=2400,
                    help="Per-task wall-clock cap written into harness.yaml.")
     p.add_argument("--proxy", action="store_true",
@@ -511,12 +518,22 @@ def main() -> int:
         print(f"python:     {resolve_bench_python(bench_dir, args.bench_python)}")
         print(f"backend:    {args.backend}  model: {args.model}")
         print(f"arms:       {arms}   seeds: {args.seeds}")
-        print(f"budget:     {args.budget_tokens} tokens/task, {args.max_rounds} rounds")
+        budget_txt = ("no token ceiling" if args.budget_tokens is None
+                      else f"{args.budget_tokens} tokens/task")
+        rounds_txt = ("default rounds" if args.max_rounds is None
+                      else f"{args.max_rounds} rounds")
+        print(f"budget:     {budget_txt}, {rounds_txt}, "
+              f"{args.harness_timeout_sec}s wall-clock cap/task")
         print(f"tasks ({len(tasks)}):")
         for t in tasks:
             print(f"  {t['task_id']:<42} {t['class']}")
-        print(f"\n{total} runs total "
-              f"(worst case {total * args.budget_tokens / 1e6:.1f}M tokens)")
+        if args.budget_tokens is None:
+            print(f"\n{total} runs total -- spend is not capped. Each run is "
+                  f"bounded only by the round limit and the "
+                  f"{args.harness_timeout_sec}s per-task wall-clock cap.")
+        else:
+            print(f"\n{total} runs total "
+                  f"(worst case {total * args.budget_tokens / 1e6:.1f}M tokens)")
         return 0
 
     bench_python = resolve_bench_python(bench_dir, args.bench_python)

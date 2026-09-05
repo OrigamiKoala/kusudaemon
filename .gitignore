@@ -48,3 +48,5 @@ LongHorizon-Harness-main
 # External benchmark checkouts and their outputs (BENCHMARKING.md)
 /benchmarks/
 /bench_results/
+
+READING-LIST.md

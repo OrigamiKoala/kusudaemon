@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -274,11 +275,34 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--task-id", default=None, help="Task ID.")
     bench_parser.add_argument("--seed", type=int, default=1, help="Run seed (default: 1).")
     bench_parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Stable session id across a benchmark task's rounds. Multi-round "
+             "benchmarks (HarnessBench) invoke the agent once per round and "
+             "expect it to carry conversation state; this is that thread's id.",
+    )
+    bench_parser.add_argument(
+        "--round",
+        type=int,
+        default=1,
+        help="1-based round index within a multi-round benchmark task. Rounds "
+             "after the first continue the prior session instead of starting a "
+             "new one.",
+    )
+    bench_parser.add_argument(
         "--json", action="store_true", help="Output machine-readable JSON summary."
     )
     bench_parser.add_argument("--output", default=None, help="File to write JSON summary to.")
     bench_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
     bench_parser.add_argument("--run-id", default=None)
+    bench_parser.add_argument(
+        "--attended",
+        action="store_true",
+        help="Leave approvals for a human to answer via the dashboard. Off by "
+             "default: a benchmark run has no operator, and the driver's "
+             "approval wait has no timeout, so an unanswered intake question "
+             "would block until the benchmark's own wall-clock cap killed it.",
+    )
     bench_parser.add_argument("--max-rounds", type=int, default=100)
     bench_parser.add_argument("--max-attempts", type=int, default=3)
     return parser
@@ -824,24 +848,50 @@ def cmd_bench(
 
     runner = subprocess_runner or subprocess.run
 
+    session_id = getattr(argv, "session_id", None)
+    round_index = int(getattr(argv, "round", 1) or 1)
+    resuming = round_index > 1
+
     if arm == "A":
+        # Multi-round benchmark tasks invoke the agent once per round and expect
+        # it to carry its own conversation across them -- some tasks (e.g.
+        # HarnessBench 007-session-memory) exist purely to test that. So rounds
+        # after the first must continue the prior session rather than start a
+        # fresh one, using each CLI's own resume mechanism.
         cmd: list[str]
         if backend == "opencode":
             cmd = ["opencode", "run"]
             if model:
                 cmd.extend(["--model", model])
+            if resuming:
+                # --session takes an id but is undocumented as to whether it
+                # creates one; --continue resumes the last session for this
+                # directory, and each task has its own workspace, so it is the
+                # safe default. KUSUDAEMON_BENCH_SESSION_FLAG=session opts into
+                # the explicit-id form once verified against your CLI version.
+                if session_id and os.getenv("KUSUDAEMON_BENCH_SESSION_FLAG") == "session":
+                    cmd.extend(["--session", session_id])
+                else:
+                    cmd.append("--continue")
             cmd.extend(["--auto", goal])
         elif backend == "gptme":
             cmd = ["gptme", "--non-interactive"]
             if model:
                 cmd.extend(["--model", model])
+            if resuming:
+                cmd.append("--resume")
             cmd.append(goal)
         elif backend == "claude":
             cmd = ["claude", "-p", goal]
             if model:
                 cmd.extend(["--model", model])
+            if resuming:
+                cmd.append("--continue")
         elif backend == "codex":
             cmd = ["codex", "exec"]
+            if resuming:
+                cmd.append("resume")
+                cmd.append("--last")
             if model:
                 cmd.extend(["--model", model])
             cmd.append(goal)
@@ -876,6 +926,8 @@ def cmd_bench(
             "task_id": task_id,
             "arm": "A",
             "seed": seed,
+            "session_id": session_id,
+            "round": round_index,
             "model": model,
             "backend": backend,
             "score": 1.0 if resolved else 0.0,
@@ -898,6 +950,7 @@ def cmd_bench(
         from ..v0.cost import CostLedger
         from ..v0.run_dir import cost_path
         from ..eval.measure import escalation_events
+        from .approvals import Approver
         from .run_dir import halt_path, tier_path
 
         work_obj = measure_workspace(str(ws_path))
@@ -936,11 +989,31 @@ def cmd_bench(
         else:
             driver = RecursiveDriver(run_dir, provider=provider, options=options, env=env)
 
+        # A benchmark run is unattended by construction, and three phases block
+        # on an operator approval that `wait_for_resolution` waits on forever by
+        # design ("the operator is the one control surface that must never be
+        # rushed"): intake questions (T1+), pilot artifact sign-off (T3), and
+        # document-review triage (T2+). With no surface attached, the first of
+        # those hangs until the benchmark's wall-clock cap kills the process --
+        # no graded result, no halt reason, 40 minutes gone. Every hermetic test
+        # that drives the pipeline end to end already wraps it in this same
+        # Approver; only the headless production paths were missing it.
+        #
+        # Resolving blank is the documented silent-operator path at all three
+        # sites: intake ends after round 1 and records its default assumptions
+        # into spec.md, pilot approves the artifact as-is, document review
+        # proceeds with repairs. Nothing is answered *for* the model -- the
+        # assumptions are written down and auditable in the run directory.
+        attended = bool(getattr(argv, "attended", False))
         t0 = time.time()
         report = None
         halt_reason = None
         try:
-            report = asyncio.run(driver.run())
+            if attended:
+                report = asyncio.run(driver.run())
+            else:
+                with Approver(run_dir):
+                    report = asyncio.run(driver.run())
         except Exception as exc:
             halt_reason = str(exc)
         t1 = time.time()
@@ -1009,6 +1082,7 @@ def cmd_bench(
             "wall_clock_s": wall_clock_s,
             "halt_reason": halt_reason,
             "commit": commit,
+            "attended": attended,
         }
 
     json_str = json.dumps(record, indent=2)
