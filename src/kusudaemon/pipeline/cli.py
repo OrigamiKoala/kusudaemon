@@ -21,6 +21,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any, Callable
 
 from ..environment.local import LocalEnvironment
 from ..v0.events import EventLog
@@ -133,6 +134,12 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable review agents across all leaves to save tokens (gates still run).",
     )
+    run_parser.add_argument(
+        "--budget-tokens",
+        type=int,
+        default=None,
+        help="Token budget ceiling for the run.",
+    )
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
 
     resume_parser = sub.add_parser("resume", help="Resume a run after a halt or crash.")
@@ -228,6 +235,52 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     backend_parser.add_argument("run_id")
     backend_parser.add_argument("backend", choices=("gptme", "claude", "codex", "opencode", "antigravity", "agy", "none", "default"))
     backend_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    bench_parser = sub.add_parser(
+        "bench",
+        help="Run a task in a benchmark environment (TESTING.md §2: Shape A integration).",
+    )
+    bench_parser.add_argument("--goal-file", default=None, help="File containing task goal/instruction.")
+    bench_parser.add_argument("--goal", default="", help="Task goal/instruction string.")
+    bench_parser.add_argument(
+        "--workspace", required=True, help="Path to task workspace/container directory."
+    )
+    bench_parser.add_argument(
+        "--backend",
+        default="opencode",
+        choices=("opencode", "gptme", "claude", "codex", "antigravity", "agy"),
+        help="Backend to use (default: opencode).",
+    )
+    bench_parser.add_argument("--model", default=None, help="Model override.")
+    bench_parser.add_argument("--provider", default=None, help="Named provider.")
+    bench_parser.add_argument(
+        "--tier",
+        default="auto",
+        choices=("auto", "T0", "T1", "T2", "T3"),
+        help="Tier floor or 'auto' (default: auto).",
+    )
+    bench_parser.add_argument(
+        "--budget-tokens", type=int, default=None, help="Token budget ceiling."
+    )
+    bench_parser.add_argument(
+        "--arm",
+        default="C",
+        choices=("A", "B", "C", "a", "b", "c"),
+        help="Benchmark arm: A (bare backend CLI), B (decomposition only), C (full pipeline, default).",
+    )
+    bench_parser.add_argument(
+        "--benchmark", default="benchmark", help="Benchmark name (e.g. harness-bench)."
+    )
+    bench_parser.add_argument("--task-id", default=None, help="Task ID.")
+    bench_parser.add_argument("--seed", type=int, default=1, help="Run seed (default: 1).")
+    bench_parser.add_argument(
+        "--json", action="store_true", help="Output machine-readable JSON summary."
+    )
+    bench_parser.add_argument("--output", default=None, help="File to write JSON summary to.")
+    bench_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+    bench_parser.add_argument("--run-id", default=None)
+    bench_parser.add_argument("--max-rounds", type=int, default=100)
+    bench_parser.add_argument("--max-attempts", type=int, default=3)
     return parser
 
 
@@ -345,6 +398,8 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         command += ["--no-intake"]
     if getattr(argv, "disable_review", False):
         command += ["--disable-review"]
+    if getattr(argv, "budget_tokens", None) is not None:
+        command += ["--budget-tokens", str(argv.budget_tokens)]
     for flag, value in (
         ("--model", argv.model),
         ("--provider", getattr(argv, "provider", None)),
@@ -702,9 +757,290 @@ def cmd_backend(argv: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench(
+    argv: argparse.Namespace,
+    *,
+    driver_factory: Any = None,
+    subprocess_runner: Any = None,
+) -> int:
+    """TESTING.md §2 Shape A benchmark integration entry point.
+
+    Runs a task under a benchmark harness across three arms:
+      - Arm A: bare backend CLI alone (opencode run, etc.)
+      - Arm B: kusudaemon with review agents disabled (--disable-review)
+      - Arm C: full kusudaemon pipeline
+
+    Exits non-zero on halt/failure and emits a machine-readable summary
+    per TESTING.md §5.
+    """
+    goal = ""
+    if getattr(argv, "goal_file", None):
+        gf = Path(argv.goal_file).expanduser().resolve()
+        if not gf.is_file():
+            print(f"goal file not found: {gf}", file=sys.stderr)
+            return 2
+        goal = gf.read_text(encoding="utf-8").strip()
+    elif getattr(argv, "goal", ""):
+        goal = str(argv.goal).strip()
+
+    if not goal:
+        print("either --goal-file or --goal is required for bench", file=sys.stderr)
+        return 2
+
+    ws_path = Path(argv.workspace).expanduser().resolve()
+    if not ws_path.is_dir():
+        print(f"workspace directory not found: {ws_path}", file=sys.stderr)
+        return 2
+
+    task_id = getattr(argv, "task_id", None) or ws_path.name
+    benchmark = getattr(argv, "benchmark", None) or "benchmark"
+    arm = str(getattr(argv, "arm", "C") or "C").upper()
+    seed = int(getattr(argv, "seed", 1))
+    backend = str(getattr(argv, "backend", "opencode") or "opencode").lower()
+    runs_root_arg = getattr(argv, "runs_root", None) or _RUNS_ROOT_DEFAULT
+
+    model = getattr(argv, "model", None)
+    if not model:
+        try:
+            from ..provider_config import read_backend_config
+            b_cfg = read_backend_config(backend)
+            model = b_cfg.model
+        except Exception:
+            model = None
+    if not model and backend == "opencode":
+        model = "opencode/nemotron-3.5-lightning-free"
+
+    commit = "unknown"
+    try:
+        repo_dir = Path(__file__).resolve().parents[3]
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        pass
+
+    runner = subprocess_runner or subprocess.run
+
+    if arm == "A":
+        cmd: list[str]
+        if backend == "opencode":
+            cmd = ["opencode", "run"]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.extend(["--auto", goal])
+        elif backend == "gptme":
+            cmd = ["gptme", "--non-interactive"]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.append(goal)
+        elif backend == "claude":
+            cmd = ["claude", "-p", goal]
+            if model:
+                cmd.extend(["--model", model])
+        elif backend == "codex":
+            cmd = ["codex", "exec"]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.append(goal)
+        elif backend in ("antigravity", "agy"):
+            cmd = ["agy", "run"]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.append(goal)
+        else:
+            cmd = [backend, goal]
+
+        t0 = time.time()
+        try:
+            res = runner(
+                cmd,
+                cwd=str(ws_path),
+                capture_output=True,
+                text=True,
+            )
+            exit_code = res.returncode
+            halt_reason = None if exit_code == 0 else f"bare process exited with code {exit_code}: {res.stderr[:200]}"
+            resolved = (exit_code == 0)
+        except Exception as exc:
+            exit_code = 1
+            halt_reason = str(exc)
+            resolved = False
+        t1 = time.time()
+        wall_clock_s = round(t1 - t0, 3)
+
+        record = {
+            "benchmark": benchmark,
+            "task_id": task_id,
+            "arm": "A",
+            "seed": seed,
+            "model": model,
+            "backend": backend,
+            "score": 1.0 if resolved else 0.0,
+            "resolved": resolved,
+            "tier_measured": None,
+            "tier_final": None,
+            "escalations": [],
+            "calls_by_role": {"bare": 1},
+            "tokens_by_role": {},
+            "wall_clock_s": wall_clock_s,
+            "halt_reason": halt_reason,
+            "commit": commit,
+        }
+    else:
+        from ..v6.work_object import measure_workspace
+        from ..pipeline.driver import RunOptions, RecursiveDriver
+        from ..roles.factory import make_role_provider
+        from ..v1.provider import OpenAICompatibleProvider
+        from .run import _log_rate_limit_backoff_for
+        from ..v0.cost import CostLedger
+        from ..v0.run_dir import cost_path
+        from ..eval.measure import escalation_events
+        from .run_dir import halt_path, tier_path
+
+        work_obj = measure_workspace(str(ws_path))
+        run_id = getattr(argv, "run_id", None) or f"bench_{benchmark}_{task_id}_arm{arm}_s{seed}_{int(time.time())}"
+        run_dir = resolve_runs_root(runs_root_arg) / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_tier = getattr(argv, "tier", "auto")
+        tier_override = None if (raw_tier == "auto" or not raw_tier) else raw_tier
+        disable_review = (arm == "B")
+
+        options = RunOptions(
+            goal=goal,
+            backend=backend,
+            model=model,
+            provider=getattr(argv, "provider", None),
+            work_object=work_obj,
+            workspace_root=str(ws_path),
+            max_rounds=getattr(argv, "max_rounds", 100),
+            max_attempts=getattr(argv, "max_attempts", 3),
+            tier_override=tier_override,
+            max_total_tokens=getattr(argv, "budget_tokens", None),
+            disable_review=disable_review,
+        )
+
+        env = LocalEnvironment(tmp_dir=str(run_dir / "tmp"))
+        provider = make_role_provider(
+            options=options,
+            run_dir=run_dir,
+            env=env,
+            on_backoff=_log_rate_limit_backoff_for(run_dir),
+            provider_cls=OpenAICompatibleProvider,
+        )
+        if driver_factory is not None:
+            driver = driver_factory(run_dir, provider=provider, options=options, env=env)
+        else:
+            driver = RecursiveDriver(run_dir, provider=provider, options=options, env=env)
+
+        t0 = time.time()
+        report = None
+        halt_reason = None
+        try:
+            report = asyncio.run(driver.run())
+        except Exception as exc:
+            halt_reason = str(exc)
+        t1 = time.time()
+        wall_clock_s = round(t1 - t0, 3)
+
+        h_file = halt_path(run_dir)
+        if h_file.is_file():
+            flag_text = h_file.read_text(encoding="utf-8").strip()
+            if flag_text:
+                halt_reason = flag_text
+
+        if report is not None and report.status != "done" and not halt_reason:
+            # A non-"done" report is a recorded outcome, not a silent failure
+            # (TESTING.md §4). "halted" keeps its bare detail; every other
+            # terminal status (notably "error": provider down, auth refused,
+            # rate limit) carries the phase so a sweep is diagnosable after
+            # the fact instead of showing up as resolved=false, reason=null.
+            if report.status == "halted":
+                halt_reason = report.detail or "halted"
+            else:
+                phase = getattr(report, "phase", None) or "?"
+                halt_reason = f"{report.status} in {phase}: {report.detail or 'no detail'}"
+
+        resolved = (report is not None and report.status == "done" and not halt_reason)
+        score = 1.0 if resolved else 0.0
+        exit_code = 0 if resolved else 1
+
+        tier_measured = None
+        tier_final = None
+        t_file = tier_path(run_dir)
+        if t_file.is_file():
+            try:
+                t_data = json.loads(t_file.read_text(encoding="utf-8"))
+                tier_measured = t_data.get("measured")
+                tier_final = t_data.get("final") or t_data.get("effective") or tier_measured
+            except Exception:
+                pass
+
+        escalations = escalation_events(run_dir)
+
+        c_file = cost_path(run_dir)
+        calls_by_role: dict[str, int] = {}
+        tokens_by_role: dict[str, int] = {}
+        if c_file.is_file():
+            records = CostLedger(c_file).read_all()
+            for r in records:
+                role = str(r.get("role") or "unknown")
+                calls_by_role[role] = calls_by_role.get(role, 0) + 1
+                t = int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0) + int(r.get("reasoning_tokens") or 0)
+                tokens_by_role[role] = tokens_by_role.get(role, 0) + t
+
+        record = {
+            "benchmark": benchmark,
+            "task_id": task_id,
+            "arm": arm,
+            "seed": seed,
+            "model": model,
+            "backend": backend,
+            "score": score,
+            "resolved": resolved,
+            "tier_measured": tier_measured,
+            "tier_final": tier_final,
+            "escalations": escalations,
+            "calls_by_role": calls_by_role,
+            "tokens_by_role": tokens_by_role,
+            "wall_clock_s": wall_clock_s,
+            "halt_reason": halt_reason,
+            "commit": commit,
+        }
+
+    json_str = json.dumps(record, indent=2)
+    out_file = getattr(argv, "output", None)
+    if out_file:
+        out_p = Path(out_file)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json_str + "\n", encoding="utf-8")
+
+    if getattr(argv, "json", False):
+        print(json_str)
+    else:
+        print(f"benchmark:     {benchmark}")
+        print(f"task:          {task_id}")
+        print(f"arm:           {arm}")
+        print(f"seed:          {seed}")
+        print(f"model:         {model} ({backend})")
+        print(f"resolved:      {resolved}")
+        print(f"score:         {score}")
+        print(f"tier:          measured={record['tier_measured']} final={record['tier_final']}")
+        print(f"wall clock:    {wall_clock_s}s")
+        print(f"calls by role: {record['calls_by_role']}")
+        print(f"halt reason:   {halt_reason}")
+
+    return exit_code
+
+
 def dispatch(args: argparse.Namespace) -> int:
     """Route a parsed pipeline group to its handler."""
     command = args.pipeline_command
+    if command == "bench":
+        return cmd_bench(args)
     if command == "run":
         return cmd_run(args)
     if command == "resume":
@@ -785,6 +1121,8 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
         parts += ["--inline-spans"]
     if getattr(argv, "disable_review", False):
         parts += ["--disable-review"]
+    if getattr(argv, "budget_tokens", None) is not None:
+        parts += ["--budget-tokens", str(argv.budget_tokens)]
     for flag, value in (
         ("--model", argv.model),
         ("--provider", getattr(argv, "provider", None)),

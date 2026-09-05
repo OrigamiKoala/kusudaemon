@@ -24,6 +24,8 @@ benchmark run below must be run in three arms:
 | **B — decomposition only** | kusudaemon with review agents disabled | what recursive decomposition buys |
 | **C — full** | the complete pipeline | what verification adds on top |
 
+***User note: for the sake of cost-saving, we will only benchmark arms A and C, skipping B. We will run each benchmark 3 times to shrink variance.***
+
 Hold **token spend**, not task count, roughly equal across arms — kusudaemon
 spends more calls per task by construction, so an unequalized comparison
 flatters it for the wrong reason. Report cost-per-solved-task alongside pass

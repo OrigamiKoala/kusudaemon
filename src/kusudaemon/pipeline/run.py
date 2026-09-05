@@ -140,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable review agents across all leaves to save tokens (gates still run).",
     )
+    parser.add_argument(
+        "--budget-tokens",
+        type=int,
+        default=None,
+        help="Token budget ceiling for the run (sets halt.flag on exceed).",
+    )
     return parser
 
 
@@ -256,6 +262,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             tier_override=args.tier,
             no_intake=args.no_intake,
             disable_review=args.disable_review,
+            max_total_tokens=getattr(args, "budget_tokens", None),
         )
 
     driver = RecursiveDriver(

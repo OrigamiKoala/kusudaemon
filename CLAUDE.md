@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Kusudaemon is a recursive-decomposition harness for long-horizon, corpus-scale tasks: it decomposes one goal into leaves small enough for a model to reliably finish, drives each leaf to a verified artifact via a pluggable agent backend (`gptme`, Claude Code, Codex, or OpenCode), and reassembles the results. It is domain-agnostic — a textbook, a folder of notes, a codebase, or a research corpus all go through the same pipeline without special-casing.
 
-Package: `src/kusudaemon/`. Entry point: `kusudaemon` (`kusudaemon.cli:main`), a thin shim over `pipeline/cli.py`'s command group (`run` / `status` / `approve` / `amend` / `resume` / `serve`). Bare `kusudaemon` launches the web dashboard (`serve`).
+Package: `src/kusudaemon/`. Entry point: `kusudaemon` (`kusudaemon.cli:main`), a thin shim over `pipeline/cli.py`'s command group (`run` / `status` / `approve` / `amend` / `resume` / `serve` / `bench`). Bare `kusudaemon` launches the web dashboard (`serve`).
 
 ## Commands
 
@@ -39,7 +39,12 @@ Launch the dashboard / run a goal from the CLI:
 kusudaemon serve                                             # dashboard on :8765
 kusudaemon run --goal "..." --workspace ./                   # headless run
 kusudaemon resume <run-id>                                   # resume after interruption/crash
+kusudaemon bench --workspace ./ --goal "..." --backend opencode --arm C --json # benchmark task (TESTING.md §2)
 ```
+
+External benchmarks (HarnessBench, long-form generation, Terminal-Bench) have a
+step-by-step setup and run guide in `BENCHMARKING.md`; `TESTING.md` holds the
+experimental design those runs implement.
 
 Provider config lives in `provider.json` (copy from `provider.example.json`) and `.env` (copy from `.env.example`) in the invoking working directory — see README.md §2 for the schema (per-backend blocks; only `gptme` takes a multi-provider `providers` map).
 

@@ -44,3 +44,7 @@ provider.json
 .claude/worktrees/
 
 LongHorizon-Harness-main
+
+# External benchmark checkouts and their outputs (BENCHMARKING.md)
+/benchmarks/
+/bench_results/
