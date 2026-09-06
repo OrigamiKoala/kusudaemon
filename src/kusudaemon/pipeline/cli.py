@@ -252,6 +252,23 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         "--workspace", required=True, help="Path to task workspace/container directory."
     )
     bench_parser.add_argument(
+        "--source",
+        default="",
+        help="TESTING.md §2 Shape B: corpus text, @path, or - for stdin. Supplying "
+             "it selects the text work object instead of measuring --workspace, "
+             "which is what long-form generation benchmarks (LongGenBench, "
+             "WritingBench, HelloBench) need: they hand you source material and a "
+             "rubric, not a container.",
+    )
+    bench_parser.add_argument(
+        "--work-object",
+        default="auto",
+        choices=("auto", "workspace", "text"),
+        help="Work-object kind. 'auto' (default) keeps today's behaviour: text "
+             "when --source is given, workspace otherwise. Forcing 'text' without "
+             "--source uses the goal itself as the corpus.",
+    )
+    bench_parser.add_argument(
         "--backend",
         default="opencode",
         choices=("opencode", "gptme", "claude", "codex", "antigravity", "agy"),
@@ -970,6 +987,25 @@ def cmd_bench(
             if parsed_usage["total"] > 0:
                 tokens_by_role = {"bare": parsed_usage["total"]}
 
+        # A generation benchmark (TESTING.md §2 Shape B) grades the produced
+        # text, not the final state of a container, so arm A's stdout *is* its
+        # artifact. Arm C already exports one via --output-dir; without this,
+        # the two arms are not comparable because arm A leaves nothing behind.
+        arm_a_artifact: str | None = None
+        out_dir_arg = getattr(argv, "output_dir", None)
+        if out_dir_arg and hasattr(res, "stdout"):
+            dest = Path(out_dir_arg).expanduser()
+            if dest.is_dir() or not dest.suffix:
+                dest.mkdir(parents=True, exist_ok=True)
+                dest = dest / f"{benchmark}_{task_id}_armA_seed{seed}.txt"
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.write_text(res.stdout or "", encoding="utf-8")
+                arm_a_artifact = str(dest)
+            except OSError as exc:
+                print(f"could not write arm A artifact to {dest}: {exc}", file=sys.stderr)
+
         record = {
             "benchmark": benchmark,
             "task_id": task_id,
@@ -989,9 +1025,10 @@ def cmd_bench(
             "wall_clock_s": wall_clock_s,
             "halt_reason": halt_reason,
             "commit": commit,
+            "artifact_path": arm_a_artifact,
         }
     else:
-        from ..v6.work_object import measure_workspace
+        from ..v6.work_object import measure_workspace, work_object_from_text
         from ..pipeline.driver import RunOptions, RecursiveDriver
         from ..roles.factory import make_role_provider
         from ..v1.provider import OpenAICompatibleProvider
@@ -1002,10 +1039,33 @@ def cmd_bench(
         from .approvals import Approver
         from .run_dir import halt_path, tier_path
 
-        work_obj = measure_workspace(str(ws_path))
+        # TESTING.md §2: Shape A (a container to operate on) measures the
+        # workspace; Shape B (source material plus a rubric) is the text work
+        # object and must not be measured as a directory. Measuring an empty
+        # workspace for a generation task is not merely imprecise -- it forces
+        # `is_workspace` in build_writer_adapter, which hands a prose writer the
+        # full shell allowlist, and it drives survey_workspace to a single
+        # synthetic no-files unit that _plan_will_partition treats as empty.
+        raw_source = str(getattr(argv, "source", "") or "")
+        work_kind_arg = str(getattr(argv, "work_object", "auto") or "auto")
+        source_text = _expand_source_arg(raw_source) if raw_source else ""
+        use_text = work_kind_arg == "text" or (work_kind_arg == "auto" and bool(source_text))
+        if use_text and not source_text:
+            # --work-object text with no --source: the goal is the corpus.
+            source_text = goal
+
         run_id = getattr(argv, "run_id", None) or f"bench_{benchmark}_{task_id}_arm{arm}_s{seed}_{int(time.time())}"
         run_dir = resolve_runs_root(runs_root_arg) / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+
+        if use_text:
+            work_obj = work_object_from_text(source_text)
+            # Written where driver._write_source_and_spec would put it, so a
+            # leaf declaring source.txt as an input resolves and a T3 survey
+            # has a corpus to chunk instead of raising on kind="none".
+            source_path(run_dir).write_text(source_text, encoding="utf-8")
+        else:
+            work_obj = measure_workspace(str(ws_path))
 
         raw_tier = getattr(argv, "tier", "auto")
         tier_override = None if (raw_tier == "auto" or not raw_tier) else raw_tier
@@ -1017,6 +1077,7 @@ def cmd_bench(
             model=model,
             provider=getattr(argv, "provider", None),
             work_object=work_obj,
+            source_text=source_text,
             workspace_root=str(ws_path),
             max_rounds=getattr(argv, "max_rounds", 100),
             max_attempts=getattr(argv, "max_attempts", 3),
@@ -1115,6 +1176,27 @@ def cmd_bench(
                 t = int(r.get("prompt_tokens") or 0) + int(r.get("completion_tokens") or 0) + int(r.get("reasoning_tokens") or 0)
                 tokens_by_role[role] = tokens_by_role.get(role, 0) + t
 
+        # The driver records where the assembled artifact landed on the
+        # run_completed event; surfacing it here means a Shape B sweep can
+        # collect generated text without reparsing the event log itself.
+        artifact_path: str | None = None
+        events_file = run_dir / "events.jsonl"
+        if events_file.is_file():
+            try:
+                with open(events_file, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or '"run_completed"' not in line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if ev.get("type") == "run_completed":
+                            artifact_path = ev.get("export_path") or ev.get("artifact_path")
+            except OSError:
+                pass
+
         record = {
             "benchmark": benchmark,
             "task_id": task_id,
@@ -1122,6 +1204,7 @@ def cmd_bench(
             "seed": seed,
             "model": model,
             "backend": backend,
+            "artifact_path": artifact_path,
             "score": score,
             "resolved": resolved,
             "tier_measured": tier_measured,
