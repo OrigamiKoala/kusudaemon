@@ -141,6 +141,11 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         default=None,
         help="Token budget ceiling for the run.",
     )
+    run_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory or file path to copy final artifact to upon completion.",
+    )
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
 
     resume_parser = sub.add_parser("resume", help="Resume a run after a halt or crash.")
@@ -305,6 +310,11 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     )
     bench_parser.add_argument("--max-rounds", type=int, default=100)
     bench_parser.add_argument("--max-attempts", type=int, default=3)
+    bench_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory or file path to copy final artifact to upon completion.",
+    )
     return parser
 
 
@@ -424,6 +434,8 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         command += ["--disable-review"]
     if getattr(argv, "budget_tokens", None) is not None:
         command += ["--budget-tokens", str(argv.budget_tokens)]
+    if getattr(argv, "output_dir", None):
+        command += ["--output-dir", argv.output_dir]
     for flag, value in (
         ("--model", argv.model),
         ("--provider", getattr(argv, "provider", None)),
@@ -974,6 +986,7 @@ def cmd_bench(
             tier_override=tier_override,
             max_total_tokens=getattr(argv, "budget_tokens", None),
             disable_review=disable_review,
+            output_dir=getattr(argv, "output_dir", None),
         )
 
         env = LocalEnvironment(tmp_dir=str(run_dir / "tmp"))
@@ -1197,6 +1210,8 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
         parts += ["--disable-review"]
     if getattr(argv, "budget_tokens", None) is not None:
         parts += ["--budget-tokens", str(argv.budget_tokens)]
+    if getattr(argv, "output_dir", None):
+        parts += ["--output-dir", argv.output_dir]
     for flag, value in (
         ("--model", argv.model),
         ("--provider", getattr(argv, "provider", None)),

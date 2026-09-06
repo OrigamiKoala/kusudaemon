@@ -42,6 +42,8 @@ SANDBOX="${HARNESSBENCH_SANDBOX:-$WORKSPACE/..}"
 # our cwd here is the task workspace. Pin both to the repo explicitly.
 export KUSUDAEMON_PROVIDER_CONFIG="${KUSUDAEMON_PROVIDER_CONFIG:-$REPO_ROOT/provider.json}"
 export KUSUDAEMON_ENV_FILE="${KUSUDAEMON_ENV_FILE:-$REPO_ROOT/.env}"
+export KUSUDAEMON_NO_NOTIFY=1
+export KUSUDAEMON_OUTPUT_DIR="${KUSUDAEMON_OUTPUT_DIR:-$SANDBOX/kusudaemon-out}"
 
 # Optional: route role (orchestrator/planner/reviewer) traffic through
 # HarnessBench's usage proxy so its token accounting and process/security

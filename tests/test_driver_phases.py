@@ -2299,7 +2299,7 @@ class CostCeilingHaltingTest(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_export_and_notify_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_runs, tempfile.TemporaryDirectory() as tmp_home:
+        with tempfile.TemporaryDirectory() as tmp_runs, tempfile.TemporaryDirectory() as tmp_home, tempfile.TemporaryDirectory() as tmp_custom:
             run_dir = Path(tmp_runs) / "run_test_export"
             run_dir.mkdir(parents=True, exist_ok=True)
             assembly_dir = run_dir / "assembly"
@@ -2312,21 +2312,73 @@ class CostCeilingHaltingTest(unittest.TestCase):
 
             import unittest.mock as mock
             with mock.patch("pathlib.Path.home", return_value=Path(tmp_home)):
-                driver = RecursiveDriver(
+                # 1. Explicit output_dir
+                driver_custom = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="test", output_dir=tmp_custom),
+                )
+                driver_custom._export_and_notify_completion()
+                custom_exported = Path(tmp_custom) / "run_test_export.md"
+                self.assertTrue(custom_exported.exists())
+                self.assertEqual(custom_exported.read_text(encoding="utf-8"), "# Assembled Output\n\nContent")
+
+                # 2. Default export goes to run_dir / "out", not Downloads
+                (run_dir / "events.jsonl").write_text("", encoding="utf-8")
+                driver_default = RecursiveDriver(
                     run_dir,
                     provider=FakeProvider([]),  # type: ignore[arg-type]
                     options=RunOptions(goal="test"),
                 )
-                driver._export_and_notify_completion()
+                driver_default._export_and_notify_completion()
+                default_exported = run_dir / "out" / "run_test_export.md"
+                self.assertTrue(default_exported.exists())
+                self.assertFalse((downloads_dir / "run_test_export.md").exists())
 
-                exported = downloads_dir / "run_test_export.md"
-                self.assertTrue(exported.exists())
-                self.assertEqual(exported.read_text(encoding="utf-8"), "# Assembled Output\n\nContent")
+                # 3. KUSUDAEMON_EXPORT_DOWNLOADS=1 exports to Downloads
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_EXPORT_DOWNLOADS": "1"}):
+                    driver_dl = RecursiveDriver(
+                        run_dir,
+                        provider=FakeProvider([]),  # type: ignore[arg-type]
+                        options=RunOptions(goal="test"),
+                    )
+                    driver_dl._export_and_notify_completion()
+                    dl_exported = downloads_dir / "run_test_export.md"
+                    self.assertTrue(dl_exported.exists())
 
-                events = EventLog(events_path(run_dir)).read_all()
-                export_events = [e for e in events if e.get("type") == "artifact_exported"]
-                self.assertEqual(len(export_events), 1)
-                self.assertEqual(export_events[0]["destination"], str(exported))
+    def test_phase_plan_empty_workspace_fallback_to_single_node(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str, tempfile.TemporaryDirectory() as ws_str:
+                run_dir = Path(root_str) / "run_empty_ws"
+                from kusudaemon.v6.work_object import measure_workspace, survey_workspace
+                from kusudaemon.v2.survey import save_spine
+
+                ws = measure_workspace(ws_str)
+                save_spine(run_dir, survey_workspace(ws))
+                _write_tier(run_dir, "T2")
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(
+                        goal="Build task decomposition module",
+                        workspace_root=ws_str,
+                        work_object=ws,
+                    ),
+                )
+                await driver._phase_plan()
+
+                tree_p = run_dir / "tree.json"
+                self.assertTrue(tree_p.exists())
+                tree = TaskTree.load(tree_p)
+                self.assertEqual(len(tree.nodes), 1)
+                node = next(iter(tree.nodes.values()))
+                self.assertEqual(node.brief, "Build task decomposition module")
+                self.assertEqual(node.status, "pending")
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

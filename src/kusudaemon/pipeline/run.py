@@ -146,6 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Token budget ceiling for the run (sets halt.flag on exceed).",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory or file path to copy final artifact to upon completion.",
+    )
     return parser
 
 
@@ -263,6 +268,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             no_intake=args.no_intake,
             disable_review=args.disable_review,
             max_total_tokens=getattr(args, "budget_tokens", None),
+            output_dir=getattr(args, "output_dir", None),
         )
 
     driver = RecursiveDriver(

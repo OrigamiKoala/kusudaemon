@@ -38,6 +38,7 @@ Launch the dashboard / run a goal from the CLI:
 ```bash
 kusudaemon serve                                             # dashboard on :8765
 kusudaemon run --goal "..." --workspace ./                   # headless run
+kusudaemon run --goal "..." --workspace ./ --output-dir ./out # headless run with custom output dir
 kusudaemon resume <run-id>                                   # resume after interruption/crash
 kusudaemon bench --workspace ./ --goal "..." --backend opencode --arm C --json # benchmark task (TESTING.md §2)
 ```
@@ -75,4 +76,4 @@ Provider config lives in `provider.json` (copy from `provider.example.json`) and
 - `eval/` — fixed benchmark tasks + metrics for measuring resume correctness, reviewer precision, and call budgets.
 - `provider_config.py` — loads `provider.json`/`.env` with a strict per-backend schema and a defined precedence chain (CLI args → `KUSUDAEMON_*` env → `provider.json` → `OPENAI_*`).
 
-**Design invariants worth knowing before changing core flow:** nothing declares itself done except code-evaluated gates; decomposition is unconditional (never gated by model judgment about task size); every context (including the orchestrator's) is bounded and does not grow with corpus size or run length; agents are isolated from each other's raw scratch/reasoning/output.
+**Design invariants worth knowing before changing core flow:** nothing declares itself done except code-evaluated gates; decomposition is unconditional (never gated by model judgment about task size); every context (including the orchestrator's) is bounded and does not grow with corpus size or run length; agents are isolated from each other's raw scratch/reasoning/output. Greenfield/empty workspace runs synthesize a root unit in `survey_workspace` and fallback in `_phase_plan` to `build_single_node_tree(goal)` so the writer receives the full user brief. Final artifacts export to `<run-dir>/out/<run-id>.md` (or `--output-dir` / `KUSUDAEMON_OUTPUT_DIR`), never touching `~/Downloads` unless `KUSUDAEMON_EXPORT_DOWNLOADS=1`.

@@ -428,6 +428,17 @@ def survey_workspace(
                     members=tuple(rel for rel, _tokens in chunk),
                 )
             )
+    if not units:
+        units.append(
+            SpineUnit(
+                id="unit-01",
+                label="(workspace root)",
+                start_chunk=-1,
+                end_chunk=-1,
+                tokens=0,
+                members=(),
+            )
+        )
     return units
 
 

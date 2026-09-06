@@ -254,6 +254,7 @@ class RunOptions:
     review_sample_rate: float = 0.0
     disable_review: bool = False
     capabilities: Any = None
+    output_dir: str | Path | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.research_plan, str):
@@ -302,6 +303,8 @@ class RunOptions:
         }
         if ws_root:
             spec["workspace_root"] = ws_root
+        if self.output_dir:
+            spec["output_dir"] = str(self.output_dir)
         # §11.10.7: the corpus lives once, in source.txt. Embedding
         # source_text here duplicated the run's largest file into a JSON
         # every resume re-parses (*and* into the --detach argv, see
@@ -354,6 +357,7 @@ class RunOptions:
             review_sample_rate=float(data.get("review_sample_rate", 0.0)),
             disable_review=bool(data.get("disable_review", False)),
             capabilities=data.get("capabilities"),
+            output_dir=data.get("output_dir"),
         )
 
 
@@ -568,8 +572,7 @@ class RecursiveDriver:
             # the report.
             if report.status == "done":
                 artifact_src = self._resolve_final_artifact_path()
-                downloads_dir = Path.home() / "Downloads"
-                export_path = str(downloads_dir / f"{self.run_dir.name}.md") if (artifact_src and downloads_dir.is_dir()) else None
+                export_path = self._resolve_export_path(artifact_src)
                 closing_statement = self._build_closing_statement(artifact_src, export_path)
                 entry: dict[str, Any] = {
                     "node_id": "-",
@@ -653,26 +656,50 @@ class RecursiveDriver:
 
         return "\n".join(lines)
 
+    def _resolve_export_path(self, artifact_src: Path | None) -> str | None:
+        """Determine destination path for saving final artifact."""
+        if not artifact_src:
+            return None
+        target = (
+            getattr(self.options, "output_dir", None)
+            or os.getenv("KUSUDAEMON_OUTPUT_DIR")
+            or os.getenv("KUSUDAEMON_EXPORT_DIR")
+        )
+        if target:
+            p = Path(target).expanduser().resolve()
+            if p.is_dir() or not p.suffix:
+                p.mkdir(parents=True, exist_ok=True)
+                return str(p / f"{self.run_dir.name}.md")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return str(p)
+        if os.getenv("KUSUDAEMON_EXPORT_DOWNLOADS") == "1":
+            downloads_dir = Path.home() / "Downloads"
+            if downloads_dir.is_dir():
+                return str(downloads_dir / f"{self.run_dir.name}.md")
+        out_dir = self.run_dir / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return str(out_dir / f"{self.run_dir.name}.md")
+
     def _export_and_notify_completion(
         self,
         *,
         artifact_src: Path | None = None,
         export_path: str | Path | None = None,
     ) -> None:
-        """Copy the primary assembled artifact to ~/Downloads and send a system notification."""
+        """Copy the primary assembled artifact to the output directory and send a system notification."""
         try:
             if artifact_src is None:
                 artifact_src = self._resolve_final_artifact_path()
 
             if export_path is None and artifact_src is not None:
-                downloads_dir = Path.home() / "Downloads"
-                if downloads_dir.is_dir():
-                    export_path = str(downloads_dir / f"{self.run_dir.name}.md")
+                export_path = self._resolve_export_path(artifact_src)
 
             if artifact_src is not None and export_path is not None:
                 import shutil
                 target_path = Path(export_path)
-                shutil.copy2(artifact_src, target_path)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.resolve() != artifact_src.resolve():
+                    shutil.copy2(artifact_src, target_path)
                 self._log({
                     "node_id": "-",
                     "role": "harness",
@@ -684,12 +711,19 @@ class RecursiveDriver:
 
             import subprocess
             import sys
-            msg = f"Run {self.run_dir.name} completed successfully."
-            if export_path is not None:
-                msg += f" Artifact saved to {Path(export_path).name}."
-            elif artifact_src is not None:
-                msg += " Artifact generated."
-            if sys.platform == "darwin":
+            should_notify = (
+                sys.platform == "darwin"
+                and sys.stdout.isatty()
+                and not os.getenv("HARNESSBENCH_TASK_ID")
+                and not os.getenv("KUSUDAEMON_NO_NOTIFY")
+                and not os.getenv("PYTEST_CURRENT_TEST")
+            )
+            if should_notify:
+                msg = f"Run {self.run_dir.name} completed successfully."
+                if export_path is not None:
+                    msg += f" Artifact saved to {Path(export_path).name}."
+                elif artifact_src is not None:
+                    msg += " Artifact generated."
                 subprocess.run(
                     ["osascript", "-e", f'display notification "{msg}" with title "Kusudaemon"'],
                     check=False,
@@ -1474,20 +1508,56 @@ class RecursiveDriver:
         tier = self._current_tier()
         depth_cap = 1 if tier == "T2" else DEFAULT_DEPTH_CAP
         probe_sink: list[dict[str, Any]] = []
-        tree = await asyncio.to_thread(
-            build_tree,
-            load_spine(self.run_dir),
-            self.provider,
-            depth_cap=depth_cap,
-            input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
-            log=self.log,
-            unit_summary_for=self._explore_summary_for,
-            on_reasoning=self._reasoning_sink("phase-plan"),
-            probe_sink=probe_sink,
-            streaming=True,
-            code_tile_planner=self.options.code_tile_planner,
-            trust_estimated_calls=self.options.trust_estimated_calls,
+        units = load_spine(self.run_dir)
+        corpus_inputs = (
+            ("source.txt",) if self._effective_work_object().kind == "text" else ()
         )
+
+        work_obj = self._effective_work_object()
+        is_empty_workspace = (
+            work_obj.kind == "workspace"
+            and (not units or (len(units) == 1 and (not units[0].members or units[0].start_chunk == -1)))
+        )
+
+        if not units or is_empty_workspace:
+            goal = (self.options.goal or "").strip() or "Execute task"
+            tree = build_single_node_tree(goal, inputs=corpus_inputs)
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "single_node_tree_fallback",
+                    "detail": "empty workspace or empty spine, generated single node tree from goal",
+                }
+            )
+        else:
+            tree = await asyncio.to_thread(
+                build_tree,
+                units,
+                self.provider,
+                depth_cap=depth_cap,
+                input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
+                log=self.log,
+                unit_summary_for=self._explore_summary_for,
+                on_reasoning=self._reasoning_sink("phase-plan"),
+                probe_sink=probe_sink,
+                streaming=True,
+                code_tile_planner=self.options.code_tile_planner,
+                trust_estimated_calls=self.options.trust_estimated_calls,
+            )
+            if not tree.nodes:
+                goal = (self.options.goal or "").strip() or "Execute task"
+                tree = build_single_node_tree(goal, inputs=corpus_inputs)
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "single_node_tree_fallback",
+                        "detail": "planner returned empty tree, generated single node tree from goal",
+                    }
+                )
         # A5-3: fold the plan call's own probe suggestions (≤2, top-level
         # only) into the research phase — written to disk now so a resume
         # re-uses them without re-calling the model; _build_auto_probe_plan
