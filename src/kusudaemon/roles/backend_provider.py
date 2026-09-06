@@ -8,6 +8,7 @@ raw HTTP calls.
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -74,12 +75,20 @@ class BackendRoleProvider(RoleProviderBase):
         log: EventLog | None = None,
         concurrency: int = 4,
         adapter_factory: Callable[[str], AgentAdapter] | None = None,
+        role: str = "role",
     ) -> None:
+        self.role = role or "role"
         self.backend = str(backend).strip().lower()
         self.run_dir = Path(run_dir)
         self.env = env
         self.model = model or ""
-        self.budget = budget or EpisodeBudget(max_duration_seconds=600, max_output_tokens=2048)
+        if self.role in ("reviewer", "triage"):
+            timeout_env = os.getenv("KUSUDAEMON_REVIEWER_TIMEOUT") or os.getenv("KUSUDAEMON_ROLE_TIMEOUT")
+            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 45
+        else:
+            timeout_env = os.getenv("KUSUDAEMON_ROLE_TIMEOUT")
+            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 180
+        self.budget = budget or EpisodeBudget(max_duration_seconds=default_timeout, max_output_tokens=2048)
         self.max_episode_retries = max_episode_retries
         self._concurrency = concurrency
         self._adapter_factory = adapter_factory
@@ -106,27 +115,28 @@ class BackendRoleProvider(RoleProviderBase):
         last_error = "empty response"
         episode_loop = get_episode_loop(concurrency=self._concurrency)
 
+        # Hoist adapter and env construction out of attempt retry loop (T0-3)
+        if self._adapter_factory is not None:
+            adapter = self._adapter_factory(self.role)
+        else:
+            adapter = build_role_adapter(
+                backend=self.backend,
+                run_dir=self.run_dir,
+                phase=self.role,
+                model=self.model or None,
+                env=self.env,
+            )
+        env = self.env or LocalEnvironment(tmp_dir=str(self.run_dir / "tmp"))
+
         for attempt in range(retries + 1):
             if self._should_abort is not None and self._should_abort():
                 raise ProviderError("Execution aborted by driver")
 
             prompt = _flatten_messages(base_messages, schema)
             call_id = f"call_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-            roles_dir = self.run_dir / "roles" / "role"
+            roles_dir = self.run_dir / "roles" / self.role
             roles_dir.mkdir(parents=True, exist_ok=True)
             live_trajectory = roles_dir / f"{call_id}_raw_trajectory.jsonl"
-
-            if self._adapter_factory is not None:
-                adapter = self._adapter_factory("role")
-            else:
-                adapter = build_role_adapter(
-                    backend=self.backend,
-                    run_dir=self.run_dir,
-                    phase="role",
-                    model=self.model or None,
-                    env=self.env,
-                )
-            env = self.env or LocalEnvironment(tmp_dir=str(self.run_dir / "tmp"))
 
             # Run episode with retries for episode-level failures (timeout/error)
             episode_result = None

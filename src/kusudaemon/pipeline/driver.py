@@ -251,7 +251,7 @@ class RunOptions:
     max_cost_usd: float | None = None
     max_total_tokens: int | None = None
     episode_cache: bool = True
-    review_sample_rate: float = 0.0
+    review_sample_rate: float = 0.05
     disable_review: bool = False
     capabilities: Any = None
     output_dir: str | Path | None = None
@@ -1879,7 +1879,7 @@ class RecursiveDriver:
         if effective_max_parallel == 1 and tier in ("T2", "T3"):
             loaded_tree = self._load_tree()
             if loaded_tree.nodes and all(not node.depends_on for node in loaded_tree.nodes.values()):
-                derived_parallel = min(4, os.cpu_count() or 1)
+                derived_parallel = min(16, max(8, (os.cpu_count() or 1) * 2))
                 if derived_parallel > 1:
                     effective_max_parallel = derived_parallel
                     self._log(
@@ -2496,16 +2496,32 @@ class RecursiveDriver:
         return False  # execute/verify/review/research/assemble: idempotent, always re-run
 
     def _model_for_role(self, role: str) -> str | None:
-        from ..provider_config import get_model_for_role
+        from ..provider_config import get_model_for_role, read_config_file
+        cfg = read_config_file()
+        roles_cfg = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+        role_models: dict[str, str] = {}
+        if isinstance(roles_cfg.get("models"), dict):
+            role_models.update(roles_cfg["models"])
+        if isinstance(roles_cfg.get("role_models"), dict):
+            role_models.update(roles_cfg["role_models"])
+        for k, v in roles_cfg.items():
+            if k not in ("transport", "backend", "models", "role_models") and isinstance(v, str):
+                role_models[k] = v
+        backend_block = cfg.get(self._current_backend())
+        if isinstance(backend_block, dict) and backend_block.get("role_model"):
+            role_models.setdefault(role, backend_block["role_model"])
+
         return get_model_for_role(
             role,
             default_model=self.options.model,
             run_dir=self.run_dir,
+            role_models=role_models,
         )
 
     def _role_provider(self, role: str) -> RoleProvider:
         from ..roles.factory import make_role_provider
         role_model = self._model_for_role(role)
+        timeout = 45.0 if role in ("reviewer", "triage") else 300.0
         if not role_model or role_model == getattr(self.provider, "model", None):
             return self.provider
         return make_role_provider(
@@ -2513,6 +2529,8 @@ class RecursiveDriver:
             model=role_model,
             run_dir=self.run_dir,
             env=self.env,
+            timeout=timeout,
+            role=role,
         )
 
     def _generate_resumption_brief(self) -> None:

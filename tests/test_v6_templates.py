@@ -91,10 +91,10 @@ class ApplyTemplateTest(unittest.TestCase):
     def test_problem_set_template_lands_warn_gates_and_judgment(self) -> None:
         node = _node("p1", shape="problem-set-dominant")
         apply_template_to_node(node)
-        # Hard gates are untouched: the template ships warn-only today.
-        self.assertEqual(node.gates, ["nonempty", "max_tokens:24000"])
+        # headers:std graduated to hard gates (T1-1)
+        self.assertEqual(node.gates, ["nonempty", "max_tokens:24000", "headers:std"])
         self.assertIn("problems>=5", node.warn_gates)
-        self.assertIn("headers:std", node.warn_gates)
+        self.assertIn("headers:std", node.gates)
         self.assertNotIn("problems>=5", node.gates)
         self.assertEqual(node.judgment, ["worked_examples_reachable"])
         self.assertIn("worked_examples_reachable", node.rubric)
@@ -119,10 +119,10 @@ class ApplyTemplateTest(unittest.TestCase):
         )
         apply_template_to_node(node)
         self.assertEqual(
-            node.gates, ["contains:Summary"]
+            node.gates, ["contains:Summary", "headers:std"]
         )
         # Existing warn gate first, template's after.
-        self.assertEqual(node.warn_gates, ["latex_balanced", "headers:std", "problems>=5"])
+        self.assertEqual(node.warn_gates, ["latex_balanced", "problems>=5"])
         # Judgment union, operator's item first; rubric: existing wins.
         self.assertEqual(node.judgment, ["custom_item", "worked_examples_reachable"])
         self.assertEqual(node.rubric["custom_item"], "operator custom bar")
@@ -132,8 +132,8 @@ class ApplyTemplateTest(unittest.TestCase):
         node = _node("p1", shape="problem-set-dominant")
         apply_template_to_node(node)
         apply_template_to_node(node)
-        self.assertEqual(node.warn_gates, ["headers:std", "problems>=5"])
-        self.assertEqual(node.gates, ["nonempty", "max_tokens:24000"])
+        self.assertEqual(node.warn_gates, ["problems>=5"])
+        self.assertEqual(node.gates, ["nonempty", "max_tokens:24000", "headers:std"])
         self.assertEqual(node.judgment, ["worked_examples_reachable"])
         self.assertEqual(node.tools, ["read", "save", "shell"])
 
@@ -154,7 +154,8 @@ class ApplyTemplateTest(unittest.TestCase):
     def test_explicit_template_param_wins_over_resolution(self) -> None:
         node = _node("p1", shape="prose-dominant")
         apply_template_to_node(node, template=builtin_templates()[0])
-        self.assertEqual(node.warn_gates, ["headers:std", "problems>=5"])
+        self.assertEqual(node.warn_gates, ["problems>=5"])
+        self.assertIn("headers:std", node.gates)
 
     def test_merge_template_into_tree_covers_every_node(self) -> None:
         tree = TaskTree(
@@ -169,7 +170,7 @@ class ApplyTemplateTest(unittest.TestCase):
         )
         merge_template_into_tree(tree)
         self.assertIn("problems>=5", tree.nodes["c1"].warn_gates)
-        self.assertIn("latex_balanced", tree.nodes["c2"].warn_gates)
+        self.assertIn("latex_balanced", tree.nodes["c2"].gates)
         self.assertEqual(tree.nodes["c3"].warn_gates, [])
 
 
@@ -182,8 +183,8 @@ class GlossaryWiringTest(unittest.TestCase):
 
         apply_template_to_node(node, glossary_path=Path("/tmp/x/glossary.json"))
         self.assertIn("terms_defined:/tmp/x/glossary.json", node.warn_gates)
-        # Other warn gates untouched by the rewrite.
-        self.assertIn("headers:std", node.warn_gates)
+        # headers:std is a hard gate
+        self.assertIn("headers:std", node.gates)
 
     def test_glossary_for_tree_unions_template_glossaries(self) -> None:
         tree = TaskTree(nodes={"g1": _node("g1", shape="generic-shape")})

@@ -105,9 +105,9 @@ def _counting_writer_factory(run_dir: Path, counter: list[int], task: EvalTask |
     def factory(node):
         counter[0] += 1
         if task is not None and getattr(task, "task_id", "") == "t2-misclassified" and node.id == "single":
-            content = "word " * 40000
+            content = "# Single\n\n" + ("word " * 40000)
         else:
-            content = f"eval artifact body for {node.id}.\n\n{node.brief}\n"
+            content = f"# {node.id}\n\neval artifact body for {node.id}.\n\n{node.brief}\n"
         return _InMemoryWriterAdapter(node_artifact_path(run_dir, node.id), content)
 
     return factory

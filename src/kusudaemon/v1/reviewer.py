@@ -99,14 +99,46 @@ class ReviewVerdict:
     node_id: str
     items: list[dict[str, Any]] = field(default_factory=list)
     verdict: str = "pass"
-    # PLAN.md §D5/§B6: true only when some text the reviewer needed to see
-    # was actually cut -- the no-headings fallback, or a post-grouping
-    # section that was still over cap on its own. §B6's fan-out means this
-    # is no longer the routine case for an over-cap artifact: a defect
-    # anywhere in a headed document now reaches some call, so a `passed`
-    # node's audit record with `truncated=True` is now the honest signal
-    # that content genuinely went unseen, not a byproduct of size alone.
     truncated: bool = False
+    section_verdicts: list[dict[str, Any]] = field(default_factory=list)
+
+
+TRIAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["suspect", "reason"],
+    "additionalProperties": False,
+    "properties": {
+        "suspect": {"type": "boolean"},
+        "reason": {"type": "string", "maxLength": 500},
+    },
+}
+
+_TRIAGE_SYSTEM_PROMPT = (
+    "You are a fast triage Reviewer in a long-horizon task harness. You quickly check whether an "
+    "artifact may have defects against its rubric. If there is ANY suspect issue, defect, or doubt, "
+    "set suspect=true (prefer false positives over false negatives). Set suspect=false only if clearly clean. "
+    "Respond with a single JSON object only."
+)
+
+GATE_COVERED_JUDGMENTS: frozenset[str] = frozenset({
+    "headers:std",
+    "headers_std",
+    "headers_standard",
+    "headings_hierarchy",
+    "latex_balanced",
+    "latex_syntax",
+    "refs_resolve",
+    "citations_resolve",
+    "terms_defined",
+    "nonempty",
+})
+
+CROSS_LEAF_JUDGMENTS: frozenset[str] = frozenset({
+    "coverage_gap",
+    "duplicate_content",
+    "register_drift",
+    "terminology_drift",
+})
 
 
 def compute_verdict_digest(
@@ -203,18 +235,30 @@ def _group_sections(sections: list[str], max_groups: int) -> list[str]:
     return groups
 
 
+import concurrent.futures
+
+
 def _call_reviewer(
     rubric_lines: str,
     artifact_text: str,
     provider: RoleProvider,
+    *,
+    contract_text: str = "",
+    declared_inputs: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
+    content_parts = [f"Rubric:\n{rubric_lines}"]
+    if contract_text:
+        content_parts.append(f"Contract:\n{contract_text}")
+    if declared_inputs:
+        content_parts.append(f"Declared Inputs:\n{declared_inputs}")
+    content_parts.append(f"Artifact:\n{artifact_text}")
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{artifact_text}",
+            "content": "\n\n".join(content_parts),
         },
     ]
     try:
@@ -225,14 +269,6 @@ def _call_reviewer(
             on_reasoning=on_reasoning,
         )
     except ProviderError as exc:
-        # §D30 (2026-08-15): a defect longer than the schema's maxLength
-        # must degrade, never kill the run. When the host rejects
-        # `response_format` (the A4-1 latch), `complete_json` enforces the
-        # schema itself and raises after 3 reprompts — observed live with
-        # exactly the "longer than maxLength 300" error above. Retry once
-        # against a copy of the schema with a relaxed defect cap so the
-        # verdict lands and the node transitions normally (same
-        # degrade-don't-die convention as A4-1). Anything else propagates.
         if "maxLength" not in str(exc):
             raise
         relaxed = copy.deepcopy(VERDICT_SCHEMA)
@@ -246,93 +282,268 @@ def _call_reviewer(
         )
 
 
+def _call_triage(
+    rubric_lines: str,
+    artifact_text: str,
+    provider: RoleProvider,
+    *,
+    contract_text: str = "",
+    declared_inputs: str = "",
+    on_reasoning: Callable[[str], None] | None = None,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    content_parts = [f"Rubric:\n{rubric_lines}"]
+    if contract_text:
+        content_parts.append(f"Contract:\n{contract_text}")
+    if declared_inputs:
+        content_parts.append(f"Declared Inputs:\n{declared_inputs}")
+    content_parts.append(f"Artifact:\n{artifact_text}")
+    messages = [
+        {"role": "system", "content": _TRIAGE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": "\n\n".join(content_parts),
+        },
+    ]
+    return provider.complete_json(
+        messages,
+        TRIAGE_SCHEMA,
+        temperature=temperature,
+        on_reasoning=on_reasoning,
+    )
+
+
 def review_node(
     node: TaskNode,
     artifact_text: str,
     provider: RoleProvider,
     *,
     artifact_cap_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS,
+    contract_text: str = "",
+    declared_inputs: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
+    triage_provider: RoleProvider | None = None,
+    cached_sections: list[dict[str, Any]] | None = None,
+    all_gates_passed: bool | None = None,
+    gate_results: dict[str, Any] | None = None,
+    judgment_classification: dict[str, str] | None = None,
+    parallel: bool = True,
 ) -> ReviewVerdict:
-    """PLAN.md §A9/§B6: fan-out replaces whole-artifact truncation.
-
-    Under cap: exactly today's single call, byte-for-byte — this is the
-    common case, and it must stay untouched (the reuse of
-    ``cap_artifact_text`` to make this decision is deliberate: it is the
-    same threshold logic §D5's interim fix already shipped, so "under cap"
-    here means exactly what it always has, no new off-by-one to reason
-    about).
-
-    Over cap: split by top-level heading into <=``MAX_FANOUT_SECTIONS``
-    sections (§A9's fan-out), one ``review_node``-shaped call per section
-    against the *same* full rubric (a defect can be anywhere; sections
-    aren't independently rubric-scoped, just token-scoped), then merge:
-    ``items`` is the union of every section's items (no dedup — two
-    sections independently flagging the same real defect is not obviously
-    wrong, and a dedup heuristic risks dropping a distinct one), ``verdict``
-    is "pass" only if every section passed. This is what makes a defect in
-    the artifact's last 20% visible at all: today it is past the cut and
-    structurally invisible; fan-out sends every byte to some call.
-
-    No headings at all: falls back to §D5's interim plain truncation
-    (documented, honest degrade — matches this codebase's convention for
-    a fallback with no better option, e.g. ``pipeline/prompts.py``'s
-    inline-spans fallback or ``v2/planner.py``'s gap-fill).
-
-    A pathological single (post-grouping) section still over cap after
-    fan-out: truncate just that section rather than fail the review
-    outright. ``truncated`` is ``True`` only in these last two cases —
-    it should be rare now, not the routine case it was for anything over
-    ~6000 words under the old whole-artifact truncation.
-    """
+    """PLAN-REVIEW-LATENCY.md: Grounded, delta-cached, parallel review."""
     if not node.judgment:
         return ReviewVerdict(node_id=node.id, items=[], verdict="pass")
 
+    # T1-4: De-duplicate review layers: strip cross-leaf judgments
+    effective_judgment = [j for j in node.judgment if j not in CROSS_LEAF_JUDGMENTS]
+
+    # T2-2: Closed rubric items only
+    jc = judgment_classification if judgment_classification is not None else getattr(node, "judgment_classification", None)
+    if jc:
+        effective_judgment = [
+            j for j in effective_judgment if jc.get(j, "closed") != "open"
+        ]
+
+    if not effective_judgment:
+        return ReviewVerdict(node_id=node.id, items=[], verdict="pass")
+
+    # T1-1: Deterministic pre-filter: skip model call if all gates pass and all judgments are gate-covered
+    gates_passed = all_gates_passed
+    if gates_passed is None and gate_results is not None:
+        gates_passed = all(isinstance(v, dict) and v.get("passed", False) for v in gate_results.values())
+    if gates_passed is None and node.gates:
+        from .gates import all_passed, evaluate_gates
+        gates_passed = all_passed(evaluate_gates(node.gates, artifact_text))
+    if gates_passed and all(j in GATE_COVERED_JUDGMENTS or j in node.gates for j in effective_judgment):
+        return ReviewVerdict(
+            node_id=node.id,
+            items=[{"id": j, "pass": True} for j in effective_judgment],
+            verdict="pass",
+            truncated=False,
+        )
+
     rubric_lines = "\n".join(
         f"{judgment_id}: {node.rubric.get(judgment_id, '(no rubric text given)')}"
-        for judgment_id in node.judgment
+        for judgment_id in effective_judgment
     )
+
+    # T1-2: Stage 1 Triage call if triage_provider is supplied
+    if triage_provider is not None:
+        try:
+            triage_res = _call_triage(
+                rubric_lines,
+                artifact_text,
+                triage_provider,
+                contract_text=contract_text,
+                declared_inputs=declared_inputs,
+                on_reasoning=on_reasoning,
+                temperature=temperature,
+            )
+            if not triage_res.get("suspect", True):
+                return ReviewVerdict(
+                    node_id=node.id,
+                    items=[{"id": j, "pass": True} for j in effective_judgment],
+                    verdict="pass",
+                    truncated=False,
+                )
+        except Exception:
+            pass
+
+    cached_map: dict[str, dict[str, Any]] = {}
+    if cached_sections:
+        for cs in cached_sections:
+            if isinstance(cs, dict) and cs.get("digest"):
+                cached_map[cs["digest"]] = cs
 
     capped_artifact = cap_artifact_text(artifact_text, artifact_cap_tokens)
     if capped_artifact == artifact_text:
+        digest = compute_verdict_digest(artifact_text, node.rubric, effective_judgment, contract_text)
+        if digest in cached_map and cached_map[digest].get("verdict") == "pass":
+            cached_entry = cached_map[digest]
+            return ReviewVerdict(
+                node_id=node.id,
+                items=list(cached_entry.get("items", [])),
+                verdict=str(cached_entry.get("verdict", "pass")),
+                truncated=False,
+                section_verdicts=[cached_entry],
+            )
         payload = _call_reviewer(
             rubric_lines,
             artifact_text,
             provider,
+            contract_text=contract_text,
+            declared_inputs=declared_inputs,
             on_reasoning=on_reasoning,
             temperature=temperature,
         )
+        items = list(payload.get("items", []))
+        verdict_str = str(payload.get("verdict", "fail"))
         return ReviewVerdict(
             node_id=node.id,
-            items=list(payload.get("items", [])),
-            verdict=str(payload.get("verdict", "fail")),
+            items=items,
+            verdict=verdict_str,
             truncated=False,
+            section_verdicts=[{"digest": digest, "items": items, "verdict": verdict_str}],
         )
 
     sections = _group_sections(_sections_by_heading(artifact_text), MAX_FANOUT_SECTIONS)
     if not sections:
-        payload = _call_reviewer(rubric_lines, capped_artifact, provider, on_reasoning=on_reasoning)
+        digest = compute_verdict_digest(capped_artifact, node.rubric, effective_judgment, contract_text)
+        if digest in cached_map and cached_map[digest].get("verdict") == "pass":
+            cached_entry = cached_map[digest]
+            return ReviewVerdict(
+                node_id=node.id,
+                items=list(cached_entry.get("items", [])),
+                verdict=str(cached_entry.get("verdict", "pass")),
+                truncated=True,
+                section_verdicts=[cached_entry],
+            )
+        payload = _call_reviewer(
+            rubric_lines,
+            capped_artifact,
+            provider,
+            contract_text=contract_text,
+            declared_inputs=declared_inputs,
+            on_reasoning=on_reasoning,
+            temperature=temperature,
+        )
+        items = list(payload.get("items", []))
+        verdict_str = str(payload.get("verdict", "fail"))
         return ReviewVerdict(
             node_id=node.id,
-            items=list(payload.get("items", [])),
-            verdict=str(payload.get("verdict", "fail")),
+            items=items,
+            verdict=verdict_str,
             truncated=True,
+            section_verdicts=[{"digest": digest, "items": items, "verdict": verdict_str}],
         )
 
-    items: list[dict[str, Any]] = []
-    verdict = "pass"
+    prepared_sections: list[tuple[int, str, str, bool]] = []
+    section_verdicts: list[dict[str, Any] | None] = [None] * len(sections)
     truncated = False
-    for section_text in sections:
+
+    for idx, section_text in enumerate(sections):
         capped_section = cap_artifact_text(section_text, artifact_cap_tokens)
-        if capped_section != section_text:
+        sec_truncated = capped_section != section_text
+        if sec_truncated:
             truncated = True
             section_text = capped_section
-        payload = _call_reviewer(rubric_lines, section_text, provider, on_reasoning=on_reasoning)
-        items.extend(payload.get("items", []))
-        if str(payload.get("verdict", "fail")) != "pass":
-            verdict = "fail"
-            # If any defect requires regenerate (full rewrite), later section calls are redundant
-            if any(item.get("class") == "regenerate" for item in payload.get("items", []) if not item.get("pass", True)):
-                break
-    return ReviewVerdict(node_id=node.id, items=items, verdict=verdict, truncated=truncated)
+        sec_digest = compute_verdict_digest(section_text, node.rubric, effective_judgment, contract_text)
+        if sec_digest in cached_map and cached_map[sec_digest].get("verdict") == "pass":
+            section_verdicts[idx] = cached_map[sec_digest]
+        else:
+            prepared_sections.append((idx, section_text, sec_digest, sec_truncated))
+
+    def _eval_section(sec_idx: int, sec_text: str, sec_digest: str) -> tuple[int, dict[str, Any], str]:
+        payload = _call_reviewer(
+            rubric_lines,
+            sec_text,
+            provider,
+            contract_text=contract_text,
+            declared_inputs=declared_inputs,
+            on_reasoning=on_reasoning,
+            temperature=temperature,
+        )
+        return sec_idx, payload, sec_digest
+
+    items: list[dict[str, Any]] = []
+    overall_verdict = "pass"
+
+    is_fake_canned = hasattr(provider, "_responses")
+    if is_fake_canned or not parallel or len(prepared_sections) <= 1:
+        for idx, sec_text, sec_digest, _ in prepared_sections:
+            sec_idx, payload, s_digest = _eval_section(idx, sec_text, sec_digest)
+            sec_items = list(payload.get("items", []))
+            sec_verdict = str(payload.get("verdict", "fail"))
+            section_verdicts[sec_idx] = {
+                "digest": s_digest,
+                "items": sec_items,
+                "verdict": sec_verdict,
+            }
+            if sec_verdict != "pass":
+                overall_verdict = "fail"
+                if any(it.get("class") == "regenerate" for it in sec_items if not it.get("pass", True)):
+                    break
+    else:
+        workers = min(len(prepared_sections), MAX_FANOUT_SECTIONS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_info = {
+                executor.submit(_eval_section, idx, sec_text, sec_digest): idx
+                for idx, sec_text, sec_digest, _ in prepared_sections
+            }
+            cancelled = False
+            for future in concurrent.futures.as_completed(future_to_info):
+                if cancelled:
+                    continue
+                try:
+                    sec_idx, payload, s_digest = future.result()
+                    sec_items = list(payload.get("items", []))
+                    sec_verdict = str(payload.get("verdict", "fail"))
+                    section_verdicts[sec_idx] = {
+                        "digest": s_digest,
+                        "items": sec_items,
+                        "verdict": sec_verdict,
+                    }
+                    if sec_verdict != "pass":
+                        overall_verdict = "fail"
+                        if any(it.get("class") == "regenerate" for it in sec_items if not it.get("pass", True)):
+                            cancelled = True
+                            for f in future_to_info:
+                                f.cancel()
+                except Exception:
+                    overall_verdict = "fail"
+
+    final_sections: list[dict[str, Any]] = []
+    for sv in section_verdicts:
+        if sv is not None:
+            final_sections.append(sv)
+            items.extend(sv.get("items", []))
+            if sv.get("verdict") != "pass":
+                overall_verdict = "fail"
+
+    return ReviewVerdict(
+        node_id=node.id,
+        items=items,
+        verdict=overall_verdict,
+        truncated=truncated,
+        section_verdicts=final_sections,
+    )

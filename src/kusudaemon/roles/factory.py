@@ -91,6 +91,8 @@ class LazyRoleProvider(RoleProviderBase):
 def _resolve_role_transport(
     run_backend: str,
     config_path: Path | None = None,
+    log: EventLog | None = None,
+    run_dir: Path | str | None = None,
 ) -> tuple[str, str]:
     """Resolve (effective_backend, transport) for role calls.
 
@@ -108,14 +110,15 @@ def _resolve_role_transport(
     effective_backend = env_backend or cfg_backend or run_backend or "gptme"
     effective_backend = str(effective_backend).strip().lower()
 
+    degradation_reason: str | None = None
+
     if env_transport:
         transport = env_transport.strip().lower()
-    elif cfg_transport:
-        transport = cfg_transport.lower()
     else:
-        # Default transport: prefer "http" whenever provider/key or resolve() succeeds,
-        # fallback to "backend" only for keyless CLI setups.
-        if effective_backend == "gptme":
+        desired_transport = cfg_transport.lower() if cfg_transport else "http"
+        if desired_transport == "backend":
+            transport = "backend"
+        elif effective_backend == "gptme":
             transport = "http"
         else:
             try:
@@ -125,8 +128,40 @@ def _resolve_role_transport(
                     transport = "http"
                 else:
                     transport = "backend"
+                    if not res.api_key:
+                        degradation_reason = "no_api_key"
+                    elif not res.base_url:
+                        degradation_reason = "no_base_url"
+                    else:
+                        degradation_reason = "resolve_failed"
             except Exception:
                 transport = "backend"
+                degradation_reason = "resolve_failed"
+
+    if degradation_reason:
+        target_log = log
+        if target_log is None and run_dir is not None:
+            try:
+                from ..v0.run_dir import events_path
+                p = events_path(Path(run_dir))
+                if p.parent.exists():
+                    target_log = EventLog(p)
+            except Exception:
+                pass
+        if target_log is not None:
+            try:
+                target_log.append(
+                    {
+                        "node_id": "-",
+                        "role": "role",
+                        "type": "role_transport_degraded",
+                        "reason": degradation_reason,
+                        "backend": effective_backend,
+                        "transport": transport,
+                    }
+                )
+            except Exception:
+                pass
 
     return effective_backend, transport
 
@@ -144,6 +179,7 @@ def make_role_provider(
     timeout: float = 300.0,
     lazy: bool = False,
     provider_cls: Any = None,
+    role: str | None = None,
 ) -> RoleProvider:
     """Build a RoleProvider instance for reasoning/role calls."""
     run_backend = backend or (options.backend if options is not None and hasattr(options, "backend") else None) or "gptme"
@@ -153,7 +189,7 @@ def make_role_provider(
     def _builder() -> RoleProvider:
         from ..v1.provider import OpenAICompatibleProvider
 
-        effective_backend, transport = _resolve_role_transport(run_backend)
+        effective_backend, transport = _resolve_role_transport(run_backend, log=log, run_dir=run_dir)
 
         if transport == "http" or effective_backend == "gptme":
             cls = provider_cls or OpenAICompatibleProvider
@@ -171,6 +207,7 @@ def make_role_provider(
             env=env,
             model=resolved_model,
             log=log,
+            role=role or "role",
         )
 
     if not lazy:

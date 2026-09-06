@@ -42,6 +42,8 @@ DEFECT_CLASSES = (
     "duplicate_content",
     "coverage_gap",
     "register_drift",
+    "uncited_claim",
+    "contradicts_contract",
 )
 
 
@@ -89,6 +91,12 @@ def build_review_corpus() -> list[ReviewArtifactCase]:
         ("clean_cache", "Cache Coherence", "MESI and MOESI protocol state transition diagrams and bus snooping mechanisms."),
         ("clean_async", "Event Loop Mechanics", "Epoll reactor patterns, ready list queues, and non-blocking socket state machines."),
         ("clean_vector", "SIMD Vectorization", "Auto-vectorization patterns, loop peeling, and memory alignment constraints."),
+        ("clean_quic", "QUIC Transport", "Stream multiplexing, 0-RTT handshakes, and packet encryption protocols."),
+        ("clean_bloom", "Bloom Filters", "Optimal hash function count, false positive probability, and counting filter variants."),
+        ("clean_wal", "Write-Ahead Logging", "ARIES recovery algorithm, compensation log records, and fuzzy checkpointing."),
+        ("clean_paxos", "Multi-Paxos Consensus", "Phase 1 prepare/promise, Phase 2 accept/commit, and lease mechanisms."),
+        ("clean_tls", "TLS 1.3 Handshake", "Diffie-Hellman key exchange, AEAD cipher suites, and forward secrecy guarantees."),
+        ("clean_gpu", "GPU Pipeline Execution", "Warp divergence, shared memory bank conflicts, and tensor core throughput."),
     ]
 
     for name, title, topic in clean_specs:
@@ -116,7 +124,7 @@ def build_review_corpus() -> list[ReviewArtifactCase]:
         ))
 
     # ------------------------------------------------------------------
-    # 15 Defective Artifacts
+    # 21 Defective Artifacts
     # ------------------------------------------------------------------
     # Class 1: contract_rule_violated (4 cases)
     c1_specs = [
@@ -233,6 +241,48 @@ def build_review_corpus() -> list[ReviewArtifactCase]:
         defect_location_ratio=0.95,
     ))
 
+    # Class 5: uncited_claim (3 cases)
+    c5_specs = [
+        ("defect_c5_unverified_benchmark", "All performance claims must cite benchmark data",
+         "Our matrix multiplication kernel achieves 99.4% peak theoretical FLOPS."),
+        ("defect_c5_invented_statistic", "Statistical assertions must cite verified experiments",
+         "Over 84% of database lock contentions resolve within 2 microseconds in production."),
+        ("defect_c5_missing_claim_ref", "Empirical assertions must cite references",
+         "The algorithm reduces DRAM power consumption by 45% compared to DDR5 baselines."),
+    ]
+    for name, req, claim in c5_specs:
+        rubric = {"citations": f"Citations required: {req}"}
+        text = f"# Empirical Report {name}\n\n## Results\n{claim}\n"
+        cases.append(ReviewArtifactCase(
+            name=name,
+            artifact_text=text,
+            is_clean=False,
+            defect_class="uncited_claim",
+            node=_make_node(name, rubric),
+            defect_location_ratio=0.7,
+        ))
+
+    # Class 6: contradicts_contract (3 cases)
+    c6_specs = [
+        ("defect_c6_wrong_output_format", "Contract specifies output must be strict JSON",
+         "Outputting data as YAML format: \nserver:\n  host: 127.0.0.1\n  port: 8080"),
+        ("defect_c6_conflicting_invariant", "Contract specifies single-threaded event loop architecture",
+         "We spawn 16 OS threads sharing mutable global state protected by mutexes."),
+        ("defect_c6_unsupported_protocol", "Contract specifies HTTP/2 only",
+         "Configuring legacy HTTP/1.0 fallback with persistent keep-alive disabled."),
+    ]
+    for name, contract_spec, contradiction in c6_specs:
+        rubric = {"contract_compliance": f"Strict adherence to contract: {contract_spec}"}
+        text = f"# Specification Review {name}\n\n## Architecture\n{contradiction}\n"
+        cases.append(ReviewArtifactCase(
+            name=name,
+            artifact_text=text,
+            is_clean=False,
+            defect_class="contradicts_contract",
+            node=_make_node(name, rubric),
+            defect_location_ratio=0.6,
+        ))
+
     return cases
 
 
@@ -240,8 +290,9 @@ def evaluate_reviewer_metrics(
     verdicts: dict[str, ReviewVerdict],
     corpus: list[ReviewArtifactCase],
     token_counts: list[int] | None = None,
+    wall_clock_times: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Computes precision, recall, per-class recall, and mean tokens per call."""
+    """Computes precision, recall, per-class recall, mean tokens, and mean wall clock per call."""
     tp = 0
     fp = 0
     fn = 0
@@ -284,12 +335,18 @@ def evaluate_reviewer_metrics(
         if token_counts
         else 0.0
     )
+    mean_wall_clock = (
+        float(sum(wall_clock_times)) / max(1, len(wall_clock_times))
+        if wall_clock_times
+        else 0.0
+    )
 
     return {
         "precision": precision,
         "recall": recall,
         "per_class_recall": per_class_recall,
         "mean_tokens_per_call": mean_tokens,
+        "mean_wall_clock_per_call": mean_wall_clock,
         "tp": tp,
         "fp": fp,
         "fn": fn,
@@ -302,12 +359,12 @@ class ReviewerPrecisionTest(unittest.TestCase):
 
     def test_corpus_structure_and_invariants(self) -> None:
         corpus = build_review_corpus()
-        self.assertEqual(len(corpus), 30, "Corpus must contain exactly 30 artifacts")
+        self.assertEqual(len(corpus), 42, "Corpus must contain exactly 42 artifacts")
 
         clean_cases = [c for c in corpus if c.is_clean]
         defect_cases = [c for c in corpus if not c.is_clean]
-        self.assertEqual(len(clean_cases), 15, "Corpus must have 15 clean artifacts")
-        self.assertEqual(len(defect_cases), 15, "Corpus must have 15 defective artifacts")
+        self.assertEqual(len(clean_cases), 21, "Corpus must have 21 clean artifacts")
+        self.assertEqual(len(defect_cases), 21, "Corpus must have 21 defective artifacts")
 
         for cls in DEFECT_CLASSES:
             cls_cases = [c for c in defect_cases if c.defect_class == cls]
@@ -338,6 +395,7 @@ class ReviewerPrecisionTest(unittest.TestCase):
         self.assertIn("recall", baseline)
         self.assertIn("per_class_recall", baseline)
         self.assertIn("mean_tokens_per_call", baseline)
+        self.assertIn("mean_wall_clock_per_call", baseline)
         for cls in DEFECT_CLASSES:
             self.assertIn(cls, baseline["per_class_recall"])
 
@@ -355,17 +413,22 @@ class ReviewerPrecisionTest(unittest.TestCase):
                     verdict="fail",
                 )
 
-        metrics = evaluate_reviewer_metrics(verdicts, corpus, token_counts=[1000] * 30)
+        metrics = evaluate_reviewer_metrics(
+            verdicts, corpus, token_counts=[1000] * 42, wall_clock_times=[2.5] * 42
+        )
         self.assertEqual(metrics["precision"], 1.0)
         self.assertEqual(metrics["recall"], 1.0)
         for cls in DEFECT_CLASSES:
             self.assertEqual(metrics["per_class_recall"][cls], 1.0)
         self.assertEqual(metrics["mean_tokens_per_call"], 1000.0)
+        self.assertEqual(metrics["mean_wall_clock_per_call"], 2.5)
 
     def test_live_reviewer_precision(self) -> None:
-        """Runs the 30-artifact benchmark against a live provider when enabled."""
+        """Runs the 42-artifact benchmark against a live provider when enabled."""
         if os.environ.get("KUSUDAEMON_LIVE_REVIEW") != "1":
             raise unittest.SkipTest("KUSUDAEMON_LIVE_REVIEW != 1 (live review suite disabled)")
+
+        import time
 
         corpus = build_review_corpus()
         provider = OpenAICompatibleProvider()
@@ -373,14 +436,18 @@ class ReviewerPrecisionTest(unittest.TestCase):
 
         verdicts: dict[str, ReviewVerdict] = {}
         token_samples: list[int] = []
+        wall_clock_samples: list[float] = []
 
         for case in corpus:
+            t0 = time.perf_counter()
             verdict = review_node(case.node, case.artifact_text, provider)
+            elapsed = time.perf_counter() - t0
             verdicts[case.name] = verdict
+            wall_clock_samples.append(elapsed)
             tokens = estimate_tokens(case.artifact_text)
             token_samples.append(tokens)
 
-        metrics = evaluate_reviewer_metrics(verdicts, corpus, token_samples)
+        metrics = evaluate_reviewer_metrics(verdicts, corpus, token_samples, wall_clock_samples)
 
         # Print report
         print("\n=== Reviewer Precision & Recall Benchmark Report ===")
@@ -392,6 +459,7 @@ class ReviewerPrecisionTest(unittest.TestCase):
             base_rec = baseline["per_class_recall"].get(cls, 0.0)
             print(f"  - {cls}: {rec:.3f} (baseline: {base_rec:.3f})")
         print(f"Mean Tokens Per Call: {metrics['mean_tokens_per_call']:.1f}")
+        print(f"Mean Wall Clock Per Call: {metrics['mean_wall_clock_per_call']:.2f}s (budget: {baseline.get('mean_wall_clock_per_call', 0):.2f}s)")
 
         # Assert non-regression against checked-in baseline
         self.assertGreaterEqual(
@@ -410,6 +478,12 @@ class ReviewerPrecisionTest(unittest.TestCase):
                 actual,
                 base_rec,
                 f"Reviewer recall for '{cls}' ({actual:.3f}) regressed below baseline {base_rec:.3f}",
+            )
+        if "mean_wall_clock_per_call" in baseline:
+            self.assertLessEqual(
+                metrics["mean_wall_clock_per_call"],
+                baseline["mean_wall_clock_per_call"],
+                f"Mean wall clock per call {metrics['mean_wall_clock_per_call']:.2f} exceeded budget {baseline['mean_wall_clock_per_call']:.2f}",
             )
 
 

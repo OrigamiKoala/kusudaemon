@@ -5,7 +5,10 @@
     "contract_rule_violated": 0.75,
     "duplicate_content": 0.75,
     "coverage_gap": 0.75,
-    "register_drift": 0.75
+    "register_drift": 0.75,
+    "uncited_claim": 0.75,
+    "contradicts_contract": 0.75
   },
-  "mean_tokens_per_call": 4500.0
+  "mean_tokens_per_call": 4500.0,
+  "mean_wall_clock_per_call": 10.0
 }

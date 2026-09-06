@@ -37,21 +37,21 @@ CANONICAL_TO_CLAUDE: dict[str, tuple[str, ...]] = {
 
 # Canonical tool names to OpenCode permission keys
 CANONICAL_TO_OPENCODE: dict[str, tuple[str, ...]] = {
-    "read": ("read",),
+    "read": ("read", "glob", "grep"),
     "write": ("edit", "write"),
-    "edit": ("edit",),
+    "edit": ("edit", "write"),
     "save": ("edit", "write"),
     "patch": ("edit",),
     "shell": ("bash",),
     "bash": ("bash",),
-    "websearch": ("web_search",),
-    "web_search": ("web_search",),
-    "web": ("web_search",),
-    "list": ("read",),
-    "grep": ("read",),
-    "glob": ("read",),
-    str(SEARXNG_TOOL_PATH): ("web_search",),
-    str(WORKSPACE_READ_TOOL_PATH): ("read",),
+    "websearch": ("web_search", "websearch", "webfetch"),
+    "web_search": ("web_search", "websearch", "webfetch"),
+    "web": ("web_search", "websearch", "webfetch"),
+    "list": ("read", "glob"),
+    "grep": ("read", "grep"),
+    "glob": ("read", "glob"),
+    str(SEARXNG_TOOL_PATH): ("web_search", "websearch", "webfetch"),
+    str(WORKSPACE_READ_TOOL_PATH): ("read", "glob", "grep"),
 }
 
 # Canonical tool names to Antigravity tool names
@@ -207,13 +207,27 @@ def translate_tools_to_opencode_permissions(
         if mapped:
             allowed_opencode.update(mapped)
     if include_web_search:
-        allowed_opencode.add("web_search")
+        allowed_opencode.update({"web_search", "websearch", "webfetch"})
 
     perms: dict[str, str] = {}
-    all_known = ("read", "edit", "write", "bash", "web_search")
+    all_known = (
+        "read",
+        "edit",
+        "write",
+        "bash",
+        "web_search",
+        "websearch",
+        "webfetch",
+        "task",
+        "glob",
+        "grep",
+        "question",
+    )
     for k in all_known:
         if k in allowed_opencode:
             perms[k] = "allow"
         else:
             perms[k] = "deny"
+    if not allowed_tools and not include_web_search:
+        perms["*"] = "deny"
     return perms

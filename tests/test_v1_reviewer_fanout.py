@@ -314,6 +314,163 @@ class VerdictDigestCacheTest(unittest.TestCase):
         d3 = compute_verdict_digest("different text", {"a": "rule a"}, ["a"])
         self.assertNotEqual(d1, d3)
 
+    def test_compute_verdict_digest_with_contract_text(self) -> None:
+        from kusudaemon.v1.reviewer import compute_verdict_digest
+
+        d1 = compute_verdict_digest("text", {"a": "rule a"}, ["a"], contract_text="contract v1")
+        d2 = compute_verdict_digest("text", {"a": "rule a"}, ["a"], contract_text="contract v2")
+        self.assertNotEqual(d1, d2)
+
+
+class DeterministicPreFilterTest(unittest.TestCase):
+    def test_skips_model_call_when_all_judgments_gate_covered_and_passed(self) -> None:
+        node = TaskNode(
+            id="derivation_node",
+            brief="derive",
+            artifact="out/derivation_node.md",
+            gates=["latex_balanced"],
+            judgment=["latex_syntax"],
+            rubric={"latex_syntax": "LaTeX formulas must be balanced and well-formed"},
+        )
+        gate_results = {"latex_balanced": {"passed": True, "detail": "balanced"}}
+        provider = FakeProvider([])
+        verdict = review_node(node, "$$x=y$$", provider, gate_results=gate_results)
+        self.assertEqual(len(provider.calls), 0)
+        self.assertEqual(verdict.verdict, "pass")
+        self.assertEqual(len(verdict.items), 1)
+        self.assertTrue(verdict.items[0]["pass"])
+
+    def test_calls_model_if_gate_failed(self) -> None:
+        node = TaskNode(
+            id="derivation_node",
+            brief="derive",
+            artifact="out/derivation_node.md",
+            gates=["latex_balanced"],
+            judgment=["latex_syntax"],
+            rubric={"latex_syntax": "LaTeX formulas must be balanced and well-formed"},
+        )
+        gate_results = {"latex_balanced": {"passed": False, "detail": "unbalanced"}}
+        provider = FakeProvider([{"items": [], "verdict": "pass"}])
+        verdict = review_node(node, "$$x=y", provider, gate_results=gate_results)
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_calls_model_if_some_judgment_not_gate_covered(self) -> None:
+        node = TaskNode(
+            id="derivation_node",
+            brief="derive",
+            artifact="out/derivation_node.md",
+            gates=["latex_balanced"],
+            judgment=["latex_syntax", "clarity"],
+            rubric={"latex_syntax": "LaTeX formulas must be balanced", "clarity": "be clear"},
+        )
+        gate_results = {"latex_balanced": {"passed": True, "detail": "balanced"}}
+        provider = FakeProvider([{"items": [], "verdict": "pass"}])
+        verdict = review_node(node, "$$x=y$$", provider, gate_results=gate_results)
+        self.assertEqual(len(provider.calls), 1)
+
+
+class ClosedRubricFilterTest(unittest.TestCase):
+    def test_filters_out_open_judgment_items(self) -> None:
+        node = TaskNode(
+            id="mixed_node",
+            brief="write",
+            artifact="out/mixed_node.md",
+            gates=["nonempty"],
+            judgment=["aesthetic_feel", "contract_rules"],
+            rubric={"aesthetic_feel": "feel good", "contract_rules": "obey contract"},
+            judgment_classification={"aesthetic_feel": "open", "contract_rules": "closed"},
+        )
+        provider = FakeProvider([{"items": [{"id": "contract_rules", "pass": True}], "verdict": "pass"}])
+        verdict = review_node(node, "text", provider)
+        self.assertEqual(len(provider.calls), 1)
+        prompt = provider.calls[0][0][1]["content"]
+        self.assertIn("contract_rules", prompt)
+        self.assertNotIn("aesthetic_feel", prompt)
+
+    def test_auto_passes_when_all_judgment_items_are_open(self) -> None:
+        node = TaskNode(
+            id="all_open_node",
+            brief="write",
+            artifact="out/all_open_node.md",
+            gates=["nonempty"],
+            judgment=["aesthetic_feel"],
+            rubric={"aesthetic_feel": "feel good"},
+            judgment_classification={"aesthetic_feel": "open"},
+        )
+        provider = FakeProvider([])
+        verdict = review_node(node, "text", provider)
+        self.assertEqual(len(provider.calls), 0)
+        self.assertEqual(verdict.verdict, "pass")
+
+
+class TwoStageTriageTest(unittest.TestCase):
+    def test_triage_clean_skips_reviewer_call(self) -> None:
+        triage_provider = FakeProvider([{"suspect": False, "reason": "clean text"}])
+        reviewer_provider = FakeProvider([])
+        verdict = review_node(
+            _node(),
+            "Short clean text",
+            reviewer_provider,
+            triage_provider=triage_provider,
+        )
+        self.assertEqual(len(triage_provider.calls), 1)
+        self.assertEqual(len(reviewer_provider.calls), 0)
+        self.assertEqual(verdict.verdict, "pass")
+
+    def test_triage_suspect_calls_reviewer(self) -> None:
+        text = "## Section 1\nClean text.\n\n## Section 2\nFishy text.\n\n"
+        triage_provider = FakeProvider([{"suspect": True, "reason": "possible issues in text"}])
+        reviewer_provider = FakeProvider([
+            {"items": [{"id": "clarity", "pass": False, "defect": "bad style"}], "verdict": "fail"}
+        ])
+        verdict = review_node(
+            _node(),
+            text,
+            reviewer_provider,
+            triage_provider=triage_provider,
+        )
+        self.assertEqual(len(triage_provider.calls), 1)
+        self.assertEqual(len(reviewer_provider.calls), 1)
+        self.assertEqual(verdict.verdict, "fail")
+
+
+class CachedSectionDeltaTest(unittest.TestCase):
+    def test_cached_section_skips_provider_call(self) -> None:
+        from kusudaemon.v1.reviewer import compute_verdict_digest
+
+        node = _node()
+        text = "## Section 1\nStatic content.\n\n"
+        sec_digest = compute_verdict_digest(text, node.rubric, node.judgment)
+        cached_sections = [
+            {
+                "digest": sec_digest,
+                "passed": True,
+                "items": [{"id": "clarity", "pass": True}],
+                "verdict": "pass",
+            }
+        ]
+        provider = FakeProvider([])
+        verdict = review_node(node, text, provider, cached_sections=cached_sections)
+        self.assertEqual(len(provider.calls), 0)
+        self.assertEqual(verdict.verdict, "pass")
+
+
+class GroundedContextTest(unittest.TestCase):
+    def test_grounded_context_in_prompt(self) -> None:
+        provider = FakeProvider([{"items": [], "verdict": "pass"}])
+        review_node(
+            _node(),
+            "Artifact text",
+            provider,
+            contract_text="Must contain 3 lemmas.",
+            declared_inputs="['spine: unit 42', 'raw: finding A']",
+        )
+        self.assertEqual(len(provider.calls), 1)
+        prompt = provider.calls[0][0][1]["content"]
+        self.assertIn("Contract:\nMust contain 3 lemmas.", prompt)
+        self.assertIn("Declared Inputs:\n['spine: unit 42', 'raw: finding A']", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
+

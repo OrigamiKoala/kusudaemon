@@ -503,7 +503,7 @@ class _InMemoryWriterAdapter:
         return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
 
 
-def _writer_factory(run_dir: Path, content: str = "a small, real artifact body.\n"):
+def _writer_factory(run_dir: Path, content: str = "# Artifact\n\na small, real artifact body.\n"):
     def factory(node):
         return _InMemoryWriterAdapter(node_artifact_path(run_dir, node.id), content)
 

@@ -162,11 +162,18 @@ def _artifact_instruction(node: TaskNode, run_dir: Path) -> str:
     relative, because a relative path is only correct while the agent's cwd
     happens to equal the run directory (§D0b — workspace mode breaks that)."""
     absolute_path = resolve_stored(run_dir, node.artifact)
-    return (
+    instruction = (
         f"Write your artifact to `{absolute_path}` using your file tools "
         "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
         "else you write or say is."
     )
+    if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
+        claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")
+        instruction += (
+            " When making factual claims, cite them using `[ref:N]` anchors and "
+            f"record them in `{claims_path}` as JSON lines with `assertion` and `ref`."
+        )
+    return instruction
 
 
 

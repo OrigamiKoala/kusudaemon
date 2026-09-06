@@ -224,32 +224,44 @@ async def review_and_transition_node(
     async or an adapter moves calls onto threads.``"""
     run_dir = Path(run_dir)
     artifact_text = _read_artifact(run_dir, node.id)
-    verdict_digest = compute_verdict_digest(artifact_text, node.rubric, node.judgment)
+    contract_text = ""
+    try:
+        from ..v2.run_dir import contract_path
+        cp = contract_path(run_dir)
+        if cp.exists():
+            contract_text = cp.read_text(encoding="utf-8")
+    except Exception:
+        contract_text = ""
+
+    verdict_digest = compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text)
     cached_verdict: ReviewVerdict | None = None
+    cached_sections: list[dict[str, Any]] | None = None
     audit_file = audit_path(run_dir, node.id)
     if not disable_review and audit_file.exists():
         try:
             loaded = json.loads(audit_file.read_text(encoding="utf-8"))
-            if (
-                isinstance(loaded, dict)
-                and loaded.get("verdict_digest") == verdict_digest
-                and loaded.get("verdict") == "pass"
-            ):
-                cached_verdict = ReviewVerdict(
-                    node_id=node.id,
-                    items=list(loaded.get("items", [])),
-                    verdict="pass",
-                    truncated=bool(loaded.get("truncated", False)),
-                )
-                log.append(
-                    {
-                        "node_id": node.id,
-                        "role": "reviewer",
-                        "round": 0,
-                        "type": "node_review_cached",
-                        "detail": f"verdict_digest {verdict_digest[:12]} matched cached pass",
-                    }
-                )
+            if isinstance(loaded, dict):
+                cached_sections = loaded.get("sections")
+                if (
+                    loaded.get("verdict_digest") == verdict_digest
+                    and loaded.get("verdict") == "pass"
+                ):
+                    cached_verdict = ReviewVerdict(
+                        node_id=node.id,
+                        items=list(loaded.get("items", [])),
+                        verdict="pass",
+                        truncated=bool(loaded.get("truncated", False)),
+                        section_verdicts=list(loaded.get("sections", [])),
+                    )
+                    log.append(
+                        {
+                            "node_id": node.id,
+                            "role": "reviewer",
+                            "round": 0,
+                            "type": "node_review_cached",
+                            "detail": f"verdict_digest {verdict_digest[:12]} matched cached pass",
+                        }
+                    )
         except Exception:
             cached_verdict = None
 
@@ -302,11 +314,63 @@ async def review_and_transition_node(
     elif cached_verdict is not None:
         verdict = cached_verdict
     else:
+        # Assemble declared inputs: manifest handoffs, spine structural unit, research findings
+        declared_inputs_parts: list[str] = []
+        if node.depends_on:
+            try:
+                from .manifest import read_all_manifest_entries
+                m_path = run_dir / "manifest.jsonl"
+                if m_path.exists():
+                    entries = read_all_manifest_entries(m_path)
+                    promotions = {
+                        str(e.get("node")): str(e.get("promotion", ""))
+                        for e in entries if e.get("node") and e.get("promotion")
+                    }
+                    for dep in node.depends_on:
+                        if dep in promotions:
+                            declared_inputs_parts.append(f"Handoff from {dep}: {promotions[dep]}")
+            except Exception:
+                pass
+
+        spine_file = run_dir / "spine.json"
+        if spine_file.exists():
+            try:
+                spine_data = json.loads(spine_file.read_text(encoding="utf-8"))
+                units = spine_data.get("units", [])
+                for u in units:
+                    if (
+                        u.get("id") == getattr(node, "spine_unit", None)
+                        or u.get("id") == node.id
+                        or u.get("label") == node.brief
+                    ):
+                        declared_inputs_parts.append(f"Spine unit: {json.dumps(u)}")
+                        break
+            except Exception:
+                pass
+
+        if node.inputs:
+            for inp in node.inputs:
+                if "research" in str(inp):
+                    inp_path = run_dir / inp
+                    if inp_path.is_file():
+                        try:
+                            finding_text = inp_path.read_text(encoding="utf-8")[:2000]
+                            declared_inputs_parts.append(f"Research finding ({inp}): {finding_text}")
+                        except Exception:
+                            pass
+        declared_inputs_str = "\n\n".join(declared_inputs_parts)
+
         async def _do_review() -> ReviewVerdict:
+            kwargs: dict[str, Any] = dict(
+                contract_text=contract_text,
+                declared_inputs=declared_inputs_str,
+                cached_sections=cached_sections,
+                judgment_classification=getattr(node, "judgment_classification", None),
+            )
             if provider_semaphore is not None:
                 async with provider_semaphore:
-                    return await asyncio.to_thread(review_node, node, artifact_text, provider)
-            return await asyncio.to_thread(review_node, node, artifact_text, provider)
+                    return await asyncio.to_thread(review_node, node, artifact_text, provider, **kwargs)
+            return await asyncio.to_thread(review_node, node, artifact_text, provider, **kwargs)
 
         review_task = asyncio.create_task(_do_review())
         while not review_task.done():
@@ -353,7 +417,14 @@ async def review_and_transition_node(
     if not disable_review and verdict.verdict == "pass" and review_sample_rate > 0.0 and node.judgment:
         import random
         if random.random() < review_sample_rate:
-            sampled = review_node(node, artifact_text, provider, temperature=0.7)
+            sampled = review_node(
+                node,
+                artifact_text,
+                provider,
+                contract_text=contract_text,
+                declared_inputs=declared_inputs_str if 'declared_inputs_str' in locals() else "",
+                temperature=0.7,
+            )
             if sampled.verdict != "pass":
                 sampled_disagreement = True
                 log.append({
@@ -365,7 +436,7 @@ async def review_and_transition_node(
                     "sampled_items": sampled.items,
                 })
 
-    _write_audit(run_dir, node, verdict, artifact_text=artifact_text)
+    _write_audit(run_dir, node, verdict, artifact_text=artifact_text, contract_text=contract_text)
     if sampled_disagreement:
         try:
             audit_data = json.loads(audit_file.read_text(encoding="utf-8"))
@@ -783,6 +854,7 @@ def _write_audit(
     node: TaskNode,
     verdict: ReviewVerdict,
     artifact_text: str = "",
+    contract_text: str = "",
 ) -> None:
     path = ensure_audit_path(run_dir, node.id)
     gates: dict | None = None
@@ -806,7 +878,8 @@ def _write_audit(
             "items": verdict.items,
             "verdict": verdict.verdict,
             "truncated": verdict.truncated,
-            "verdict_digest": compute_verdict_digest(artifact_text, node.rubric, node.judgment),
+            "verdict_digest": compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text),
+            "sections": getattr(verdict, "section_verdicts", []),
         }
     )
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")

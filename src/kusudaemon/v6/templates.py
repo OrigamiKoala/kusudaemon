@@ -84,6 +84,7 @@ class NodeTemplate:
     warn_gates: tuple[str, ...] = ()
     judgment: tuple[str, ...] = ()
     rubric: dict[str, str] = field(default_factory=dict)
+    judgment_classification: dict[str, str] = field(default_factory=dict)
     # The episode's tool allowlist for a node of this shape (PLAN-AUDIT-COST
     # §A6-3). Empty means "no opinion" — the adapter keeps its
     # ``DEFAULT_TOOL_ALLOWLIST`` fallback (T0/T1 direct nodes and
@@ -112,19 +113,14 @@ class NodeTemplate:
 _GENERIC = NodeTemplate(name="generic")
 
 # A problem-set leaf (§6's example shape): ships ``problems>=5`` as a
-# warn-gate (the §15.4 example), ``headers:std`` for a basic heading
-# policy, and a single judgment item asking the reviewer to confirm each
-# worked problem actually works through its stated method. The judgment
-# text is contract-substitutable: when the driver freezes a contract whose
-# own §4.4-derived rules say "use SI units," that rule becomes part of the
-# judgment text rather than being elided — the template just names the
-# slot for it. §A6-3: keeps ``shell`` (computing/checking answers is the
-# point of a problem set) but drops ``patch``.
+# warn-gate (the §15.4 example), ``headers:std`` as hard gate.
 _PROBLEM_SET = NodeTemplate(
     name="problem-set",
     shapes=("problem-set-dominant",),
-    warn_gates=("headers:std", "problems>=5"),
+    gates=("headers:std",),
+    warn_gates=("problems>=5",),
     judgment=("worked_examples_reachable",),
+    judgment_classification={"worked_examples_reachable": "closed"},
     tools=("read", "save", "shell"),
     rubric={
         "worked_examples_reachable": (
@@ -135,17 +131,14 @@ _PROBLEM_SET = NodeTemplate(
     },
 )
 
-# A derivation-dominant leaf: the math notation has to be syntactically
-# balanced before any reviewer can fairly judge whether the algebra is
-# right — ``latex_balanced`` is the structural precondition for an
-# operator-style judgment about derivation correctness. §A6-3: keeps
-# ``shell`` (a derivation writer plausibly wants to verify a step
-# computationally) but drops ``patch``.
+# A derivation-dominant leaf: ``latex_balanced`` and ``headers:std`` graduated to hard gates.
 _DERIVATION = NodeTemplate(
     name="derivation",
     shapes=("derivation-dominant",),
-    warn_gates=("headers:std", "latex_balanced"),
+    gates=("headers:std", "latex_balanced"),
+    warn_gates=(),
     judgment=("derivation_self_consistent",),
+    judgment_classification={"derivation_self_consistent": "closed"},
     tools=("read", "save", "shell"),
     rubric={
         "derivation_self_consistent": (
@@ -156,15 +149,14 @@ _DERIVATION = NodeTemplate(
     },
 )
 
-# A reference-dominant leaf — a glossary/appendix. ``terms_defined``
-# checks every bold or bracket-quoted candidate term against the on-disk
-# glossary.json the driver writes once the leaf is published. §A6-3: like
-# prose, writing-only — ``read``/``save``, no ``shell``/``patch``.
+# A reference-dominant leaf — a glossary/appendix. ``refs_resolve`` graduated to hard gate.
 _REFERENCE = NodeTemplate(
     name="reference",
     shapes=("reference-dominant",),
-    warn_gates=("headers:std", "terms_defined", "refs_resolve"),
+    gates=("headers:std", "refs_resolve"),
+    warn_gates=("terms_defined",),
     judgment=("every_term_defined_once",),
+    judgment_classification={"every_term_defined_once": "closed"},
     tools=("read", "save"),
     rubric={
         "every_term_defined_once": (
@@ -175,22 +167,12 @@ _REFERENCE = NodeTemplate(
     },
 )
 
-# A prose-dominant leaf: ``headers:std`` for basic hygiene only. The
-# reviewer is the one who notices the actual semantic gaps, so this
-# template ships *no* judgment items — §B6's fan-out already ensures the
-# reviewer sees the whole (over-cap-bounded) artifact, which is the real
-# semantic bar for prose. Writing too many judgment items here is the
-# monotonic-inflation failure §4.4 forbade for the contract, repeated at
-# the leaf layer.
-#
-# §A6-3: ``tools=("read", "save")`` — a prose leaf writes one artifact from
-# its inputs; it never executes anything, so gptme's ``shell`` (the largest
-# tool-doc block) and ``patch`` (unneeded when ``save`` can rewrite the
-# artifact wholesale) leave the episode prompt.
+# A prose-dominant leaf: ``headers:std`` hard gate for basic hygiene.
 _PROSE = NodeTemplate(
     name="prose",
     shapes=("prose-dominant",),
-    warn_gates=("headers:std",),
+    gates=("headers:std",),
+    warn_gates=(),
     tools=("read", "save"),
 )
 
@@ -311,6 +293,10 @@ def apply_template_to_node(
     merged_rubric = dict(template.rubric)
     merged_rubric.update(node.rubric)
     node.rubric = merged_rubric
+    # judgment_classification: dict update — existing wins.
+    merged_jc = dict(template.judgment_classification)
+    merged_jc.update(getattr(node, "judgment_classification", {}))
+    node.judgment_classification = merged_jc
     # tools: the node's own list wins; a tool-less node takes the
     # template's per-shape allowlist (§A6-3).
     if not node.tools and template.tools:

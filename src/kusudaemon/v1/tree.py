@@ -119,6 +119,7 @@ class TaskNode:
     # node — direct construction with warn_gates stays legal for tests and
     # hand-authored trees, the same way it does for gates.
     warn_gates: list[str] = field(default_factory=list)
+    judgment_classification: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate_node(self)
@@ -152,6 +153,7 @@ class TaskNode:
             last_defect=str(data.get("last_defect", "")),
             parent=str(data.get("parent", "")),
             warn_gates=list(data.get("warn_gates") or []),
+            judgment_classification=dict(data.get("judgment_classification") or {}),
         )
 
 
