@@ -33,7 +33,7 @@ import fnmatch
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterator, Literal
+from typing import Any, Iterator, Literal
 
 from ..v1.gates import estimate_tokens
 from ..v2.survey import SpineUnit
@@ -440,6 +440,22 @@ def survey_workspace(
             )
         )
     return units
+
+
+def is_empty_workspace_spine(units: list[Any]) -> bool:
+    """PLAN-WORKSPACE-MODE.md §K1: True only for survey_workspace's synthetic
+    no-files unit. Never keys off start_chunk: -1 is that function's sentinel
+    on EVERY unit."""
+    return not units or (len(units) == 1 and not getattr(units[0], "members", ()))
+
+
+# PLAN-WORKSPACE-MODE.md §K1 (§R1 floor): below this many measured input
+# tokens a plannable-looking single-unit workspace still keeps the
+# single-node path — 057/058/059 stay on today's path by measurement rather
+# than by accident. Kept in sync with tiering._T1_WORK_TOKENS_CEILING by
+# construction (same value, shared concept of "measured small"); the §R1
+# output-signal conjunction lives in _plan_will_partition, not here.
+PLAN_MIN_WORKSPACE_TOKENS = 2_000
 
 
 def _chunk_by_token_ceiling(

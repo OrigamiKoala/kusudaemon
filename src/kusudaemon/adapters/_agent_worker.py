@@ -854,17 +854,177 @@ async def _pump(proc: asyncio.subprocess.Process, fmt: str, session_dir: str) ->
             print(emitted, flush=True)
 
 
+_OPENCODE_FATAL_PATTERNS = (
+    "Rate limit exceeded",
+    "rate limit",
+    "AI_APICallError",
+)
+
+
+def _is_opencode_fatal_error(line: str) -> str | None:
+    if "level=ERROR" not in line:
+        return None
+    # Ignore harmless title generation errors unless rate limit / quota
+    if "agent=title" in line and not any(p in line for p in ("Rate limit", "rate limit", "quota")):
+        return None
+    if "stream error" in line or any(p in line for p in _OPENCODE_FATAL_PATTERNS):
+        import re
+        m = re.search(r'error\.error="([^"]+)"', line)
+        if m:
+            return m.group(1)
+        m = re.search(r'error="([^"]+)"', line)
+        if m:
+            return m.group(1)
+        return line.strip()
+    return None
+
+
+async def _pump_stderr(
+    proc: asyncio.subprocess.Process,
+    fmt: str,
+    fatal_event: asyncio.Event,
+    fatal_holder: dict[str, str],
+) -> None:
+    if proc.stderr is None:
+        return
+    while True:
+        try:
+            data = await proc.stderr.readline()
+        except Exception:
+            break
+        if not data:
+            break
+        line = data.decode("utf-8", errors="replace")
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        if fmt == OPENCODE and not fatal_event.is_set():
+            err = _is_opencode_fatal_error(line)
+            if err:
+                fatal_holder["error"] = err
+                fatal_event.set()
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+
+
+async def _watch_opencode_log(
+    proc: asyncio.subprocess.Process,
+    start_offset: int,
+    fatal_event: asyncio.Event,
+    fatal_holder: dict[str, str],
+) -> None:
+    log_path = os.path.expanduser("~/.local/share/opencode/log/opencode.log")
+    if not os.path.exists(log_path):
+        return
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(start_offset)
+            while proc.returncode is None and not fatal_event.is_set():
+                line = f.readline()
+                if not line:
+                    await asyncio.sleep(0.5)
+                    continue
+                err = _is_opencode_fatal_error(line)
+                if err:
+                    fatal_holder["error"] = err
+                    fatal_event.set()
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    break
+    except Exception:
+        pass
+
+
+async def _fatal_killer(proc: asyncio.subprocess.Process, fatal_event: asyncio.Event) -> None:
+    await fatal_event.wait()
+    for _ in range(10):
+        if proc.returncode is not None:
+            return
+        await asyncio.sleep(0.1)
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _run(fmt: str, command: list[str], session_dir: str) -> int:
+    cmd = list(command)
+    start_offset = 0
+    if fmt == OPENCODE:
+        if "--print-logs" not in cmd:
+            if "run" in cmd:
+                idx = cmd.index("run")
+                cmd.insert(idx + 1, "--print-logs")
+            else:
+                cmd.append("--print-logs")
+        log_path = os.path.expanduser("~/.local/share/opencode/log/opencode.log")
+        if os.path.exists(log_path):
+            try:
+                start_offset = os.path.getsize(log_path)
+            except OSError:
+                start_offset = 0
+
     proc = await asyncio.create_subprocess_exec(
-        *command,
+        *cmd,
         stdin=0,  # the prompt file, from the shell's `< {prompt_path}`
         stdout=asyncio.subprocess.PIPE,
-        stderr=None,  # inherit: reaches the harness's stderr as if direct
+        stderr=asyncio.subprocess.PIPE if fmt == OPENCODE else None,
         limit=_MAX_LINE_BYTES,
     )
+
+    fatal_event = asyncio.Event()
+    fatal_holder: dict[str, str] = {}
+
     pump_task = asyncio.ensure_future(_pump(proc, fmt, session_dir))
-    await proc.wait()
+    stderr_task = None
+    log_watch_task = None
+    killer_task = None
+
+    if fmt == OPENCODE:
+        stderr_task = asyncio.ensure_future(_pump_stderr(proc, fmt, fatal_event, fatal_holder))
+        log_watch_task = asyncio.ensure_future(_watch_opencode_log(proc, start_offset, fatal_event, fatal_holder))
+        killer_task = asyncio.ensure_future(_fatal_killer(proc, fatal_event))
+
+    # Wait for process exit or fatal error trigger
+    wait_proc = asyncio.ensure_future(proc.wait())
+    wait_fatal = asyncio.ensure_future(fatal_event.wait())
+
+    done, pending = await asyncio.wait([wait_proc, wait_fatal], return_when=asyncio.FIRST_COMPLETED)
+
+    if fatal_event.is_set():
+        wait_fatal.cancel()
+        # Give process up to 1.5s to terminate
+        try:
+            await asyncio.wait_for(asyncio.shield(wait_proc), timeout=1.5)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await wait_proc
+        pump_task.cancel()
+        if stderr_task:
+            stderr_task.cancel()
+        if log_watch_task:
+            log_watch_task.cancel()
+        if killer_task:
+            killer_task.cancel()
+        err = fatal_holder.get("error") or "opencode fatal stream error"
+        print(json.dumps({"type": "message", "role": "system", "content": f"Error: {err}"}), flush=True)
+        return proc.returncode or 1
+
+    wait_fatal.cancel()
+    await wait_proc
     await pump_task
+    if stderr_task:
+        await stderr_task
+    if log_watch_task:
+        log_watch_task.cancel()
+    if killer_task:
+        killer_task.cancel()
     return proc.returncode or 0
 
 

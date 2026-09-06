@@ -137,7 +137,8 @@ class TestBenchCLI(unittest.TestCase):
 
         def fake_runner(cmd, cwd, capture_output, text):
             executed_cmds.append((cmd, cwd))
-            return DummyCompletedProcess(returncode=0, stdout="All tests passed")
+            stdout_data = json.dumps({"usage": {"input_tokens": 120, "output_tokens": 45}}) + "\n"
+            return DummyCompletedProcess(returncode=0, stdout=stdout_data)
 
         parser = build_pipeline_parser()
         output_file = Path(self.tmp_dir) / "result_arm_a.json"
@@ -161,6 +162,7 @@ class TestBenchCLI(unittest.TestCase):
         cmd, cwd = executed_cmds[0]
         self.assertEqual(cmd, [
             "opencode", "run",
+            "--print-logs",
             "--model", "opencode/nemotron-3.5-lightning-free",
             "--auto", "Solve task bare"
         ])
@@ -174,6 +176,7 @@ class TestBenchCLI(unittest.TestCase):
         self.assertTrue(data["resolved"])
         self.assertEqual(data["score"], 1.0)
         self.assertIsNone(data["halt_reason"])
+        self.assertEqual(data["tokens_by_role"], {"bare": 165})
 
     def test_arm_b_decomposition_only(self) -> None:
         captured_options = []

@@ -42,6 +42,7 @@ real exploration instead of a free heuristic standing in for it.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -72,6 +73,27 @@ _OUTPUT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NUMERIC_WORDS = (
+    r"\d+",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+    "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+    "eighty", "ninety", "hundred", "thousand",
+)
+_NUMERIC_TARGET_NOUNS = (
+    "chapters?", "sections?", "parts?", "modules?", "files?", "words?",
+    "pages?", "steps?", "items?", "tests?", "suites?", "benchmarks?",
+    "subtasks?", "components?", "deliverables?",
+)
+_NUMERIC_TARGET_RE = re.compile(
+    r"\b(?:"
+    + "|".join(_NUMERIC_WORDS)
+    + r")\s+(?:per\s+\w+|"
+    + "|".join(_NUMERIC_TARGET_NOUNS)
+    + r")\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class Signals:
@@ -83,6 +105,7 @@ class Signals:
     named_paths: tuple[str, ...] = ()
     breadth_markers: int = 0
     output_markers: int = 0
+    output_targets: int = 0
 
 
 def _named_paths(goal: str, work: WorkObject) -> tuple[str, ...]:
@@ -108,10 +131,22 @@ def measure_signals(goal: str, work: WorkObject) -> Signals:
         named_paths=_named_paths(goal, work),
         breadth_markers=len(_BREADTH_RE.findall(goal)),
         output_markers=len(_OUTPUT_RE.findall(goal)),
+        output_targets=len(_NUMERIC_TARGET_RE.findall(goal)),
     )
 
 
 FILES_TOUCHED_VALUES = ("1", "few", "many", "unknown")
+
+# PLAN-REVIEW-LATENCY-STATUS.md §8.4a: model-supplied evidence about the *kind*
+# of work — never a phase/review bypass (that stays rejected per §8.3), only
+# an input to the code table in _classify_raw. "unknown" preserves today's
+# behavior exactly.
+WORK_KIND_VALUES = ("document", "procedure", "code-edit", "unknown")
+
+
+def _normalize_work_kind(value: object) -> str:
+    text = str(value).strip().lower() if value is not None else "unknown"
+    return text if text in WORK_KIND_VALUES else "unknown"
 
 
 @dataclass(frozen=True)
@@ -123,6 +158,7 @@ class ScopeEstimate:
     answerable_without_exploration: bool = False
     ambiguities: tuple[str, ...] = ()
     objections: tuple[str, ...] = ()
+    work_kind: str = "unknown"
 
 
 ESTIMATE_SCHEMA: dict[str, Any] = {
@@ -133,6 +169,7 @@ ESTIMATE_SCHEMA: dict[str, Any] = {
         "files_touched": {"type": "string", "enum": list(FILES_TOUCHED_VALUES)},
         "artifacts": {"type": "integer", "minimum": 1, "maximum": 50},
         "answerable_without_exploration": {"type": "boolean"},
+        "work_kind": {"type": "string", "enum": list(WORK_KIND_VALUES)},
         "ambiguities": {
             "type": "array",
             "items": {"type": "string", "maxLength": 200},
@@ -154,7 +191,11 @@ _ESTIMATE_SYSTEM_PROMPT = (
     "goal implies producing; whether it plausibly touches exactly one file, "
     "a few, many, or you cannot tell (files_touched); whether you could "
     "answer it correctly right now without exploring the work object "
-    "further (answerable_without_exploration); and list any genuine "
+    "further (answerable_without_exploration); what kind of work this "
+    "primarily is -- producing a document (document), performing operations "
+    "or procedures in an environment such as running commands, restarting "
+    "services, or applying patches (procedure), editing code (code-edit), "
+    "or you cannot tell (work_kind, default unknown); and list any genuine "
     "ambiguities or objections -- contradictions in the goal, missing "
     "information you would need -- empty arrays if there are none. This "
     "estimate is advisory only; the harness, not you, decides what happens "
@@ -203,6 +244,7 @@ def estimate_scope(
         answerable_without_exploration=bool(payload.get("answerable_without_exploration", False)),
         ambiguities=tuple(str(item) for item in (payload.get("ambiguities") or [])),
         objections=tuple(str(item) for item in (payload.get("objections") or [])),
+        work_kind=_normalize_work_kind(payload.get("work_kind", "unknown")),
     )
 
 
@@ -229,6 +271,7 @@ FULL_SCOPE_SCHEMA: dict[str, Any] = {
         "files_touched": {"type": "string", "enum": list(FILES_TOUCHED_VALUES)},
         "artifacts": {"type": "integer", "minimum": 1, "maximum": 50},
         "answerable_without_exploration": {"type": "boolean"},
+        "work_kind": {"type": "string", "enum": list(WORK_KIND_VALUES)},
         "questions": {
             "type": "array",
             "items": {
@@ -330,6 +373,7 @@ def estimate_scope_full(
         answerable_without_exploration=bool(payload.get("answerable_without_exploration", False)),
         ambiguities=tuple(question.text for question in questions),
         objections=tuple(objection.claim for objection in objections),
+        work_kind=_normalize_work_kind(payload.get("work_kind", "unknown")),
     )
     return estimate, QuestionSet(questions=questions, objections=objections)
 
@@ -342,6 +386,34 @@ def estimate_scope_full(
 # the writer never saw the corpus). A corpus that big falls through to T2,
 # where survey builds a spine and the planner partitions it.
 _T2_WORK_TOKENS_CEILING = 150_000
+_T1_WORK_TOKENS_CEILING = 2_000
+_T1_WORK_FILES_CEILING = 8
+
+
+def _numeric_output_target(goal: str) -> bool:
+    return bool(_NUMERIC_TARGET_RE.search(goal))
+
+
+def _measured_small(signals: Signals, estimate: ScopeEstimate, goal: str = "") -> bool:
+    """PLAN-WORKSPACE-MODE.md §R1: Floor is a conjunction over input AND output evidence.
+    Declines escalation only when every signal agrees the work is small."""
+    has_target = bool(signals.output_targets > 0 or (goal and _numeric_output_target(goal)))
+    return (
+        signals.work_tokens < _T1_WORK_TOKENS_CEILING
+        and signals.work_files <= _T1_WORK_FILES_CEILING
+        and signals.breadth_markers == 0
+        and signals.output_markers == 0
+        and not has_target
+        and estimate.artifacts <= 1
+    )
+
+
+def _files_touched_from_signals(signals: Signals) -> str:
+    if signals.work_files <= 1:
+        return "1"
+    if signals.work_files <= 8:
+        return "few"
+    return "many"
 
 
 def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:
@@ -366,14 +438,85 @@ def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:
     return "T3"
 
 
-def classify(signals: Signals, estimate: ScopeEstimate) -> Tier:
+def classify(
+    signals: Signals,
+    estimate: ScopeEstimate,
+    *,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    log: Any = None,
+    goal: str = "",
+) -> Tier:
     """PLAN.md §A4.3: "`unknown` in `files_touched` forces at least T2 — an
     estimator that cannot tell is exactly the case that needs exploration."
     Applied as an override on top of the table rather than folded into it,
-    so the table itself stays a plain reading of §A4.3's rows."""
-    tier = _classify_raw(signals, estimate)
-    if estimate.files_touched == "unknown" and _TIER_RANK[tier] < _TIER_RANK["T2"]:
-        return "T2"
+    so the table itself stays a plain reading of §A4.3's rows.
+
+    PLAN-WORKSPACE-MODE.md §K0, §R1: Guard the escalation behind
+    KUSUDAEMON_TIER_TRUST_SIGNALS. A model estimate of 'unknown' must not
+    outrank measured small signals."""
+    if log is not None and on_event is None:
+        if hasattr(log, "emit"):
+            on_event = lambda ev: log.emit(ev.get("type"), **{k: v for k, v in ev.items() if k != "type"})
+        elif hasattr(log, "append"):
+            on_event = lambda ev: log.append(ev)
+
+    if estimate.files_touched == "unknown":
+        if os.getenv("KUSUDAEMON_TIER_TRUST_SIGNALS", "0") == "1" and _measured_small(signals, estimate, goal=goal):
+            effective_ft = _files_touched_from_signals(signals)
+            effective_estimate = ScopeEstimate(
+                files_touched=effective_ft,
+                artifacts=estimate.artifacts,
+                answerable_without_exploration=estimate.answerable_without_exploration,
+                ambiguities=estimate.ambiguities,
+                objections=estimate.objections,
+                work_kind=estimate.work_kind,
+            )
+            tier = _classify_raw(signals, effective_estimate)
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "tier_escalation_declined",
+                        "work_tokens": signals.work_tokens,
+                        "work_files": signals.work_files,
+                        "breadth_markers": signals.breadth_markers,
+                        "output_markers": signals.output_markers,
+                        "output_targets": signals.output_targets,
+                        "work_kind": estimate.work_kind,
+                        "ceiling_tokens": _T1_WORK_TOKENS_CEILING,
+                        "ceiling_files": _T1_WORK_FILES_CEILING,
+                        "tier_kept": tier,
+                    }
+                )
+            return _apply_work_kind_floor(tier, estimate, on_event)
+        tier = _classify_raw(signals, estimate)
+        return _apply_work_kind_floor(tier_max(tier, "T2"), estimate, on_event)
+
+    return _apply_work_kind_floor(_classify_raw(signals, estimate), estimate, on_event)
+
+
+def _apply_work_kind_floor(
+    tier: Tier,
+    estimate: ScopeEstimate,
+    on_event: Callable[[dict[str, Any]], None] | None,
+) -> Tier:
+    """PLAN-REVIEW-LATENCY-STATUS.md §8.4a: the table maps model-supplied
+    evidence to a tier — monotone only. An explicit ``procedure`` kind floors
+    at T1: operations work (commands, services, patches) has a blast radius
+    file counts cannot bound, and T0's treeless path skips the intake where
+    destructive-command ambiguity gets resolved. T1 keeps the single-node
+    direct path, so this costs no decomposition. Every other kind
+    (including ``unknown``) leaves the table result untouched, and the model
+    can never lower a floor — only code does that."""
+    if estimate.work_kind == "procedure" and _TIER_RANK[tier] < _TIER_RANK["T1"]:
+        if on_event is not None:
+            on_event(
+                {
+                    "type": "tier_work_kind_floor",
+                    "work_kind": estimate.work_kind,
+                    "tier_raised_to": "T1",
+                }
+            )
+        return "T1"
     return tier
 
 

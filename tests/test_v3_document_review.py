@@ -518,6 +518,16 @@ class DocumentReviewWiringTest(unittest.TestCase):
         self.assertEqual(len(out_of_scope_events), 1)
         self.assertEqual(out_of_scope_events[0]["node_ids"], ["gamma"])
 
+    def test_single_node_without_depth_pass_short_circuits(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        tree = TaskTree(nodes={"single": _node("single")})
+        run_dir = _run(root, tree)
+        provider = FakeProvider([])
+        review = run_document_review(run_dir, tree, provider, keep_depth_pass=False)
+        self.assertEqual(review.calls, 0)
+        self.assertFalse(review.escalated)
+        self.assertEqual(review.triage, {})
+
 
 if __name__ == "__main__":
     unittest.main()

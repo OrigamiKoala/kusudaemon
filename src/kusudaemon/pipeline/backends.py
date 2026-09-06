@@ -91,9 +91,41 @@ def _hidden_paths_and_exceptions_for_probe(
             if run_dir_resolved == workspace_resolved:
                 exceptions = (raw_resolved.relative_to(run_dir_resolved).as_posix(),)
             else:
-                exceptions = (raw_resolved.relative_to(workspace_resolved).as_posix(),)
-        except (ValueError, OSError):
-            pass
+                try:
+                    exceptions = (raw_resolved.relative_to(workspace_resolved).as_posix(),)
+                except ValueError:
+                    # Sibling run dir (the normal workspace-mode layout):
+                    # fall back to the absolute path so the carve-out still
+                    # exists, and log it rather than swallowing
+                    # (PLAN-WORKSPACE-MODE.md §K4b item 2).
+                    exceptions = (raw_resolved.as_posix(),)
+                    try:
+                        from ..v0.run_dir import events_path
+                        from ..v0.events import EventLog
+
+                        EventLog(events_path(run_dir)).append(
+                            {
+                                "type": "probe_finding_path_unreachable",
+                                "path": str(raw_finding_path),
+                                "reason": "raw finding path outside workspace; using absolute path",
+                            }
+                        )
+                    except Exception:
+                        pass
+        except OSError as exc:
+            try:
+                from ..v0.run_dir import events_path
+                from ..v0.events import EventLog
+
+                EventLog(events_path(run_dir)).append(
+                    {
+                        "type": "probe_finding_path_unreachable",
+                        "path": str(raw_finding_path),
+                        "reason": str(exc),
+                    }
+                )
+            except Exception:
+                pass
     return hidden, exceptions
 
 
@@ -157,6 +189,7 @@ def build_writer_adapter(
     run_dir: str | Path | None = None,
     provider: str | None = None,
     always_grant_web_search: bool = True,
+    is_workspace: bool = False,
 ) -> AgentAdapter:
     """A Writer adapter for one node. ``node.tools`` narrows the tool set
     (the adapter's ``tool_allowlist``) the same way v1's round loop does —
@@ -180,7 +213,17 @@ def build_writer_adapter(
         extra={"mcp_config": mcp_config} if mcp_config else None,
     )
 
-    base_tools = tuple(node.tools) if node and node.tools else DEFAULT_TOOL_ALLOWLIST
+    if is_workspace or (node is not None and node.shape == "code-dominant"):
+        # PLAN-WORKSPACE-MODE.md §K6: workspace runs are shell work until the
+        # planner says otherwise — a prose/reference template's ("read",
+        # "save") opinion must not deny bash on a repo task (Terminal-Bench
+        # is entirely shell work; SWE-bench mostly shell+edit). Planner-built
+        # code-dominant leaves take the same path explicitly.
+        base_tools = DEFAULT_TOOL_ALLOWLIST
+    elif node and node.tools:
+        base_tools = tuple(node.tools)
+    else:
+        base_tools = DEFAULT_TOOL_ALLOWLIST
     wants_web = (
         always_grant_web_search
         or bool(node is not None and ("web" in node.tools or _node_has_web_probe(node, run_dir_path)))

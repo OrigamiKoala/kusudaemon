@@ -160,12 +160,15 @@ class TokenEfficiencyAuditTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        empty_cfg = self.tmp_path / "empty_provider.json"
+        empty_cfg.write_text("{}", encoding="utf-8")
+
         # Without api key -> opencode defaults to backend
-        self.assertEqual(_resolve_role_transport("opencode"), ("opencode", "backend"))
+        self.assertEqual(_resolve_role_transport("opencode", config_path=empty_cfg), ("opencode", "backend"))
 
         # With API key configured -> opencode resolves to http
         with mock.patch.dict(os.environ, {"KUSUDAEMON_PROVIDER_API_KEY": "sk-test-key-12345"}):
-            self.assertEqual(_resolve_role_transport("opencode"), ("opencode", "http"))
+            self.assertEqual(_resolve_role_transport("opencode", config_path=empty_cfg), ("opencode", "http"))
 
 
 if __name__ == "__main__":

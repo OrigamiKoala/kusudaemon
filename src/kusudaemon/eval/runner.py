@@ -247,6 +247,7 @@ def _options(task: EvalTask, work_object: WorkObject | None) -> RunOptions:
         # model call (PLAN-zeromem.md §1) — the eval suite measures the
         # tier/phase machinery, not orchestrator prompt-tuning.
         dispatch_policy="document_order",
+        disable_node_review=True,
     )
     if task.corpus:
         kwargs["source_text"] = task.corpus

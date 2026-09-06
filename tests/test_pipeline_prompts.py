@@ -439,5 +439,45 @@ class HiddenPathsNoticeTest(unittest.TestCase):
             self.assertIn("handover note", prom)
 
 
+class WorkspaceModePromptsTest(unittest.TestCase):
+    def test_workspace_artifact_prompt_scoping(self) -> None:
+        import os
+        from unittest import mock
+        from kusudaemon.pipeline.prompts import build_node_prompt
+
+        single_node = TaskNode(id="single", brief="fix task", artifact="out/single.md", gates=["nonempty"])
+        planner_leaf = TaskNode(id="1.1", brief="part 1", artifact="out/1.1.md", gates=["nonempty"])
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            ws_root = Path(root_str) / "workspace"
+            ws_root.mkdir()
+
+            # 1. Default (flag=0): both get standard artifact instruction
+            with mock.patch.dict(os.environ, {"KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT": "0"}):
+                p_single_def = build_node_prompt(single_node, run_dir, is_workspace=True, workspace_root=ws_root)
+                p_planner_def = build_node_prompt(planner_leaf, run_dir, is_workspace=True, workspace_root=ws_root)
+                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_single_def)
+                self.assertNotIn("Your deliverables are the files your brief names", p_single_def)
+
+            # 2. Flag=1, is_workspace=True:
+            with mock.patch.dict(os.environ, {"KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT": "1"}):
+                # single_node gets reframed prompt
+                p_single = build_node_prompt(single_node, run_dir, is_workspace=True, workspace_root=ws_root)
+                self.assertIn("Your deliverables are the files your brief names", p_single)
+                self.assertIn("written in place under", p_single)
+                self.assertNotIn("That file is the deliverable; nothing else you write or say is.", p_single)
+
+                # §R2: planner_leaf keeps standard prompt byte-for-byte in artifact_instruction segment
+                p_planner = build_node_prompt(planner_leaf, run_dir, is_workspace=True, workspace_root=ws_root)
+                self.assertEqual(p_planner, p_planner_def)
+                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_planner)
+                self.assertNotIn("Your deliverables are the files your brief names", p_planner)
+
+                # text/corpus mode (is_workspace=False) keeps standard prompt
+                p_corpus = build_node_prompt(single_node, run_dir, is_workspace=False)
+                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_corpus)
+
+
 if __name__ == "__main__":
     unittest.main()

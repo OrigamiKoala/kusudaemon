@@ -39,6 +39,7 @@ avoid wasting.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from ..adapters.base import AgentAdapter
@@ -82,11 +83,16 @@ _SPLIT_INSTRUCTION_TEMPLATE = (
 
 
 def writer_prompt(
-    brief_prompt: str, promotion_path: Path, *, split_hint_path: Path | None = None
+    brief_prompt: str,
+    promotion_path: Path,
+    *,
+    split_hint_path: Path | None = None,
+    suppress_artifact_instruction: bool = False,
 ) -> str:
+    artifact_inst = "" if suppress_artifact_instruction else _ARTIFACT_INSTRUCTION
     text = (
         brief_prompt
-        + _ARTIFACT_INSTRUCTION
+        + artifact_inst
         + _PROMOTION_INSTRUCTION_TEMPLATE.format(promotion_path=promotion_path)
     )
     if split_hint_path is not None:
@@ -158,10 +164,24 @@ async def run_writer_node(
         promotion_path.unlink()
 
     split_hint_path = scratch_dir / "split.json" if _inputs_exceed_budget(run_dir, node) else None
+    suppress_artifact_instruction = False
+    if os.getenv("KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT") == "1" and node.id in ("single", "direct"):
+        try:
+            tier_data = json.loads((run_dir / "tier.json").read_text(encoding="utf-8"))
+            if tier_data.get("kind") == "workspace":
+                suppress_artifact_instruction = True
+        except Exception:
+            pass
+
     result = await run_node(
         run_dir,
         node.id,
-        writer_prompt(prompt, promotion_path, split_hint_path=split_hint_path),
+        writer_prompt(
+            prompt,
+            promotion_path,
+            split_hint_path=split_hint_path,
+            suppress_artifact_instruction=suppress_artifact_instruction,
+        ),
         adapter,
         env,
         budget,

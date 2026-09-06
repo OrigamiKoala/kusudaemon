@@ -211,6 +211,7 @@ async def review_and_transition_node(
     provider_semaphore: asyncio.Semaphore | None = None,
     review_sample_rate: float = 0.0,
     disable_review: bool = False,
+    triage_provider: RoleProvider | None = None,
 ) -> None:
     """One Reviewer verdict + status transition for a single node —
     ``run_round_loop``'s original ``review`` closure, pulled out for the
@@ -233,7 +234,7 @@ async def review_and_transition_node(
     except Exception:
         contract_text = ""
 
-    verdict_digest = compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text)
+    verdict_digest = compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text, brief=node.brief)
     cached_verdict: ReviewVerdict | None = None
     cached_sections: list[dict[str, Any]] | None = None
     audit_file = audit_path(run_dir, node.id)
@@ -364,6 +365,8 @@ async def review_and_transition_node(
             kwargs: dict[str, Any] = dict(
                 contract_text=contract_text,
                 declared_inputs=declared_inputs_str,
+                brief=node.brief,
+                triage_provider=triage_provider,
                 cached_sections=cached_sections,
                 judgment_classification=getattr(node, "judgment_classification", None),
             )
@@ -412,6 +415,18 @@ async def review_and_transition_node(
             )
         else:
             verdict = await review_task
+            if getattr(verdict, "skip_reason", None):
+                log.append(
+                    {
+                        "node_id": node.id,
+                        "role": "reviewer",
+                        "round": 0,
+                        "type": "review_skipped_no_judgment",
+                        "reason": verdict.skip_reason,
+                        "detail": f"review skipped with reason: {verdict.skip_reason}",
+                        "ts": time.time(),
+                    }
+                )
 
     sampled_disagreement = False
     if not disable_review and verdict.verdict == "pass" and review_sample_rate > 0.0 and node.judgment:
@@ -423,6 +438,7 @@ async def review_and_transition_node(
                 provider,
                 contract_text=contract_text,
                 declared_inputs=declared_inputs_str if 'declared_inputs_str' in locals() else "",
+                brief=node.brief,
                 temperature=0.7,
             )
             if sampled.verdict != "pass":
@@ -436,7 +452,7 @@ async def review_and_transition_node(
                     "sampled_items": sampled.items,
                 })
 
-    _write_audit(run_dir, node, verdict, artifact_text=artifact_text, contract_text=contract_text)
+    _write_audit(run_dir, node, verdict, artifact_text=artifact_text, contract_text=contract_text, brief=node.brief)
     if sampled_disagreement:
         try:
             audit_data = json.loads(audit_file.read_text(encoding="utf-8"))
@@ -476,6 +492,7 @@ async def run_round_loop(
     reviewer_provider: RoleProvider | None = None,
     review_sample_rate: float = 0.0,
     disable_review: bool = False,
+    triage_provider: RoleProvider | None = None,
 ) -> TaskTree:
     """Drive the Orchestrator/Writer/Reviewer round loop for ``tree.json``.
 
@@ -571,6 +588,7 @@ async def run_round_loop(
             provider_semaphore=provider_sem,
             review_sample_rate=review_sample_rate,
             disable_review=disable_review,
+            triage_provider=triage_provider,
         )
 
     # §C2: "gather the resume scan" — nodes caught mid-flight by a crash
@@ -855,6 +873,7 @@ def _write_audit(
     verdict: ReviewVerdict,
     artifact_text: str = "",
     contract_text: str = "",
+    brief: str = "",
 ) -> None:
     path = ensure_audit_path(run_dir, node.id)
     gates: dict | None = None
@@ -878,8 +897,9 @@ def _write_audit(
             "items": verdict.items,
             "verdict": verdict.verdict,
             "truncated": verdict.truncated,
-            "verdict_digest": compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text),
+            "verdict_digest": compute_verdict_digest(artifact_text, node.rubric, node.judgment, contract_text, brief=brief or getattr(node, "brief", "")),
             "sections": getattr(verdict, "section_verdicts", []),
+            "skip_reason": getattr(verdict, "skip_reason", None),
         }
     )
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")

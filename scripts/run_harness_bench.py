@@ -272,6 +272,7 @@ def run_one(
         # with cwd set to the task workspace, so pin both.
         "KUSUDAEMON_PROVIDER_CONFIG": str(_REPO_ROOT / "provider.json"),
         "KUSUDAEMON_ENV_FILE": str(_REPO_ROOT / ".env"),
+        "KUSUDAEMON_ROLE_TRANSPORT": os.getenv("KUSUDAEMON_ROLE_TRANSPORT", "backend"),
     })
     env.update(extra_env)
 

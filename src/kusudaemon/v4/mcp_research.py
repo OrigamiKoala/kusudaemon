@@ -55,8 +55,8 @@ from .research import ProbeKind, ResearchKind, normalize_probe_kind  # noqa: F40
 
 RESEARCH_TOOL_ALLOWLIST: dict[ProbeKind, tuple[str, ...]] = {
     "web": (str(SEARXNG_TOOL_PATH),),
-    "workspace": ("read", str(WORKSPACE_READ_TOOL_PATH)),
-    "corpus": ("read",),
+    "workspace": ("read", "save", str(WORKSPACE_READ_TOOL_PATH)),
+    "corpus": ("read", "save"),
 }
 
 

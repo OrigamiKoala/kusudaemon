@@ -2050,6 +2050,7 @@ def _runtime_for(run_dir: Path):
         node=node,
         model=options.model,
         run_dir=run_dir,
+        is_workspace=(work is not None and work.kind == "workspace"),
     )
     return options, provider, env, factory
 

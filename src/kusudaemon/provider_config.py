@@ -638,12 +638,23 @@ def read_backend_config(
     if resolved_model is None:
         if cfg_model:
             # Check validation against declared_models if present
-            if declared_models and cfg_model not in declared_models:
-                raise ProviderConfigError(
-                    f"provider config {target}: backend {name!r} model {cfg_model!r} is not in declared models ({declared_models})"
-                )
+            if declared_models:
+                is_valid = cfg_model in declared_models
+                if not is_valid and name == "opencode":
+                    from .adapters.opencode import normalize_opencode_model
+                    norm_cfg = normalize_opencode_model(cfg_model)
+                    norm_declared = [normalize_opencode_model(m) for m in declared_models]
+                    is_valid = norm_cfg in norm_declared
+                if not is_valid:
+                    raise ProviderConfigError(
+                        f"provider config {target}: backend {name!r} model {cfg_model!r} is not in declared models ({declared_models})"
+                    )
             resolved_model = cfg_model
             model_source = f"{name} (provider.json)"
+
+    if name == "opencode" and resolved_model:
+        from .adapters.opencode import normalize_opencode_model
+        resolved_model = normalize_opencode_model(resolved_model)
 
     # 4. Extra
     final_extra = dict(cfg_extra)

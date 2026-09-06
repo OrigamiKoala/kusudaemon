@@ -129,18 +129,18 @@ class ProbeAliasTest(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# §B4: a workspace probe is granted no write tool
+# §B4 / §K4b: a workspace probe is granted save tool for its finding, but no patch/shell
 # ----------------------------------------------------------------------
 class WorkspaceProbeToolAllowlistTest(unittest.TestCase):
     def test_workspace_kind_gets_read_and_workspace_read_only(self) -> None:
         tools = allowed_tools_for("workspace")
-        self.assertEqual(tools, ("read", str(WORKSPACE_READ_TOOL_PATH)))
-        self.assertNotIn("save", tools)
+        self.assertEqual(tools, ("read", "save", str(WORKSPACE_READ_TOOL_PATH)))
+        self.assertIn("save", tools)
         self.assertNotIn("patch", tools)
         self.assertNotIn("shell", tools)
 
     def test_corpus_kind_gets_read_only(self) -> None:
-        self.assertEqual(allowed_tools_for("corpus"), ("read",))
+        self.assertEqual(allowed_tools_for("corpus"), ("read", "save"))
 
     def test_web_alias_matches_legacy_web_search(self) -> None:
         self.assertEqual(allowed_tools_for("web"), allowed_tools_for("web_search"))
@@ -154,7 +154,7 @@ class WorkspaceProbeToolAllowlistTest(unittest.TestCase):
                 prompt_dir="/tmp/prompts",
                 query=ResearchQuery(slug="pkg", kind="workspace", question="What does this do?"),
             )
-        self.assertNotIn("save", adapter.tool_allowlist)
+        self.assertIn("save", adapter.tool_allowlist)
         self.assertNotIn("patch", adapter.tool_allowlist)
         self.assertNotIn("shell", adapter.tool_allowlist)
         self.assertIn("read", adapter.tool_allowlist)
