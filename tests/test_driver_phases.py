@@ -2381,5 +2381,187 @@ class CostCeilingHaltingTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class WorkspaceModePhasesTest(unittest.TestCase):
+    def test_plan_will_partition_and_logging(self) -> None:
+        import asyncio
+        from unittest import mock
+        from kusudaemon.v6.work_object import measure_workspace, survey_workspace, SpineUnit
+        from kusudaemon.v2.survey import save_spine
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str, tempfile.TemporaryDirectory() as ws_str:
+                ws_root = Path(ws_str)
+                (ws_root / "case_queue.json").write_text('{"cases": [1, 2, 3]}', encoding="utf-8")
+                ws = measure_workspace(ws_root)
+                units = survey_workspace(ws)
+
+                run_dir = create_run_dir(Path(root_str), "run_plan")
+                save_spine(run_dir, units)
+                _write_tier(run_dir, "T2")
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(
+                        goal="Process the case queue",
+                        workspace_root=str(ws_root),
+                        work_object=ws,
+                    ),
+                )
+
+                # 1. Default (flag=0): _plan_will_partition is False due to start_chunk sentinel
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE": "0"}):
+                    self.assertFalse(driver._plan_will_partition(units))
+
+                # 2. Flag=1, small workspace (<2000 tokens, no output markers/targets):
+                # _plan_will_partition is False due to small-workspace floor
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE": "1"}):
+                    self.assertFalse(driver._plan_will_partition(units))
+                    await driver._phase_plan()
+                    events = EventLog(events_path(run_dir)).read_all()
+                    small_ws_events = [e for e in events if e.get("type") == "single_node_tree_small_workspace"]
+                    self.assertEqual(len(small_ws_events), 1)
+
+                # 3. Flag=1, large workspace (est_tokens >= 2000): _plan_will_partition is True
+                ws_large = mock.MagicMock()
+                ws_large.kind = "workspace"
+                ws_large.est_tokens = 5000
+                ws_large.files = 5
+                driver.options.work_object = ws_large
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE": "1"}):
+                    self.assertTrue(driver._plan_will_partition(units))
+
+                # 4. Flag=1, small input but generative goal with output targets: _plan_will_partition is True
+                ws_small = mock.MagicMock()
+                ws_small.kind = "workspace"
+                ws_small.est_tokens = 500
+                ws_small.files = 2
+                driver.options.work_object = ws_small
+                driver.options.goal = "Write 40 chapters of user guides"
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE": "1"}):
+                    self.assertTrue(driver._plan_will_partition(units))
+
+                # 5. Empty workspace (synthetic unit with no members): _plan_will_partition is False
+                empty_units = [SpineUnit("unit-01", "(workspace root)", -1, -1, 0, members=())]
+                with mock.patch.dict(os.environ, {"KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE": "1"}):
+                    self.assertFalse(driver._plan_will_partition(empty_units))
+
+        asyncio.run(scenario())
+
+    def test_phase_explore_skips_probe_when_not_partitioning(self) -> None:
+        import asyncio
+        from unittest import mock
+        from kusudaemon.v6.work_object import measure_workspace
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str, tempfile.TemporaryDirectory() as ws_str:
+                ws_root = Path(ws_str)
+                (ws_root / "test.txt").write_text("hello", encoding="utf-8")
+                ws = measure_workspace(ws_root)
+
+                run_dir = create_run_dir(Path(root_str), "run_explore")
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2", "measured_tier": "T2", "override": None,
+                            "needs_intake": False, "needs_explore": True,
+                            "signals": {}, "estimate": {}, "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(
+                        goal="Fix single bug",
+                        workspace_root=str(ws_root),
+                        work_object=ws,
+                    ),
+                )
+
+                # Default flags: not partitioning -> explore probe should be skipped
+                await driver._phase_explore()
+
+                # spine.json must exist
+                self.assertTrue((run_dir / "spine.json").exists())
+
+                # phase_skipped event should be logged
+                events = EventLog(events_path(run_dir)).read_all()
+                skipped = [e for e in events if e.get("type") == "phase_skipped"]
+                self.assertTrue(any(e.get("phase") == "structural_exploration" and "will not partition" in str(e.get("reason", "")) for e in skipped))
+
+        asyncio.run(scenario())
+
+    def test_phase_classify_size_dependent_fallback(self) -> None:
+        import asyncio
+        from unittest import mock
+        from kusudaemon.v6.work_object import measure_workspace
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str, tempfile.TemporaryDirectory() as ws_str:
+                ws_root = Path(ws_str)
+                (ws_root / "small.txt").write_text("tiny", encoding="utf-8")
+                ws_small = measure_workspace(ws_root)
+
+                # 1. Small task (< T2): classify call fails -> degrades gracefully
+                run_dir_small = Path(root_str) / "run_cls_small"
+                provider_failing = mock.MagicMock()
+                provider_failing.complete_json.side_effect = RuntimeError("API error")
+
+                driver_small = RecursiveDriver(
+                    run_dir_small,
+                    provider=provider_failing,
+                    options=RunOptions(
+                        goal="Fix typo",
+                        workspace_root=str(ws_root),
+                        work_object=ws_small,
+                    ),
+                )
+
+                await driver_small._phase_classify()
+                self.assertTrue(tier_path(run_dir_small).exists())
+                tier_rec = json.loads(tier_path(run_dir_small).read_text(encoding="utf-8"))
+                self.assertIn(tier_rec["tier"], ("T0", "T1"))
+
+                events = EventLog(events_path(run_dir_small)).read_all()
+                degraded = [e for e in events if e.get("type") == "scope_estimate_degraded"]
+                self.assertEqual(len(degraded), 1)
+
+                # 2. Large task (>= T2): classify call fails -> retries and raises RuntimeError
+                run_dir_large = Path(root_str) / "run_cls_large"
+                ws_large = mock.MagicMock()
+                ws_large.kind = "workspace"
+                ws_large.est_tokens = 50_000
+                ws_large.files = 25
+                ws_large.top_dirs = ()
+
+                driver_large = RecursiveDriver(
+                    run_dir_large,
+                    provider=provider_failing,
+                    options=RunOptions(
+                        goal="Refactor entire repo architecture",
+                        workspace_root=str(ws_root),
+                        work_object=ws_large,
+                    ),
+                )
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    await driver_large._phase_classify()
+                self.assertIn("scope_estimate_unavailable", str(ctx.exception))
+
+                # tier.json must still be written before halting
+                self.assertTrue(tier_path(run_dir_large).exists())
+                tier_rec_l = json.loads(tier_path(run_dir_large).read_text(encoding="utf-8"))
+                self.assertEqual(tier_rec_l["tier"], "T2")
+
+                events_l = EventLog(events_path(run_dir_large)).read_all()
+                unavail = [e for e in events_l if e.get("type") == "scope_estimate_unavailable"]
+                self.assertEqual(len(unavail), 1)
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

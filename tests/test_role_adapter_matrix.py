@@ -73,18 +73,21 @@ class RoleAdapterMatrixTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        empty_cfg = self.tmp_path / "empty_provider.json"
+        empty_cfg.write_text("{}", encoding="utf-8")
+
         # Default auto with gptme backend -> http
-        self.assertEqual(_resolve_role_transport("gptme"), ("gptme", "http"))
+        self.assertEqual(_resolve_role_transport("gptme", config_path=empty_cfg), ("gptme", "http"))
 
         # Default auto with opencode backend -> backend
-        self.assertEqual(_resolve_role_transport("opencode"), ("opencode", "backend"))
+        self.assertEqual(_resolve_role_transport("opencode", config_path=empty_cfg), ("opencode", "backend"))
 
         # Env override
         with mock.patch.dict(os.environ, {"KUSUDAEMON_ROLE_TRANSPORT": "backend"}):
-            self.assertEqual(_resolve_role_transport("gptme"), ("gptme", "backend"))
+            self.assertEqual(_resolve_role_transport("gptme", config_path=empty_cfg), ("gptme", "backend"))
 
         with mock.patch.dict(os.environ, {"KUSUDAEMON_ROLE_TRANSPORT": "http"}):
-            self.assertEqual(_resolve_role_transport("opencode"), ("opencode", "http"))
+            self.assertEqual(_resolve_role_transport("opencode", config_path=empty_cfg), ("opencode", "http"))
 
     def test_make_role_provider(self) -> None:
         clean_env = {

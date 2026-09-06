@@ -192,6 +192,24 @@ def research_prompt(query: ResearchQuery, raw_path: Path) -> str:
     )
 
 
+def _is_jsonl_trace(text: str) -> bool:
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for line in lines[:15]:
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    if parsed.get("type") in ("logdir", "tool_use", "tool_result", "tool_call"):
+                        return True
+                    if parsed.get("role") == "tool" or "tool_name" in parsed:
+                        return True
+            except Exception:
+                pass
+    return False
+
+
 async def run_research_query(
     run_dir: str | Path,
     node_id: str,
@@ -245,7 +263,25 @@ async def run_research_query(
         # the episode itself surfaced, same fallback writer.py uses for its
         # promotion. Empty on a replayed completion (see module docstring);
         # an honest degraded result, not silently lost work.
-        text = result.metadata.get("assistant_visible_output") or result.actions_log or ""
+        fallback = result.metadata.get("assistant_visible_output") or result.actions_log or ""
+        if _is_jsonl_trace(fallback):
+            text = ""
+            try:
+                from ..v0.run_dir import events_path
+                from ..v0.events import EventLog
+
+                EventLog(events_path(run_dir)).append(
+                    {
+                        "type": "probe_finding_degraded",
+                        "node_id": node_id,
+                        "slug": query.slug,
+                        "reason": "raw finding missing and fallback is jsonl trace",
+                    }
+                )
+            except Exception:
+                pass
+        else:
+            text = fallback
     text = cap_promotion(text, limit=RESEARCH_FINDING_TOKEN_CAP)
     finding_path.write_text(text, encoding="utf-8")
 

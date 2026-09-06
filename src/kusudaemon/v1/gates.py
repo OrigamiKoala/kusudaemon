@@ -392,6 +392,56 @@ def _gate_refs_resolve(gate: str, arg: str, text: str) -> GateResult:
     return GateResult(gate=gate, passed=True)
 
 
+def _gate_claims_resolve(gate: str, arg: str, text: str) -> GateResult:
+    """PLAN-REVIEW-LATENCY-STATUS.md §3.4, §6.7 (T2-3): verifies that factual
+    claims recorded in `<node>_claims.jsonl` are cited with valid references.
+    Fails on uncited assertions or references not found in the artifact."""
+    claims_path = Path(arg) if arg else Path("claims.jsonl")
+    if not claims_path.exists():
+        if arg:
+            return GateResult(gate=gate, passed=False, detail=f"claims file not found: {arg}")
+        return GateResult(gate=gate, passed=True)
+
+    try:
+        lines = claims_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return GateResult(gate=gate, passed=False, detail=f"error reading claims file: {exc}")
+
+    uncited: list[str] = []
+    unresolved_refs: list[str] = []
+
+    for idx, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return GateResult(gate=gate, passed=False, detail=f"malformed JSON on line {idx} in {claims_path.name}")
+        if not isinstance(entry, dict):
+            continue
+        assertion = str(entry.get("assertion", "")).strip()
+        ref = str(entry.get("ref", "")).strip()
+        if not ref or ref.lower() in ("none", "uncited", "null"):
+            uncited.append(assertion or f"line {idx}")
+        elif ref not in text and f"[ref:{ref}]" not in text and f"[ref: {ref}]" not in text:
+            unresolved_refs.append(ref)
+
+    if uncited:
+        return GateResult(
+            gate=gate,
+            passed=False,
+            detail=f"uncited claim: {uncited[0]}" if len(uncited) == 1 else f"{len(uncited)} uncited claim(s) ({uncited[0]}...)",
+        )
+    if unresolved_refs:
+        return GateResult(
+            gate=gate,
+            passed=False,
+            detail=f"{len(unresolved_refs)} unresolved claim ref(s) ({', '.join(unresolved_refs[:3])}...)",
+        )
+    return GateResult(gate=gate, passed=True)
+
+
 _HANDLERS = {
     "exists": _gate_exists,
     "nonempty": _gate_nonempty,
@@ -414,4 +464,6 @@ _HANDLERS = {
     "terms_defined": _gate_terms_defined,
     "latex_balanced": _gate_latex_balanced,
     "refs_resolve": _gate_refs_resolve,
+    "claims_resolve": _gate_claims_resolve,
+    "uncited_claim": _gate_claims_resolve,
 }

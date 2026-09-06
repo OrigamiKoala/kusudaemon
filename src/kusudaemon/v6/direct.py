@@ -29,6 +29,7 @@ needed there at all.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from ..v0.events import EventLog
@@ -74,6 +75,7 @@ def build_direct_node(
     token_budget: int = 50_000,
     tool_call_cap: int = 15,
     inputs: tuple[str, ...] = (),
+    apply_template: bool = False,
 ) -> TaskNode:
     """One node, built directly from the goal by code -- no Planner call.
     Matches v2/planner.py's leaf defaults (`nonempty` + `max_tokens:N`,
@@ -81,35 +83,49 @@ def build_direct_node(
     opinion about, v1/reviewer.py) so a T0/T1 node behaves exactly like any
     other leaf everywhere except in how it got built.
 
+    PLAN-REVIEW-LATENCY-STATUS.md §7.4: When apply_template is True, applies
+    _DIRECT template (closed-rubric on_topic and claims_supported with no gate
+    or tool opinions).
+
     §E28 (2026-08-13): ``inputs`` names the corpus for kind="text" runs
     (stored relative to run_dir per §D0b, e.g. ``("source.txt",)``). Before
     this, T0/T1 nodes shipped ``inputs=[]`` -- the prompt builder's Inputs
     section was empty, so a corpus run's writer never saw the corpus and
     degenerated into repetition (observed live against a 129.8 MB
     source.txt)."""
-    return TaskNode(
+    shape = "direct" if os.getenv("KUSUDAEMON_DIRECT_TEMPLATE") == "1" else "prose-dominant"
+    node = TaskNode(
         id=node_id,
         brief=goal,
         artifact=f"out/{node_id}.md",
         gates=["nonempty", f"max_tokens:{token_budget}"],
         budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
         inputs=inputs,
+        shape=shape,
     )
+    if apply_template:
+        from .templates import _DIRECT, _direct_template, apply_template_to_node
+        tpl = _direct_template() if os.getenv("KUSUDAEMON_DIRECT_TEMPLATE") == "1" else _DIRECT
+        apply_template_to_node(node, template=tpl)
+    return node
 
 
-def build_single_node_tree(goal: str, **kwargs) -> TaskTree:
+def build_single_node_tree(goal: str, *, apply_template: bool = True, **kwargs) -> TaskTree:
     """T1's whole tree: one node, built directly from the goal (module
-    docstring: a Planner call would have nothing to partition)."""
-    node = build_direct_node(goal, node_id=SINGLE_NODE_ID, **kwargs)
+    docstring: a Planner call would have nothing to partition). Defaults to
+    applying _DIRECT template per PLAN-REVIEW-LATENCY-STATUS.md §7.4."""
+    node = build_direct_node(goal, node_id=SINGLE_NODE_ID, apply_template=apply_template, **kwargs)
     return TaskTree(nodes={node.id: node})
 
 
-def _load_or_create_direct_node(run_dir: Path, goal: str, inputs: tuple[str, ...] = ()) -> tuple[TaskNode, TaskTree]:
+def _load_or_create_direct_node(
+    run_dir: Path, goal: str, inputs: tuple[str, ...] = (), apply_template: bool = False
+) -> tuple[TaskNode, TaskTree]:
     path = direct_node_path(run_dir)
     if path.exists():
         tree = TaskTree.load(path)
         return tree.nodes[DIRECT_NODE_ID], tree
-    node = build_direct_node(goal, inputs=inputs)
+    node = build_direct_node(goal, inputs=inputs, apply_template=apply_template)
     tree = TaskTree(nodes={node.id: node})
     tree.save(path)
     return node, tree
@@ -128,6 +144,7 @@ async def run_direct_episode(
     max_attempts: int = DIRECT_MAX_ATTEMPTS,
     inputs: tuple[str, ...] = (),
     disable_review: bool = False,
+    direct_review: bool = False,
 ) -> TaskNode:
     """T0's whole execute phase: one gated Writer episode, one Reviewer
     verdict (free when the node declares no judgment items, exactly like
@@ -138,7 +155,7 @@ async def run_direct_episode(
     exactly like a round-loop resume does from ``tree.json``.
     """
     run_dir = Path(run_dir)
-    node, tree = _load_or_create_direct_node(run_dir, goal, inputs=inputs)
+    node, tree = _load_or_create_direct_node(run_dir, goal, inputs=inputs, apply_template=direct_review)
     path = direct_node_path(run_dir)
     manifest = manifest_path(run_dir)
 

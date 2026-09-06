@@ -242,5 +242,56 @@ class GlossaryWiringTest(unittest.TestCase):
             self.assertFalse(run_dir.exists())
 
 
+class WorkspaceModeTemplatesTest(unittest.TestCase):
+    def test_code_dominant_template(self) -> None:
+        tpl = template_for("code-dominant")
+        self.assertEqual(tpl.name, "code")
+        self.assertEqual(tpl.tools, ("read", "save", "patch", "shell"))
+        self.assertEqual(tpl.gates, ())
+        self.assertIn("builds_or_runs", tpl.judgment)
+        self.assertIn("on_topic", tpl.judgment)
+
+    def test_direct_template_under_flags(self) -> None:
+        import os
+        from unittest import mock
+        from kusudaemon.v6.direct import build_direct_node
+
+        # Default (KUSUDAEMON_DIRECT_TEMPLATE=0): shape resolves to generic
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_DIRECT_TEMPLATE": "0"}):
+            self.assertEqual(template_for("direct").name, "generic")
+            node = build_direct_node("goal")
+            self.assertEqual(node.shape, "prose-dominant")
+
+        # Enabled KUSUDAEMON_DIRECT_TEMPLATE=1
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_DIRECT_TEMPLATE": "1", "KUSUDAEMON_DIRECT_TOOLS": "0"}):
+            tpl = template_for("direct")
+            self.assertEqual(tpl.name, "direct")
+            self.assertEqual(tpl.warn_gates, ("headers:std",))
+            self.assertEqual(tpl.gates, ())
+            self.assertEqual(tpl.tools, ("read", "save"))
+
+            node = build_direct_node("goal", apply_template=True)
+            self.assertEqual(node.shape, "direct")
+            self.assertNotIn("headers:std", node.gates)
+            self.assertIn("headers:std", node.warn_gates)
+
+            # Test merge_template_into_tree does not add headers:std to gates
+            tree = TaskTree(nodes={node.id: node})
+            merge_template_into_tree(tree)
+            self.assertNotIn("headers:std", tree.nodes[node.id].gates)
+            self.assertIn("headers:std", tree.nodes[node.id].warn_gates)
+
+        # Enabled KUSUDAEMON_DIRECT_TOOLS=1
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_DIRECT_TEMPLATE": "1", "KUSUDAEMON_DIRECT_TOOLS": "1"}):
+            tpl_tools = template_for("direct")
+            self.assertEqual(tpl_tools.tools, ())
+
+    def test_prose_dominant_unaffected(self) -> None:
+        tpl = template_for("prose-dominant")
+        self.assertEqual(tpl.name, "prose")
+        self.assertEqual(tpl.gates, ("headers:std",))
+        self.assertEqual(tpl.tools, ("read", "save"))
+
+
 if __name__ == "__main__":
     unittest.main()

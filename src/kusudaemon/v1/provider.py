@@ -92,7 +92,12 @@ class ProviderResponse:
 Transport = Callable[[str, dict[str, Any], dict[str, str]], dict[str, Any]]
 
 
-from ..roles.json_io import _parse_json_object, extract_last_json_object
+from ..roles.json_io import (
+    _parse_json_object,
+    _repair_common_schema_omissions,
+    _unwrap_schema_echo,
+    extract_last_json_object,
+)
 from ..roles.protocol import RoleProviderBase
 
 
@@ -321,10 +326,11 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     on_reasoning(reasoning)
             content = message.get("content") or ""
             self._record_usage(curr_payload, raw, content)
-            parsed, parse_error = _parse_json_object(content)
-            if parsed is None and schema is not None:
-                parsed, parse_error = extract_last_json_object(content, schema=schema)
+            parsed, parse_error = extract_last_json_object(content, schema=schema)
+            if parsed is None:
+                parsed, parse_error = _parse_json_object(content)
             if parsed is not None:
+                parsed = _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema)
                 schema_errors = validate(parsed, schema)
                 if not schema_errors:
                     # A3-2: a schema-valid response under response_format is

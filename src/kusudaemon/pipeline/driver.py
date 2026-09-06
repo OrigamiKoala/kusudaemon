@@ -55,6 +55,8 @@ from ..v6.direct import (
 from ..v6.tiering import (
     ScopeEstimate,
     Tier,
+    _files_touched_from_signals,
+    _measured_small,
     classify,
     escalate,
     estimate_scope_full,
@@ -63,7 +65,7 @@ from ..v6.tiering import (
     phases_for,
     tier_max,
 )
-from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text, work_object_none
+from ..v6.work_object import PLAN_MIN_WORKSPACE_TOKENS, WorkObject, survey_workspace, work_object_from_text, work_object_none
 from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
@@ -255,6 +257,8 @@ class RunOptions:
     disable_review: bool = False
     capabilities: Any = None
     output_dir: str | Path | None = None
+    direct_review: bool | None = None
+    disable_node_review: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.research_plan, str):
@@ -300,6 +304,8 @@ class RunOptions:
             "review_sample_rate": self.review_sample_rate,
             "disable_review": self.disable_review,
             "capabilities": self.capabilities,
+            "direct_review": self.direct_review,
+            "disable_node_review": self.disable_node_review,
         }
         if ws_root:
             spec["workspace_root"] = ws_root
@@ -358,6 +364,8 @@ class RunOptions:
             disable_review=bool(data.get("disable_review", False)),
             capabilities=data.get("capabilities"),
             output_dir=data.get("output_dir"),
+            direct_review=data.get("direct_review"),
+            disable_node_review=bool(data.get("disable_node_review", False)),
         )
 
 
@@ -931,7 +939,16 @@ class RecursiveDriver:
                 answerable_without_exploration=bool(override in ("T0", "T1")),
             )
             question_set = QuestionSet()
-            measured: Tier = override if override in ("T0", "T1", "T3") else classify(signals, estimate)
+            measured: Tier = (
+                override
+                if override in ("T0", "T1", "T3")
+                else classify(
+                    signals,
+                    estimate,
+                    on_event=lambda ev: self._log({"node_id": "-", "role": "harness", "round": 0, **ev}),
+                    goal=goal,
+                )
+            )
             if override in ("T0", "T1") and intake_disabled:
                 self._log(
                     {
@@ -957,15 +974,89 @@ class RecursiveDriver:
                     }
                 )
         else:
-            estimate, question_set = await asyncio.to_thread(
-                estimate_scope_full,
-                goal,
-                work,
-                self.provider,
-                on_reasoning=self._reasoning_sink("phase-classify"),
-                streaming=True,
+            try:
+                estimate, question_set = await asyncio.to_thread(
+                    estimate_scope_full,
+                    goal,
+                    work,
+                    self.provider,
+                    on_reasoning=self._reasoning_sink("phase-classify"),
+                    streaming=True,
+                )
+            except Exception as exc:
+                # PLAN-WORKSPACE-MODE.md §K5, §R3: size-dependent fallback
+                is_small = _measured_small(signals, ScopeEstimate(files_touched="1", artifacts=1), goal=goal)
+                if is_small:
+                    estimate = ScopeEstimate(
+                        files_touched=_files_touched_from_signals(signals),
+                        artifacts=1,
+                        answerable_without_exploration=True,
+                    )
+                    question_set = QuestionSet()
+                    self._log(
+                        {
+                            "node_id": "-",
+                            "role": "harness",
+                            "round": 0,
+                            "type": "scope_estimate_degraded",
+                            "reason": str(exc)[:200],
+                        }
+                    )
+                else:
+                    # At or above T2: retry with backoff
+                    await asyncio.sleep(0.5)
+                    try:
+                        estimate, question_set = await asyncio.to_thread(
+                            estimate_scope_full,
+                            goal,
+                            work,
+                            self.provider,
+                            on_reasoning=self._reasoning_sink("phase-classify"),
+                            streaming=True,
+                        )
+                    except Exception as retry_exc:
+                        # Write tier.json before halting so resume picks up
+                        estimate = ScopeEstimate(
+                            files_touched="unknown",
+                            artifacts=2,
+                            answerable_without_exploration=False,
+                        )
+                        question_set = QuestionSet()
+                        measured = "T2"
+                        tier = tier_max(measured, override) if override else measured
+                        payload = {
+                            "tier": tier,
+                            "measured_tier": measured,
+                            "override": override,
+                            "signals": asdict(signals),
+                            "estimate": asdict(estimate),
+                            "needs_intake": False,
+                            "needs_explore": True,
+                            "needs_research": False,
+                            "intake_round1": None,
+                            "error": f"scope_estimate_unavailable: {retry_exc}",
+                            "ts": time.time(),
+                        }
+                        write_text_atomic(
+                            tier_path(self.run_dir),
+                            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                        )
+                        self._log(
+                            {
+                                "node_id": "-",
+                                "role": "harness",
+                                "round": 0,
+                                "type": "scope_estimate_unavailable",
+                                "reason": str(retry_exc)[:200],
+                            }
+                        )
+                        raise RuntimeError(f"scope_estimate_unavailable: {retry_exc}") from retry_exc
+            measured = classify(
+                signals,
+                estimate,
+                on_event=lambda ev: self._log({"node_id": "-", "role": "harness", "round": 0, **ev}),
+                goal=goal,
             )
-            measured = classify(signals, estimate)
         tier: Tier = tier_max(measured, override) if override else measured
         intake_round1 = {
             "questions": [
@@ -997,6 +1088,14 @@ class RecursiveDriver:
             # operator-forced T1 (tier set command).
             "needs_explore": not estimate.answerable_without_exploration
             and (tier != "T1" or estimate.files_touched == "unknown"),
+            # PLAN-WORKSPACE-MODE.md §8.4b: the research phase stays in the
+            # T3 tuple, but short-circuits to a logged no-op when probing
+            # is disabled up front (explicit plan absent and auto-planning
+            # off) — decided once, at classify time, read back from
+            # tier.json, mirroring the needs_intake / needs_explore idiom
+            # rather than inventing a parallel skip mechanism.
+            "needs_research": tier == "T3"
+            and (bool(self.options.research_plan) or bool(self.options.auto_probe_plan)),
             "intake_round1": intake_round1 if question_set.questions or question_set.objections else None,
             "ts": time.time(),
         }
@@ -1395,7 +1494,20 @@ class RecursiveDriver:
             )
             return
         if tier in ("T2", "T3"):
-            await self._run_structural_exploration(tier)
+            units = load_spine(self.run_dir)
+            if not self._plan_will_partition(units):
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "phase_skipped",
+                        "phase": "structural_exploration",
+                        "reason": "plan phase will not partition",
+                    }
+                )
+            else:
+                await self._run_structural_exploration(tier)
         if self.options.research_plan:
             # PLAN-AUDIT.md §E14: this delegates into _phase_research as a
             # sub-step of the still-running "explore" phase, never as its
@@ -1504,6 +1616,33 @@ class RecursiveDriver:
             f"anything a planner partitioning work here should know."
         )
 
+    def _plan_will_partition(self, units: list[SpineUnit]) -> bool:
+        """PLAN-WORKSPACE-MODE.md §K1, §K4a, §R1: Return True if the plan phase will
+        actually partition work rather than falling back to a single-node tree."""
+        if not units:
+            return False
+        work_obj = self._effective_work_object()
+        if work_obj.kind == "workspace":
+            use_plan_single_unit = (os.getenv("KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE", "0") == "1")
+            from ..v6.work_object import is_empty_workspace_spine
+            if use_plan_single_unit:
+                if is_empty_workspace_spine(units):
+                    return False
+                goal = (self.options.goal or "").strip() or "Execute task"
+                signals = measure_signals(goal, work_obj)
+                if _measured_small(signals, ScopeEstimate(files_touched="1", artifacts=1), goal=goal) or (
+                    work_obj.est_tokens < PLAN_MIN_WORKSPACE_TOKENS
+                    and signals.output_targets == 0
+                    and signals.output_markers == 0
+                    and signals.breadth_markers == 0
+                ):
+                    return False
+                return True
+            else:
+                is_empty = not units or (len(units) == 1 and (not units[0].members or units[0].start_chunk == -1))
+                return not is_empty
+        return True
+
     async def _phase_plan(self) -> None:
         tier = self._current_tier()
         depth_cap = 1 if tier == "T2" else DEFAULT_DEPTH_CAP
@@ -1514,23 +1653,37 @@ class RecursiveDriver:
         )
 
         work_obj = self._effective_work_object()
-        is_empty_workspace = (
-            work_obj.kind == "workspace"
-            and (not units or (len(units) == 1 and (not units[0].members or units[0].start_chunk == -1)))
-        )
+        goal = (self.options.goal or "").strip() or "Execute task"
 
-        if not units or is_empty_workspace:
-            goal = (self.options.goal or "").strip() or "Execute task"
+        if not self._plan_will_partition(units):
+            from ..v6.work_object import is_empty_workspace_spine
             tree = build_single_node_tree(goal, inputs=corpus_inputs)
-            self._log(
-                {
-                    "node_id": "-",
-                    "role": "harness",
-                    "round": 0,
-                    "type": "single_node_tree_fallback",
-                    "detail": "empty workspace or empty spine, generated single node tree from goal",
-                }
-            )
+            if (
+                work_obj.kind == "workspace"
+                and os.getenv("KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE", "0") == "1"
+                and not is_empty_workspace_spine(units)
+            ):
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "single_node_tree_small_workspace",
+                        "measured_tokens": work_obj.est_tokens,
+                        "min_tokens": PLAN_MIN_WORKSPACE_TOKENS,
+                        "detail": f"workspace has {work_obj.est_tokens} tokens < {PLAN_MIN_WORKSPACE_TOKENS} floor with small output signals, kept single-node path",
+                    }
+                )
+            else:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "single_node_tree_fallback",
+                        "detail": "empty workspace or empty spine, generated single node tree from goal",
+                    }
+                )
         else:
             tree = await asyncio.to_thread(
                 build_tree,
@@ -1708,10 +1861,32 @@ class RecursiveDriver:
         running, so a dashboard poll in that window saw ``research/done``
         mid-explore. ``_phase_explore`` now passes ``phase="explore"``.
         """
+        if not bool(self._read_tier_record().get("needs_research", True)):
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": phase,
+                    "reason": "tier record reports needs_research=false (probing disabled at classify time)",
+                }
+            )
+            return None
         plan = self.options.research_plan
         if not plan and self.options.auto_probe_plan:
             plan = self._build_auto_probe_plan()
         if not plan:
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": phase,
+                    "reason": "probe planner returned zero probes",
+                }
+            )
             return None
         try:
             await run_research_loop(
@@ -1850,6 +2025,13 @@ class RecursiveDriver:
             ("source.txt",) if self._effective_work_object().kind == "text" else ()
         )
         if tier == "T0":
+            direct_review = (
+                self.options.direct_review
+                if self.options.direct_review is not None
+                else False
+            )
+            if self.options.disable_node_review:
+                direct_review = False
             await run_direct_episode(
                 self.run_dir,
                 self.options.goal.strip(),
@@ -1861,14 +2043,22 @@ class RecursiveDriver:
                 log=self.log,
                 max_attempts=DIRECT_MAX_ATTEMPTS,
                 inputs=corpus_inputs,
-                disable_review=self.options.disable_review,
+                disable_review=self.options.disable_review or self.options.disable_node_review,
+                direct_review=direct_review,
             )
             return None
 
         if tier == "T1" and not tree_path(self.run_dir).exists():
-            build_single_node_tree(self.options.goal.strip(), inputs=corpus_inputs).save(
-                tree_path(self.run_dir)
+            direct_review = (
+                self.options.direct_review
+                if self.options.direct_review is not None
+                else True
             )
+            if self.options.disable_node_review:
+                direct_review = False
+            build_single_node_tree(
+                self.options.goal.strip(), inputs=corpus_inputs, apply_template=direct_review
+            ).save(tree_path(self.run_dir))
 
         max_attempts = DIRECT_MAX_ATTEMPTS if tier == "T1" else self.options.max_attempts
         # PLAN.md §A8/§B5: runtime split only makes sense against a real,
@@ -1892,6 +2082,7 @@ class RecursiveDriver:
                         }
                     )
         reviewer_provider = self._role_provider("reviewer")
+        triage_provider = self._role_provider("triage")
         await run_round_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -1899,6 +2090,7 @@ class RecursiveDriver:
             env=self.env,
             provider=self.provider,
             reviewer_provider=reviewer_provider,
+            triage_provider=triage_provider,
             review_sample_rate=self.options.review_sample_rate,
             prompt_for_node=lambda node: self._prompt_for_node(
                 node, inline_spans=self.options.inline_spans
@@ -1920,7 +2112,7 @@ class RecursiveDriver:
             # work instead of only taking effect at the next phase
             # boundary.
             should_halt=self._halted,
-            disable_review=self.options.disable_review,
+            disable_review=self.options.disable_review or self.options.disable_node_review,
         )
         tree = self._load_tree()
         if tier == "T1" and tree.is_blocked():
@@ -2050,6 +2242,9 @@ class RecursiveDriver:
         idempotent/resumable the same way the round loop is, so calling it
         again here safely continues from wherever it stopped.
         """
+        direct_review = self.options.direct_review if self.options.direct_review is not None else False
+        if self.options.disable_node_review:
+            direct_review = False
         node = await run_direct_episode(
             self.run_dir,
             self.options.goal.strip(),
@@ -2060,6 +2255,8 @@ class RecursiveDriver:
             budget=EpisodeBudget(),
             log=self.log,
             max_attempts=DIRECT_MAX_ATTEMPTS,
+            disable_review=self.options.disable_review or self.options.disable_node_review,
+            direct_review=direct_review,
         )
         if node.status == "passed":
             return None
@@ -2728,6 +2925,7 @@ class RecursiveDriver:
                 model=self.options.model,
                 run_dir=self.run_dir,
                 always_grant_web_search=self.options.always_grant_web_search,
+                is_workspace=(work is not None and work.kind == "workspace"),
             )
 
         return factory
@@ -2758,10 +2956,15 @@ class RecursiveDriver:
         hidden, exceptions = hidden_paths_for_node(
             node, self.run_dir, self._writer_workspace_path()
         )
+        work = self.options.work_object
+        is_workspace = (work is not None and work.kind == "workspace")
+        workspace_root = work.root if (is_workspace and work is not None) else None
         kwargs: dict[str, Any] = dict(
             hidden_paths=hidden,
             hidden_path_exceptions=exceptions,
             resuming=resuming,
+            is_workspace=is_workspace,
+            workspace_root=workspace_root,
         )
         if inline_spans is not None:
             kwargs["inline_spans"] = inline_spans

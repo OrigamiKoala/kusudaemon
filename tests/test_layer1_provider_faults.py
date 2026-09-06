@@ -167,7 +167,7 @@ class ProviderFaultInjectionTest(unittest.TestCase):
 
     def _setup_run(self, fault: str, **fault_kwargs: Any) -> tuple[Path, RecursiveDriver, _FaultyProvider]:
         tmp_dir = Path(tempfile.mkdtemp(prefix="kusudaemon_fault_test_"))
-        task = next(t for t in build_tasks() if t.task_id == "t1-notes")
+        task = next(t for t in build_tasks() if t.task_id == "t2-corpus")
         work_object, plan_payload = _prepare_task(tmp_dir, task)
         responses = _canned_responses(task, plan_payload, resume=False)
         inner = _ScriptedProvider(responses)

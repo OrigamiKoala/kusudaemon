@@ -116,10 +116,10 @@ def _resolve_role_transport(
         transport = env_transport.strip().lower()
     else:
         desired_transport = cfg_transport.lower() if cfg_transport else "http"
-        if desired_transport == "backend":
-            transport = "backend"
-        elif effective_backend == "gptme":
+        if effective_backend == "gptme":
             transport = "http"
+        elif desired_transport == "backend":
+            transport = "backend"
         else:
             try:
                 from ..provider_config import resolve
@@ -176,12 +176,18 @@ def make_role_provider(
     provider: str | None = None,
     backend: str | None = None,
     on_backoff: Callable[[int, float], None] | None = None,
-    timeout: float = 300.0,
+    timeout: float | None = None,
     lazy: bool = False,
     provider_cls: Any = None,
     role: str | None = None,
 ) -> RoleProvider:
-    """Build a RoleProvider instance for reasoning/role calls."""
+    """Build a RoleProvider instance for reasoning/role calls.
+
+    ``timeout`` is honored on both transports: the HTTP provider takes it
+    directly, and the backend path threads it into BackendRoleProvider's
+    episode budget (PLAN-REVIEW-LATENCY.md T0-6 — driver._role_provider's
+    45 s reviewer/triage budget previously died here). None preserves each
+    path's own default (300 s HTTP; env/defaults backend-side)."""
     run_backend = backend or (options.backend if options is not None and hasattr(options, "backend") else None) or "gptme"
     resolved_model = model or (options.model if options is not None and hasattr(options, "model") else None)
     resolved_provider = provider or (options.provider if options is not None and hasattr(options, "provider") else None)
@@ -197,7 +203,7 @@ def make_role_provider(
                 model=resolved_model,
                 provider=resolved_provider,
                 on_backoff=on_backoff,
-                timeout=timeout,
+                timeout=300.0 if timeout is None else timeout,
             )
 
         target_dir = Path(run_dir) if run_dir is not None else Path.cwd()
@@ -208,6 +214,7 @@ def make_role_provider(
             model=resolved_model,
             log=log,
             role=role or "role",
+            timeout=timeout,
         )
 
     if not lazy:

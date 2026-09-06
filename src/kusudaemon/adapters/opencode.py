@@ -36,6 +36,21 @@ _VALID_FORMATS = ("default", "json")
 _VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARN", "ERROR")
 
 
+def normalize_opencode_model(model: str | None) -> str | None:
+    """Normalize model identifier for OpenCode CLI.
+
+    OpenCode's NVIDIA provider requires `<provider>/<vendor>/<model>` (e.g.
+    `nvidia/nvidia/nemotron-3.5-lightning-30b-a3b`). If `nvidia/nemotron-...`
+    is supplied without the vendor segment, normalize to `nvidia/nvidia/...`.
+    """
+    if not model:
+        return model
+    m = model.strip()
+    if m.startswith("nvidia/nemotron-") or m.startswith("nvidia/cosmos-") or m.startswith("nvidia/nv-"):
+        return f"nvidia/{m}"
+    return m
+
+
 class OpenCodeAdapter(CommandAgentAdapter):
     supports_session_resume = True
     supports_tool_restriction = True
@@ -58,7 +73,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         variant: str | None = None,
         thinking: bool = False,
         pure: bool = False,
-        print_logs: bool = False,
+        print_logs: bool = True,
         log_level: str | None = None,
         port: int | None = None,
         username: str | None = None,
@@ -76,6 +91,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
             raise ValueError(
                 f"invalid format {format!r}; choices are {_VALID_FORMATS}"
             )
+        model = normalize_opencode_model(model)
         if log_level is not None:
             normalized_level = log_level.upper()
             if normalized_level not in _VALID_LOG_LEVELS:

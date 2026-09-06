@@ -167,6 +167,60 @@ class BackendRoleProviderTest(unittest.TestCase):
                 schema={"type": "object"},
             )
 
+    def test_schema_repair_review_item_direct(self) -> None:
+        raw = json.dumps({
+            "id": "rubric_1",
+            "pass": False,
+            "defect": "Missing steps",
+            "class": "patchable",
+            "check": "extra check field",
+        })
+        adapter = _FakeRoleAdapter([raw])
+        provider = BackendRoleProvider(
+            backend="opencode",
+            run_dir=self.tmp_path,
+            env=_DummyEnv(),
+            adapter_factory=lambda phase: adapter,
+        )
+        from kusudaemon.v1.reviewer import VERDICT_SCHEMA
+        res = provider.complete_json(
+            [{"role": "user", "content": "Review this"}],
+            schema=VERDICT_SCHEMA,
+            retries=1,
+        )
+        self.assertEqual(res["verdict"], "fail")
+        self.assertEqual(len(res["items"]), 1)
+        self.assertEqual(res["items"][0]["id"], "rubric_1")
+        self.assertFalse(res["items"][0]["pass"])
+        self.assertEqual(res["items"][0]["defect"], "Missing steps")
+        self.assertNotIn("check", res["items"][0])
+
+    def test_schema_repair_full_scope_missing_questions_and_objections(self) -> None:
+        raw = json.dumps({
+            "files_touched": 2,
+            "artifacts": 1,
+            "answerable_without_exploration": True,
+        })
+        adapter = _FakeRoleAdapter([raw])
+        provider = BackendRoleProvider(
+            backend="opencode",
+            run_dir=self.tmp_path,
+            env=_DummyEnv(),
+            adapter_factory=lambda phase: adapter,
+        )
+        from kusudaemon.v6.tiering import FULL_SCOPE_SCHEMA
+        res = provider.complete_json(
+            [{"role": "user", "content": "Estimate"}],
+            schema=FULL_SCOPE_SCHEMA,
+            retries=1,
+        )
+        self.assertEqual(res["files_touched"], "few")
+        self.assertEqual(res["artifacts"], 1)
+        self.assertTrue(res["answerable_without_exploration"])
+        self.assertEqual(res["questions"], [])
+        self.assertEqual(res["objections"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
+

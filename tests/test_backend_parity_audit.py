@@ -75,9 +75,9 @@ class BackendParityAuditTest(unittest.TestCase):
             hidden, exceptions = _hidden_paths_and_exceptions_for_probe(
                 run_dir, workspace, raw_finding
             )
-            # When run_dir is sibling/outside workspace
+            # When run_dir is sibling/outside workspace (§K4b carve-out is absolute)
             self.assertEqual(hidden, ())
-            self.assertEqual(exceptions, ())
+            self.assertEqual(exceptions, (raw_finding.resolve().as_posix(),))
 
             # When run_dir is nested inside workspace
             nested_run = workspace / ".kusudaemon" / "run"
@@ -181,8 +181,9 @@ class BackendParityAuditTest(unittest.TestCase):
                 self.assertIsNotNone(adapter)
                 if backend == "claude":
                     self.assertIsInstance(adapter, ClaudeCodeAdapter)
-                    # Ensure write tools are disallowed
-                    self.assertIn("Write", adapter.command_template)
+                    # Per §K4b, save (Write) is allowed for probes, but execution tools (Bash, Agent) are disallowed
+                    self.assertIn("Bash", adapter.command_template)
+                    self.assertNotIn("Write", adapter.command_template)
                 elif backend == "codex":
                     self.assertIsInstance(adapter, CodexAdapter)
                 elif backend == "opencode":

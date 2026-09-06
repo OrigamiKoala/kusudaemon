@@ -19,6 +19,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,66 @@ class ResearchQueryTest(unittest.TestCase):
                 e for e in log.read_all() if e.get("node_id") == r_id and e.get("type") == "episode_completed"
             ]
             self.assertEqual(len(completed_events), 1)
+
+
+class WorkspaceModeResearchTest(unittest.TestCase):
+    def test_research_allowlists_include_save(self) -> None:
+        from kusudaemon.v4.mcp_research import allowed_tools_for
+
+        self.assertIn("save", allowed_tools_for("workspace"))
+        self.assertIn("save", allowed_tools_for("corpus"))
+
+    def test_probe_hidden_path_carve_out_with_sibling_run_dir(self) -> None:
+        from kusudaemon.pipeline.backends import _hidden_paths_and_exceptions_for_probe
+
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = root / "runs" / "run_01"
+            run_dir.mkdir(parents=True)
+            workspace_root = root / "workspaces" / "ws_01"
+            workspace_root.mkdir(parents=True)
+            raw_path = run_dir / "scratch" / "probe" / "finding.raw.json"
+            raw_path.parent.mkdir(parents=True)
+            raw_path.touch()
+
+            hidden, exceptions = _hidden_paths_and_exceptions_for_probe(run_dir, workspace_root, raw_path)
+            self.assertEqual(exceptions, (raw_path.resolve().as_posix(),))
+
+    def test_probe_fallback_jsonl_trace_emits_degraded_event(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_jsonl")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            # Adapter returns a JSONL trace dump
+            trace_dump = '{"type": "logdir", "path": "/tmp/log"}\n{"type": "message", "role": "tool", "tool_name": "read"}'
+            mock_adapter = mock.AsyncMock()
+            from kusudaemon.types import EpisodeResult
+            mock_adapter.run_episode.return_value = EpisodeResult(
+                status="done",
+                actions_log=trace_dump,
+                error=None,
+                duration_ms=100,
+                metadata={"assistant_visible_output": ""},
+            )
+            query = ResearchQuery(slug="probe-q", kind="workspace", question="Find structure")
+
+            finding = asyncio.run(
+                run_research_query(
+                    run_dir, "node1", query, mock_adapter,
+                    LocalEnvironment(tmp_dir=str(prompt_dir)), EpisodeBudget(max_duration_seconds=30),
+                )
+            )
+
+            # Text should be empty, not the trace dump
+            self.assertEqual(finding.text, "")
+
+            # probe_finding_degraded event should be logged
+            log = EventLog(events_path(run_dir))
+            degraded_events = [e for e in log.read_all() if e.get("type") == "probe_finding_degraded"]
+            self.assertEqual(len(degraded_events), 1)
+            self.assertEqual(degraded_events[0].get("slug"), "probe-q")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,13 @@ from ..v0.run_dir import events_path
 from ..v1.json_schema import validate
 from ..v1.provider import ProviderError
 from .episode_loop import get_episode_loop
-from .json_io import _parse_json_object, build_json_instruction, extract_last_json_object
+from .json_io import (
+    _parse_json_object,
+    _repair_common_schema_omissions,
+    _unwrap_schema_echo,
+    build_json_instruction,
+    extract_last_json_object,
+)
 from .protocol import RoleProviderBase
 
 
@@ -71,6 +77,7 @@ class BackendRoleProvider(RoleProviderBase):
         env: Environment | None = None,
         model: str | None = None,
         budget: EpisodeBudget | None = None,
+        timeout: float | None = None,
         max_episode_retries: int = 2,
         log: EventLog | None = None,
         concurrency: int = 4,
@@ -82,13 +89,23 @@ class BackendRoleProvider(RoleProviderBase):
         self.run_dir = Path(run_dir)
         self.env = env
         self.model = model or ""
-        if self.role in ("reviewer", "triage"):
+        if budget is not None:
+            self.budget = budget
+        elif timeout is not None:
+            # Explicit caller timeout (PLAN-REVIEW-LATENCY.md T0-6:
+            # roles/factory.make_role_provider threads driver._role_provider's
+            # 45 s reviewer/triage budget through here). Wins over env.
+            self.budget = EpisodeBudget(
+                max_duration_seconds=int(timeout), max_output_tokens=2048
+            )
+        elif self.role in ("reviewer", "triage"):
             timeout_env = os.getenv("KUSUDAEMON_REVIEWER_TIMEOUT") or os.getenv("KUSUDAEMON_ROLE_TIMEOUT")
-            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 45
+            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 120
+            self.budget = EpisodeBudget(max_duration_seconds=default_timeout, max_output_tokens=2048)
         else:
             timeout_env = os.getenv("KUSUDAEMON_ROLE_TIMEOUT")
-            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 180
-        self.budget = budget or EpisodeBudget(max_duration_seconds=default_timeout, max_output_tokens=2048)
+            default_timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 300
+            self.budget = EpisodeBudget(max_duration_seconds=default_timeout, max_output_tokens=2048)
         self.max_episode_retries = max_episode_retries
         self._concurrency = concurrency
         self._adapter_factory = adapter_factory
@@ -182,6 +199,8 @@ class BackendRoleProvider(RoleProviderBase):
                         except Exception:
                             pass
                     if ep_try < self.max_episode_retries:
+                        if "rate limit" in (res.error or "").lower() or (res.actions_log and "rate limit" in res.actions_log.lower()):
+                            time.sleep(5 * (ep_try + 1))
                         continue
                     raise ProviderError(
                         f"role episode failed ({res.status}) after {self.max_episode_retries + 1} attempts: {res.error or 'unknown error'}"
@@ -197,12 +216,12 @@ class BackendRoleProvider(RoleProviderBase):
             parsed = None
             parse_err = ""
             if content.strip():
-                parsed, parse_err = _parse_json_object(content)
-                if parsed is not None and parsed.get("type") in {"usage", "logdir", "heartbeat", "thinking", "system", "session_captured"}:
-                    parsed = None
+                parsed, parse_err = extract_last_json_object(content, schema=schema)
                 if parsed is None:
-                    parsed, parse_err = extract_last_json_object(content, schema=schema)
-            if parsed is None:
+                    parsed, parse_err = _parse_json_object(content)
+                    if parsed is not None and parsed.get("type") in {"usage", "logdir", "heartbeat", "thinking", "system", "session_captured"}:
+                        parsed = None
+            if parsed is None and episode_result.actions_log:
                 # Fallback to scanning actions_log for valid JSON matching schema
                 parsed, parse_err = extract_last_json_object(episode_result.actions_log, schema=schema)
 
@@ -232,6 +251,7 @@ class BackendRoleProvider(RoleProviderBase):
                 pass
 
             if parsed is not None:
+                parsed = _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema)
                 schema_errors = validate(parsed, schema)
                 if not schema_errors:
                     return parsed
@@ -263,7 +283,8 @@ class BackendRoleProvider(RoleProviderBase):
                     "role": "user",
                     "content": (
                         f"That did not validate: {last_error}.{capped_preview}\n\n"
-                        "Return only a single valid JSON object matching the schema. No prose, no reasoning, no code fences."
+                        "Return only a single valid JSON object matching the schema. No prose, no reasoning, no code fences. "
+                        "Do not wrap inside top-level 'properties' or 'type'."
                     ),
                 },
             ]

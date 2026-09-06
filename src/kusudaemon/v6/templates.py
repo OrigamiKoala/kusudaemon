@@ -42,6 +42,7 @@ the only contract available is the script-rendered spec.md one
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -49,7 +50,11 @@ from typing import Literal
 from ..v2.survey import SpineUnit  # noqa: F401 — re-exported for callers
 
 Shape = Literal[
-    "prose-dominant", "derivation-dominant", "problem-set-dominant", "reference-dominant"
+    "prose-dominant",
+    "derivation-dominant",
+    "problem-set-dominant",
+    "reference-dominant",
+    "code-dominant",
 ]
 
 
@@ -168,12 +173,122 @@ _REFERENCE = NodeTemplate(
 )
 
 # A prose-dominant leaf: ``headers:std`` hard gate for basic hygiene.
+# PLAN-REVIEW-LATENCY-STATUS.md §9.2: closed rubric on-topic and claims_supported.
 _PROSE = NodeTemplate(
     name="prose",
     shapes=("prose-dominant",),
     gates=("headers:std",),
     warn_gates=(),
     tools=("read", "save"),
+    judgment=("on_topic", "claims_supported"),
+    judgment_classification={
+        "on_topic": "closed",
+        "claims_supported": "closed",
+    },
+    rubric={
+        "on_topic": (
+            "Every section addresses this leaf's stated brief; material "
+            "that belongs to another leaf's brief, or to no brief, is a "
+            "defect. Judge against the brief as written, not against what "
+            "the topic could plausibly cover."
+        ),
+        "claims_supported": (
+            "Every factual claim traces to a declared input, to the "
+            "contract, or is explicitly marked as an assumption. A claim "
+            "with no such support is a defect. Do NOT judge whether a "
+            "claim is true in the world -- only whether this artifact "
+            "shows where it came from."
+        ),
+    },
+)
+
+# §K6: Code template for code-dominant leaves in repositories / coding tasks.
+_CODE = NodeTemplate(
+    name="code",
+    shapes=("code-dominant",),
+    types=(),
+    gates=(),
+    warn_gates=(),
+    tools=("read", "save", "patch", "shell"),
+    judgment=("builds_or_runs", "on_topic"),
+    judgment_classification={
+        "builds_or_runs": "closed",
+        "on_topic": "closed",
+    },
+    rubric={
+        "builds_or_runs": (
+            "Code compiles, builds, or runs without syntax or import errors. "
+            "Existing tests pass or new tests pass as appropriate."
+        ),
+        "on_topic": (
+            "Every section addresses this leaf's stated brief; material "
+            "that belongs to another leaf's brief, or to no brief, is a "
+            "defect. Judge against the brief as written, not against what "
+            "the topic could plausibly cover."
+        ),
+    },
+)
+
+# PLAN-REVIEW-LATENCY-STATUS.md §7.4, §9.6; PLAN-WORKSPACE-MODE.md §K2, §R4: Direct template for short-horizon nodes (T0/T1).
+def _direct_template() -> NodeTemplate:
+    tools = () if os.getenv("KUSUDAEMON_DIRECT_TOOLS") == "1" else ("read", "save")
+    return NodeTemplate(
+        name="direct",
+        shapes=("direct",),
+        types=(),
+        gates=(),
+        warn_gates=("headers:std",),
+        tools=tools,
+        judgment=("on_topic", "claims_supported"),
+        judgment_classification={
+            "on_topic": "closed",
+            "claims_supported": "closed",
+        },
+        rubric={
+            "on_topic": (
+                "Every section addresses this leaf's stated brief; material "
+                "that belongs to another leaf's brief, or to no brief, is a "
+                "defect. Judge against the brief as written, not against what "
+                "the topic could plausibly cover."
+            ),
+            "claims_supported": (
+                "Every factual claim traces to a declared input, to the "
+                "contract, or is explicitly marked as an assumption. A claim "
+                "with no such support is a defect. Do NOT judge whether a "
+                "claim is true in the world -- only whether this artifact "
+                "shows where it came from."
+            ),
+        },
+    )
+
+
+_DIRECT = NodeTemplate(
+    name="direct",
+    shapes=(),
+    types=(),
+    gates=(),
+    warn_gates=(),
+    tools=(),
+    judgment=("on_topic", "claims_supported"),
+    judgment_classification={
+        "on_topic": "closed",
+        "claims_supported": "closed",
+    },
+    rubric={
+        "on_topic": (
+            "Every section addresses this leaf's stated brief; material "
+            "that belongs to another leaf's brief, or to no brief, is a "
+            "defect. Judge against the brief as written, not against what "
+            "the topic could plausibly cover."
+        ),
+        "claims_supported": (
+            "Every factual claim traces to a declared input, to the "
+            "contract, or is explicitly marked as an assumption. A claim "
+            "with no such support is a defect. Do NOT judge whether a "
+            "claim is true in the world -- only whether this artifact "
+            "shows where it came from."
+        ),
+    },
 )
 
 _BUILTIN_TEMPLATES: tuple[NodeTemplate, ...] = (
@@ -181,6 +296,7 @@ _BUILTIN_TEMPLATES: tuple[NodeTemplate, ...] = (
     _DERIVATION,
     _REFERENCE,
     _PROSE,
+    _CODE,
     _GENERIC,
 )
 
@@ -199,6 +315,8 @@ def template_for(shape: str, node_type: str = "generic") -> NodeTemplate:
     doesn't yet emit richer types, but the resolver already supports a
     future where it does (templates carry a ``types`` tuple precisely so
     a richer type system can land without rewriting this function)."""
+    if shape == "direct" and os.getenv("KUSUDAEMON_DIRECT_TEMPLATE") == "1":
+        return _direct_template()
     # Specific ``(shape, type)`` templates would win first; today the
     # registry only keys on ``shape`` (every template's ``types`` is
     # empty), so the loop is effectively shape-only and ``generic`` is

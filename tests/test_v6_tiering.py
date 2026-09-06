@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -676,6 +677,7 @@ class TierOverrideFloorTest(unittest.TestCase):
                         # dispatch-decision response too, which isn't what
                         # this test is about.
                         dispatch_policy="document_order",
+                        disable_node_review=True,
                     ),
                     writer_adapter_factory=_writer_factory(run_dir.resolve()),
                     research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
@@ -1093,3 +1095,111 @@ class MaxParallelForgingDriverTest(unittest.TestCase):
                 self.assertEqual(captured.get("max_parallel"), 3)
 
         asyncio.run(scenario())
+
+
+class WorkspaceModeTieringTest(unittest.TestCase):
+    def test_numeric_output_target_detection(self) -> None:
+        from kusudaemon.v6.tiering import _numeric_output_target, _NUMERIC_TARGET_RE
+
+        self.assertTrue(_numeric_output_target("Write 40 chapters of documentation"))
+        self.assertTrue(_numeric_output_target("Generate 12 sections based on analysis"))
+        self.assertTrue(_numeric_output_target("Deliver 50,000 words covering all aspects"))
+        self.assertTrue(_numeric_output_target("Produce one per file across the repo"))
+        self.assertFalse(_numeric_output_target("Fix the bug in main.py"))
+        self.assertFalse(_numeric_output_target("Review case queue"))
+
+    def test_measured_small_conjunction(self) -> None:
+        from kusudaemon.v6.tiering import Signals, ScopeEstimate, _measured_small
+
+        small_signals = Signals(
+            work_tokens=500,
+            work_files=3,
+            goal_tokens=50,
+            named_paths=(),
+            breadth_markers=0,
+            output_markers=0,
+            output_targets=0,
+        )
+        small_estimate = ScopeEstimate(files_touched="unknown", artifacts=1)
+        self.assertTrue(_measured_small(small_signals, small_estimate, "Fix typo in file"))
+
+        # Generative long-horizon task with small input fails _measured_small
+        gen_signals = Signals(
+            work_tokens=500,
+            work_files=1,
+            goal_tokens=50,
+            named_paths=(),
+            breadth_markers=0,
+            output_markers=0,
+            output_targets=1,
+        )
+        self.assertFalse(_measured_small(gen_signals, small_estimate, "Write 40 chapters"))
+
+        # Breadth or output markers fail _measured_small
+        breadth_signals = Signals(
+            work_tokens=500,
+            work_files=2,
+            goal_tokens=50,
+            named_paths=(),
+            breadth_markers=1,
+            output_markers=0,
+            output_targets=0,
+        )
+        self.assertFalse(_measured_small(breadth_signals, small_estimate, "Analyze entire codebase"))
+
+    def test_tier_escalation_guard_with_flag(self) -> None:
+        from kusudaemon.v6.tiering import Signals, ScopeEstimate, classify
+
+        small_signals = Signals(
+            work_tokens=188,
+            work_files=3,
+            goal_tokens=30,
+            named_paths=(),
+            breadth_markers=0,
+            output_markers=0,
+            output_targets=0,
+        )
+        estimate_unknown = ScopeEstimate(files_touched="unknown", artifacts=1)
+
+        # Default (flag not set): escalates to T2
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_TIER_TRUST_SIGNALS": "0"}):
+            tier_default = classify(small_signals, estimate_unknown, goal="Fix bug")
+            self.assertEqual(tier_default, "T2")
+
+        # Flag set: declines escalation, logs tier_escalation_declined
+        logged_events: list[dict] = []
+        mock_log = mock.MagicMock()
+        mock_log.emit.side_effect = lambda event, **kwargs: logged_events.append({"type": event, **kwargs})
+
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_TIER_TRUST_SIGNALS": "1"}):
+            tier_flagged = classify(small_signals, estimate_unknown, log=mock_log, goal="Fix bug")
+            self.assertIn(tier_flagged, ("T0", "T1"))
+            self.assertTrue(any(e.get("type") == "tier_escalation_declined" for e in logged_events))
+
+        # Large work object still escalates to T2 even with flag set
+        large_signals = Signals(
+            work_tokens=10_000,
+            work_files=20,
+            goal_tokens=30,
+            named_paths=(),
+            breadth_markers=0,
+            output_markers=0,
+            output_targets=0,
+        )
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_TIER_TRUST_SIGNALS": "1"}):
+            tier_large = classify(large_signals, estimate_unknown, goal="Fix bug")
+            self.assertEqual(tier_large, "T2")
+
+        # §R1 / §R6: Generative long-horizon with small input but large declared output still reaches T2
+        gen_small_input_signals = Signals(
+            work_tokens=500,
+            work_files=1,
+            goal_tokens=30,
+            named_paths=(),
+            breadth_markers=0,
+            output_markers=0,
+            output_targets=1,
+        )
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_TIER_TRUST_SIGNALS": "1"}):
+            tier_gen = classify(gen_small_input_signals, estimate_unknown, goal="Write 40 chapters")
+            self.assertEqual(tier_gen, "T2")

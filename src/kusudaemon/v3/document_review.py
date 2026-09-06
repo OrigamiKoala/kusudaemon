@@ -360,6 +360,8 @@ def run_document_review(
     spine_labels = _spine_labels(run_dir)
 
     result = DocumentReviewResult()
+    if len(entries) <= 1 and not keep_depth_pass:
+        return result
     by_node: dict[str, dict[str, Any]] = {}
 
     def absorb(pass_id: str, item: dict[str, Any], *, default_node_ids: list[str] | None = None) -> None:

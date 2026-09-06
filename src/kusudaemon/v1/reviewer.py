@@ -101,6 +101,7 @@ class ReviewVerdict:
     verdict: str = "pass"
     truncated: bool = False
     section_verdicts: list[dict[str, Any]] = field(default_factory=list)
+    skip_reason: str | None = None
 
 
 TRIAGE_SCHEMA: dict[str, Any] = {
@@ -131,6 +132,8 @@ GATE_COVERED_JUDGMENTS: frozenset[str] = frozenset({
     "citations_resolve",
     "terms_defined",
     "nonempty",
+    "claims_resolve",
+    "uncited_claim",
 })
 
 CROSS_LEAF_JUDGMENTS: frozenset[str] = frozenset({
@@ -146,15 +149,17 @@ def compute_verdict_digest(
     rubric: dict[str, str],
     judgment: list[str],
     contract_text: str = "",
+    brief: str = "",
 ) -> str:
-    """PLAN-EFFICIENCY-AND-HORIZON.md §L6: deterministic digest over artifact,
-    rubric, and contract for caching passing review verdicts."""
+    """PLAN-EFFICIENCY-AND-HORIZON.md §L6, PLAN-REVIEW-LATENCY-STATUS.md §9.3:
+    deterministic digest over artifact, rubric, contract, and brief for caching
+    passing review verdicts."""
     import hashlib
 
     sorted_rubric = "\n".join(
         f"{k}:{rubric.get(k, '')}" for k in sorted(judgment)
     )
-    payload = f"{artifact_text}\n{sorted_rubric}\n{contract_text}".encode("utf-8")
+    payload = f"{artifact_text}\n{sorted_rubric}\n{contract_text}\n{brief}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -245,6 +250,7 @@ def _call_reviewer(
     *,
     contract_text: str = "",
     declared_inputs: str = "",
+    brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
@@ -253,6 +259,8 @@ def _call_reviewer(
         content_parts.append(f"Contract:\n{contract_text}")
     if declared_inputs:
         content_parts.append(f"Declared Inputs:\n{declared_inputs}")
+    if brief:
+        content_parts.append(f"Brief:\n{brief}")
     content_parts.append(f"Artifact:\n{artifact_text}")
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -289,6 +297,7 @@ def _call_triage(
     *,
     contract_text: str = "",
     declared_inputs: str = "",
+    brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
@@ -297,6 +306,8 @@ def _call_triage(
         content_parts.append(f"Contract:\n{contract_text}")
     if declared_inputs:
         content_parts.append(f"Declared Inputs:\n{declared_inputs}")
+    if brief:
+        content_parts.append(f"Brief:\n{brief}")
     content_parts.append(f"Artifact:\n{artifact_text}")
     messages = [
         {"role": "system", "content": _TRIAGE_SYSTEM_PROMPT},
@@ -321,6 +332,7 @@ def review_node(
     artifact_cap_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS,
     contract_text: str = "",
     declared_inputs: str = "",
+    brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
     triage_provider: RoleProvider | None = None,
@@ -331,8 +343,9 @@ def review_node(
     parallel: bool = True,
 ) -> ReviewVerdict:
     """PLAN-REVIEW-LATENCY.md: Grounded, delta-cached, parallel review."""
+    brief_text = brief
     if not node.judgment:
-        return ReviewVerdict(node_id=node.id, items=[], verdict="pass")
+        return ReviewVerdict(node_id=node.id, items=[], verdict="pass", skip_reason="empty_judgment")
 
     # T1-4: De-duplicate review layers: strip cross-leaf judgments
     effective_judgment = [j for j in node.judgment if j not in CROSS_LEAF_JUDGMENTS]
@@ -345,7 +358,7 @@ def review_node(
         ]
 
     if not effective_judgment:
-        return ReviewVerdict(node_id=node.id, items=[], verdict="pass")
+        return ReviewVerdict(node_id=node.id, items=[], verdict="pass", skip_reason="all_filtered")
 
     # T1-1: Deterministic pre-filter: skip model call if all gates pass and all judgments are gate-covered
     gates_passed = all_gates_passed
@@ -360,6 +373,7 @@ def review_node(
             items=[{"id": j, "pass": True} for j in effective_judgment],
             verdict="pass",
             truncated=False,
+            skip_reason="gate_covered_prefilter",
         )
 
     rubric_lines = "\n".join(
@@ -376,6 +390,7 @@ def review_node(
                 triage_provider,
                 contract_text=contract_text,
                 declared_inputs=declared_inputs,
+                brief=brief_text,
                 on_reasoning=on_reasoning,
                 temperature=temperature,
             )
@@ -397,7 +412,7 @@ def review_node(
 
     capped_artifact = cap_artifact_text(artifact_text, artifact_cap_tokens)
     if capped_artifact == artifact_text:
-        digest = compute_verdict_digest(artifact_text, node.rubric, effective_judgment, contract_text)
+        digest = compute_verdict_digest(artifact_text, node.rubric, effective_judgment, contract_text, brief=brief_text)
         if digest in cached_map and cached_map[digest].get("verdict") == "pass":
             cached_entry = cached_map[digest]
             return ReviewVerdict(
@@ -413,6 +428,7 @@ def review_node(
             provider,
             contract_text=contract_text,
             declared_inputs=declared_inputs,
+            brief=brief_text,
             on_reasoning=on_reasoning,
             temperature=temperature,
         )
@@ -428,7 +444,7 @@ def review_node(
 
     sections = _group_sections(_sections_by_heading(artifact_text), MAX_FANOUT_SECTIONS)
     if not sections:
-        digest = compute_verdict_digest(capped_artifact, node.rubric, effective_judgment, contract_text)
+        digest = compute_verdict_digest(capped_artifact, node.rubric, effective_judgment, contract_text, brief=brief_text)
         if digest in cached_map and cached_map[digest].get("verdict") == "pass":
             cached_entry = cached_map[digest]
             return ReviewVerdict(
@@ -444,6 +460,7 @@ def review_node(
             provider,
             contract_text=contract_text,
             declared_inputs=declared_inputs,
+            brief=brief_text,
             on_reasoning=on_reasoning,
             temperature=temperature,
         )
@@ -467,7 +484,7 @@ def review_node(
         if sec_truncated:
             truncated = True
             section_text = capped_section
-        sec_digest = compute_verdict_digest(section_text, node.rubric, effective_judgment, contract_text)
+        sec_digest = compute_verdict_digest(section_text, node.rubric, effective_judgment, contract_text, brief=brief_text)
         if sec_digest in cached_map and cached_map[sec_digest].get("verdict") == "pass":
             section_verdicts[idx] = cached_map[sec_digest]
         else:
@@ -480,6 +497,7 @@ def review_node(
             provider,
             contract_text=contract_text,
             declared_inputs=declared_inputs,
+            brief=brief_text,
             on_reasoning=on_reasoning,
             temperature=temperature,
         )

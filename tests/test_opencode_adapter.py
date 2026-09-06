@@ -342,6 +342,29 @@ class BackendRegistrationTest(unittest.TestCase):
         args_cli = cli_p.parse_args(["run", "--backend", "opencode", "--goal", "g"])
         self.assertEqual(args_cli.backend, "opencode")
 
+    def test_normalize_opencode_model(self) -> None:
+        from kusudaemon.adapters.opencode import normalize_opencode_model
+
+        self.assertEqual(
+            normalize_opencode_model("nvidia/nemotron-3.5-lightning-30b-a3b"),
+            "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+        )
+        self.assertEqual(
+            normalize_opencode_model("nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
+            "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+        )
+        self.assertEqual(
+            normalize_opencode_model("opencode/nemotron-3.5-lightning-free"),
+            "opencode/nemotron-3.5-lightning-free",
+        )
+        self.assertIsNone(normalize_opencode_model(None))
+
+    def test_adapter_normalizes_model_in_command(self) -> None:
+        adapter = OpenCodeAdapter(model="nvidia/nemotron-3.5-lightning-30b-a3b")
+        self.assertEqual(adapter.model, "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b")
+        self.assertIn("nvidia/nvidia/nemotron-3.5-lightning-30b-a3b", adapter.command_template)
+
 
 if __name__ == "__main__":
     unittest.main()
+

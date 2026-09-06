@@ -40,7 +40,7 @@ DEFAULT_TOKEN_BUDGET = 50_000  # matches v1's NodeBudget default
 DEFAULT_TOP_LEVEL_MIN_CHILDREN = 8
 DEFAULT_TOP_LEVEL_MAX_CHILDREN = 12
 
-_SHAPES = ["prose-dominant", "derivation-dominant", "problem-set-dominant", "reference-dominant"]
+_SHAPES = ["prose-dominant", "derivation-dominant", "problem-set-dominant", "reference-dominant", "code-dominant"]
 
 def _make_partition_schema(with_probes: bool) -> dict[str, Any]:
     props: dict[str, Any] = {

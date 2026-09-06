@@ -793,6 +793,36 @@ def cmd_backend(argv: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_opencode_usage(output: str) -> dict[str, int]:
+    total_tokens = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        usage = rec.get("usage")
+        if isinstance(usage, dict):
+            inp = usage.get("input_tokens", 0) or 0
+            outp = usage.get("output_tokens", 0) or 0
+            prompt_tokens += inp
+            completion_tokens += outp
+            total_tokens += (inp + outp)
+        elif rec.get("type") == "usage":
+            inp = rec.get("prompt_tokens", 0) or 0
+            outp = rec.get("completion_tokens", 0) or 0
+            prompt_tokens += inp
+            completion_tokens += outp
+            total_tokens += rec.get("total_tokens", inp + outp) or (inp + outp)
+    return {"total": total_tokens, "prompt": prompt_tokens, "completion": completion_tokens}
+
+
 def cmd_bench(
     argv: argparse.Namespace,
     *,
@@ -872,7 +902,7 @@ def cmd_bench(
         # fresh one, using each CLI's own resume mechanism.
         cmd: list[str]
         if backend == "opencode":
-            cmd = ["opencode", "run"]
+            cmd = ["opencode", "run", "--print-logs"]
             if model:
                 cmd.extend(["--model", model])
             if resuming:
@@ -933,6 +963,13 @@ def cmd_bench(
         t1 = time.time()
         wall_clock_s = round(t1 - t0, 3)
 
+        tokens_by_role: dict[str, int] = {}
+        if backend == "opencode" and hasattr(res, "stdout"):
+            combined = (res.stdout or "") + "\n" + (res.stderr or "")
+            parsed_usage = _parse_opencode_usage(combined)
+            if parsed_usage["total"] > 0:
+                tokens_by_role = {"bare": parsed_usage["total"]}
+
         record = {
             "benchmark": benchmark,
             "task_id": task_id,
@@ -948,7 +985,7 @@ def cmd_bench(
             "tier_final": None,
             "escalations": [],
             "calls_by_role": {"bare": 1},
-            "tokens_by_role": {},
+            "tokens_by_role": tokens_by_role,
             "wall_clock_s": wall_clock_s,
             "halt_reason": halt_reason,
             "commit": commit,

@@ -154,19 +154,47 @@ def _goal_and_rubric_block(run_dir: Path) -> str:
     return "\n\n".join(lines)
 
 
-def _artifact_instruction(node: TaskNode, run_dir: Path) -> str:
+def _artifact_instruction(
+    node: TaskNode,
+    run_dir: Path,
+    *,
+    is_workspace: bool = False,
+    workspace_root: str | Path | None = None,
+) -> str:
     """PLAN.md §D0: the artifact path appeared in no Writer prompt, in any
     tier, ever — the single file path any Writer was ever given was
     ``promotion.json``. ``node.artifact`` is the single source of truth
     (asserted at tree load, ``v1/tree.py``); render it absolute, not
     relative, because a relative path is only correct while the agent's cwd
-    happens to equal the run directory (§D0b — workspace mode breaks that)."""
+    happens to equal the run directory (§D0b — workspace mode breaks that).
+
+    PLAN-WORKSPACE-MODE.md §K3, §R2: Scope workspace deliverable framing to
+    single-node fallback (SINGLE_NODE_ID, DIRECT_NODE_ID) behind
+    KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT. Planner-built leaves stay untouched."""
+    from ..v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID
+
     absolute_path = resolve_stored(run_dir, node.artifact)
-    instruction = (
-        f"Write your artifact to `{absolute_path}` using your file tools "
-        "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
-        "else you write or say is."
-    )
+    if (
+        os.getenv("KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT") == "1"
+        and is_workspace
+        and node.id in (SINGLE_NODE_ID, DIRECT_NODE_ID)
+    ):
+        ws_display = str(workspace_root) if workspace_root else "<workspace_root>"
+        instruction = (
+            f"Your deliverables are the files your brief names, written in place under "
+            f"{ws_display}. Write them with your file tools; they are what gets read "
+            f"next.\n\n"
+            f"When the work itself is complete, also write a short summary of what you "
+            f"produced to `{absolute_path}` — the harness reads that summary, not "
+            f"your workspace, when it assembles the run. The summary never substitutes "
+            f"for the deliverables."
+        )
+    else:
+        instruction = (
+            f"Write your artifact to `{absolute_path}` using your file tools "
+            "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
+            "else you write or say is."
+        )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
         claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")
         instruction += (
@@ -230,10 +258,25 @@ def segments(
     hidden_paths: tuple[str, ...] = (),
     hidden_path_exceptions: tuple[str, ...] = (),
     resuming: bool = False,
+    is_workspace: bool | None = None,
+    workspace_root: str | Path | None = None,
 ) -> list[tuple[str, str]]:
     """Return the ordered list of (label, text) segments making up a Writer's
     prompt (PLAN-EFFICIENCY-AND-HORIZON.md §L10)."""
     run_dir = Path(run_dir)
+    if is_workspace is None:
+        try:
+            tier_file = run_dir / "tier.json"
+            if tier_file.exists():
+                tier_info = json.loads(tier_file.read_text(encoding="utf-8"))
+                is_workspace = tier_info.get("kind") == "workspace"
+                if not workspace_root:
+                    workspace_root = tier_info.get("root")
+            else:
+                is_workspace = False
+        except Exception:
+            is_workspace = False
+
     segs: list[tuple[str, str]] = []
 
     def add(label: str, text: str) -> None:
@@ -252,7 +295,15 @@ def segments(
         )
     add("hidden_paths", _hidden_paths_notice_block(hidden_paths))
     add("hidden_path_exceptions", _hidden_path_exceptions_block(hidden_path_exceptions))
-    add("artifact_instruction", _artifact_instruction(node, run_dir))
+    add(
+        "artifact_instruction",
+        _artifact_instruction(
+            node,
+            run_dir,
+            is_workspace=bool(is_workspace),
+            workspace_root=workspace_root,
+        ),
+    )
     if node.judgment and node.rubric:
         rubric_lines = "\n".join(
             f"- {judgment_id}: {node.rubric[judgment_id]}"
@@ -339,6 +390,8 @@ def build_node_prompt(
     hidden_paths: tuple[str, ...] = (),
     hidden_path_exceptions: tuple[str, ...] = (),
     resuming: bool = False,
+    is_workspace: bool | None = None,
+    workspace_root: str | Path | None = None,
 ) -> str:
     """Assemble a Writer's prompt. ``segment_tokens`` (PLAN.md §C5's
     "mean input tokens per leaf broken down by prompt segment" instrument)
@@ -365,6 +418,8 @@ def build_node_prompt(
         hidden_paths=hidden_paths,
         hidden_path_exceptions=hidden_path_exceptions,
         resuming=resuming,
+        is_workspace=is_workspace,
+        workspace_root=workspace_root,
     )
     if segment_tokens is not None:
         for label, text in segs:
