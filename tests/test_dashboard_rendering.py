@@ -217,7 +217,7 @@ class HeartbeatAndDedupeRemovalTest(unittest.TestCase):
             ]
         )
         entries = rendering.parse_trace(raw)
-        self.assertEqual(entries, [rendering.TraceEntry("assistant", "still here")])
+        self.assertEqual(entries, [rendering.TraceEntry("assistant", "still here", timestamp=12345.0)])
 
 
 class ErrorClassificationTest(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""PLAN.md §4.3 / TEST-PLAN.md §1.5 — Planner coverage.
+"""PLAN.md §4.3 / BENCHMARKING.md §9.1 / docs/TEST-PLAN.md §1.5 — Planner coverage.
 
 Property-based and fully deterministic tests for build_tree and plan_level.
 Verifies invariants over randomly generated spines (1-500 units, random token weights):

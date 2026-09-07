@@ -112,12 +112,10 @@ const state = {
   escalationFlash: false,
   chatFeedPinned: true,    // the run stream pins to the newest entry until the operator scrolls up
   nodeChatPinned: true,    // the node Chat tab pins to the newest entry until the operator scrolls up
-  // §F1 (PLAN-AUDIT.md, 2026-08-12): live thinking for the followed agent
-  // (mainAgentId()), appended into the main feed. Cursor-based — `next` is
-  // the index to resume fetching from, `entries` accumulate client-side so
-  // a tick only ever asks the server for what's new (?since=next) instead
-  // of re-fetching and re-rendering the whole trace every ~1.5s.
-  mainThinking: { agentId: null, entries: [], next: 0, sortAnchor: undefined },
+  thinkingOpen: {},        // key -> boolean: explicit user-toggled details state
+  // §F1 (PLAN-AUDIT.md, 2026-08-12): live thinking for followed and historical agents,
+  // accumulated client-side per agent so thinking from prior turns/phases is retained.
+  mainThinking: { agents: {}, entries: [], total: 0 },
 };
 
 const root = document.getElementById("app");
@@ -304,61 +302,92 @@ function mainAgentId() {
   const snap = state.snapshot;
   if (!snap) return "";
   const subs = snap.subagents || [];
-  // Main agent is strictly a phase agent or main harness agent, NEVER a worker node subagent
   const livePhase = subs.find((s) => (s.kind === "phase" || String(s.id).startsWith("phase-")) && s.live);
   if (livePhase) return livePhase.id;
   const anyPhase = subs.find((s) => s.kind === "phase" || String(s.id).startsWith("phase-"));
   if (anyPhase) return anyPhase.id;
   if (snap.phase && snap.phase !== "execute") return `phase-${snap.phase}`;
+  const anyLiveSub = subs.find((s) => s.live);
+  if (anyLiveSub) return anyLiveSub.id;
+  const anySub = subs[subs.length - 1];
+  if (anySub) return anySub.id;
   return "";
 }
 
-// §F1: live thinking for the main/phase agent only, appended into the main
-// run-stream feed. Subagent thinking belongs solely in each subagent's
-// specific Chat tab.
+// §F1: live thinking for active and historical agents, appended into the main
+// run-stream feed. Thinking from previous turns/phases is retained per agent
+// and merged chronologically rather than wiped when the followed agent changes.
 function loadMainThinking() {
-  const id = mainAgentId();
-  if (!id) {
-    if (state.mainThinking && state.mainThinking.agentId) {
-      state.mainThinking = { agentId: null, entries: [], next: 0, loaded: false };
+  if (!state.mainThinking) {
+    state.mainThinking = { agents: {}, entries: [], total: 0 };
+  }
+  if (!state.mainThinking.agents) {
+    state.mainThinking.agents = {};
+  }
+  const snap = state.snapshot;
+  if (!snap) return;
+
+  const activeId = mainAgentId();
+  const candidateIds = new Set();
+  if (activeId) candidateIds.add(activeId);
+  for (const s of (snap.subagents || [])) {
+    if (s.id) candidateIds.add(s.id);
+  }
+  if (snap.phase && snap.phase !== "execute") {
+    candidateIds.add(`phase-${snap.phase}`);
+  }
+
+  for (const agentId of candidateIds) {
+    let ag = state.mainThinking.agents[agentId];
+    if (!ag) {
+      ag = state.mainThinking.agents[agentId] = { entries: [], next: 0, loaded: false, sortAnchor: undefined };
     }
-    return;
-  }
-  if (state.mainThinking.agentId !== id) {
-    state.mainThinking = { agentId: id, entries: [], next: 0, loaded: false };
-  }
-  const live = (state.snapshot.subagents || []).some((s) => s.id === id && s.live) || state.snapshot.phase_status === "in_progress";
-  if (!live && state.mainThinking.loaded) return;
-  const since = state.mainThinking.next;
-  apiGet(`/api/node/${encodeURIComponent(id)}/thinking?since=${since}`)
-    .then((d) => {
-      if (state.mainThinking.agentId !== id) return; // followed agent changed mid-flight
-      state.mainThinking.loaded = true;
-      const fresh = d.entries || [];
-      if (fresh.length) {
-        if (state.mainThinking.sortAnchor === undefined) {
-          state.mainThinking.sortAnchor = Date.now() / 1000;
+    const isLiveAgent = (snap.subagents || []).some((s) => s.id === agentId && s.live) ||
+      (agentId === `phase-${snap.phase}` && snap.phase_status === "in_progress") ||
+      agentId === activeId;
+    if (!isLiveAgent && ag.loaded) continue;
+
+    const since = ag.next || 0;
+    apiGet(`/api/node/${encodeURIComponent(agentId)}/thinking?since=${since}`)
+      .then((d) => {
+        ag.loaded = true;
+        const fresh = d.entries || [];
+        if (fresh.length) {
+          if (ag.sortAnchor === undefined) {
+            ag.sortAnchor = Date.now() / 1000;
+          }
+          const base = ag.sortAnchor;
+          const stamped = fresh.map((entry, i) => Object.assign({}, entry, {
+            node_id: entry.node_id || agentId,
+            subagent_name: entry.subagent_name || entry.node_id || agentId,
+            timestamp: (entry.timestamp !== undefined && entry.timestamp !== null) ? entry.timestamp : (base + (entry.ts !== undefined ? entry.ts : i) * 0.001),
+            sort: (entry.timestamp !== undefined && entry.timestamp !== null) ? Number(entry.timestamp) : (base + (entry.ts !== undefined ? entry.ts : i) * 0.001),
+          }));
+          if (d.reset || ag.entries.length === 0) {
+            ag.entries = stamped;
+          } else {
+            ag.entries = ag.entries.slice(0, -1).concat(stamped);
+          }
+          ag.total = d.total;
+          ag.next = d.next;
+
+          // Rebuild unified entries across all tracked agents
+          const all = [];
+          for (const a of Object.values(state.mainThinking.agents)) {
+            if (a.entries && a.entries.length) {
+              all.push(...a.entries);
+            }
+          }
+          all.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+          state.mainThinking.entries = all;
+          state.mainThinking.total = all.length;
+          render();
+        } else if (d.next !== undefined) {
+          ag.next = d.next;
         }
-        const base = state.mainThinking.sortAnchor;
-        const stamped = fresh.map((entry, i) => Object.assign({}, entry, {
-          node_id: entry.node_id || id,
-          subagent_name: entry.subagent_name || entry.node_id || id,
-          timestamp: entry.timestamp !== undefined ? entry.timestamp : (base + (entry.ts !== undefined ? entry.ts : i) * 0.001),
-          sort: entry.timestamp ? Number(entry.timestamp) : (base + (entry.ts !== undefined ? entry.ts : i) * 0.001),
-        }));
-        if (d.reset || state.mainThinking.entries.length === 0) {
-          state.mainThinking.entries = stamped;
-        } else {
-          state.mainThinking.entries = state.mainThinking.entries.slice(0, -1).concat(stamped);
-        }
-        state.mainThinking.total = d.total;
-        state.mainThinking.next = d.next;
-        render();
-      } else if (d.next !== undefined) {
-        state.mainThinking.next = d.next;
-      }
-    })
-    .catch(() => {});
+      })
+      .catch(() => {});
+  }
 }
 
 // Chat tab for the selected node: fetch its parsed trace on demand and
@@ -381,7 +410,8 @@ function loadThinkingIfNeeded(force = false) {
       const entries = rawEntries.map((e, i) => Object.assign({}, e, {
         node_id: e.node_id || id,
         subagent_name: e.subagent_name || e.node_id || id,
-        timestamp: e.timestamp !== undefined ? e.timestamp : (baseTs + (e.ts !== undefined ? e.ts : i) * 0.001),
+        timestamp: (e.timestamp !== undefined && e.timestamp !== null) ? e.timestamp : (baseTs + (e.ts !== undefined ? e.ts : i) * 0.001),
+        sort: (e.timestamp !== undefined && e.timestamp !== null) ? Number(e.timestamp) : (baseTs + (e.ts !== undefined ? e.ts : i) * 0.001),
       }));
       const total = d.total || entries.length;
       const first = entries.length ? entries[0].text : "";
@@ -426,6 +456,20 @@ function applySnapshot(snap) {
     // `force=true` only when the node is actually live (avoids unnecessary
     // re-renders on every tick for static completed traces).
     loadThinkingIfNeeded(isLive(state.selectedNode));
+    // Live artifact/detail refresh: the artifact tab and the header token
+    // count used to freeze at first-open values while the writer kept
+    // appending. Throttled to one fetch per 5s per surface while live.
+    if (isLive(state.selectedNode)) {
+      const nowMs = Date.now();
+      if ((state.agentTab === "artifact" || state.agentTab === "versions" || state.agentTab === "overview") && nowMs - _lastArtifactPoll > 5000) {
+        _lastArtifactPoll = nowMs;
+        loadArtifactsIfNeeded(undefined, true);
+      }
+      if (nowMs - _lastDetailPoll > 5000) {
+        _lastDetailPoll = nowMs;
+        refreshNodeDetailQuiet();
+      }
+    }
   }
   if (snap && snap.attached) {
     loadMainThinking();
@@ -541,7 +585,7 @@ function el(tag, attrs, children) {
 // actually uses (see the `on[a-z]+:` / addEventListener grep this was
 // built from) onto the kept node is what keeps clicks/typing bound to the
 // *current* render's state instead of a stale one.
-const _MORPH_HANDLER_PROPS = ["onclick", "onchange", "oncontextmenu", "oninput", "onkeydown", "onscroll"];
+const _MORPH_HANDLER_PROPS = ["onclick", "onchange", "oncontextmenu", "oninput", "onkeydown", "onscroll", "ontoggle"];
 const MORPH_OPTS = {
   getNodeKey(node) {
     return node.dataset && node.dataset.key !== undefined ? node.dataset.key : undefined;
@@ -549,6 +593,14 @@ const MORPH_OPTS = {
   onBeforeElUpdated(fromEl, toEl) {
     for (const prop of _MORPH_HANDLER_PROPS) {
       if (fromEl[prop] !== toEl[prop]) fromEl[prop] = toEl[prop];
+    }
+    // Preserve interactive toggle/details open state across renders
+    if (fromEl.tagName === "DETAILS") {
+      if (fromEl.open) {
+        toEl.setAttribute("open", "");
+      } else {
+        toEl.removeAttribute("open");
+      }
     }
     return true;
   },
@@ -658,7 +710,8 @@ function subagentLabel(e, defaultName = "Agent") {
   const name = e && (e.subagent_name || e.node_id || e.agent_id);
   if (name) return String(name);
   if (state.agentTab === "chat" && state.selectedNode) return String(state.selectedNode);
-  if (state.mainThinking && state.mainThinking.agentId) return String(state.mainThinking.agentId);
+  const active = mainAgentId();
+  if (active) return String(active);
   return defaultName;
 }
 
@@ -756,13 +809,31 @@ function renderThinkingChatEntry(e, key) {
     ? el("span", { class: "dim thinking-time-pill", style: "font-size:10px; font-family:var(--font-mono); margin-left:auto; margin-right:6px;" }, fmtTime(timeVal))
     : null;
   const isLong = (e.text || "").length > 250;
+  const userOpen = (key && state.thinkingOpen && state.thinkingOpen[key] !== undefined)
+    ? state.thinkingOpen[key]
+    : null;
+  const isOpen = userOpen !== null ? userOpen : !isLong;
+  const cueText = isLong ? (isOpen ? "▾ collapse thought" : "▸ expand thought") : (isOpen ? "▾ thought" : "▸ thought");
   return el("div", { class: "stream-msg agent-chat-entry role-thinking thinking-card", ...(key ? { "data-key": key } : {}) }, [
-    el("details", { class: "thinking-details", open: !isLong ? "" : null }, [
+    el("details", {
+      class: "thinking-details",
+      open: isOpen ? "" : null,
+      ontoggle: (ev) => {
+        if (key) {
+          if (!state.thinkingOpen) state.thinkingOpen = {};
+          state.thinkingOpen[key] = ev.currentTarget.open;
+          const cue = ev.currentTarget.querySelector(".thinking-toggle-cue");
+          if (cue) {
+            cue.textContent = isLong ? (ev.currentTarget.open ? "▾ collapse thought" : "▸ expand thought") : (ev.currentTarget.open ? "▾ thought" : "▸ thought");
+          }
+        }
+      },
+    }, [
       el("summary", { class: "thinking-summary" }, [
         el("span", { class: "author" }, authorLabel),
         tokenBadge,
         timeBadge,
-        el("span", { class: "thinking-toggle-cue" }, isLong ? "▸ toggle thought" : ""),
+        el("span", { class: "thinking-toggle-cue" }, cueText),
       ]),
       el("div", { class: "msg-body thinking-body" }, e.text),
     ]),
@@ -813,7 +884,11 @@ function renderAssistantChatEntry(e, key) {
 }
 
 function renderAgentChatEntry(e, idx) {
-  const key = `agent-chat-${e.sort !== undefined ? e.sort : (idx !== undefined ? idx : 0)}-${e.role || ""}-${e.ts !== undefined ? e.ts : (idx !== undefined ? idx : 0)}`;
+  const nodePart = e.node_id ? `${e.node_id}-` : "";
+  const sortPart = e.sort !== undefined ? e.sort : (idx !== undefined ? idx : 0);
+  const rolePart = e.role || "";
+  const tsPart = e.ts !== undefined ? e.ts : (idx !== undefined ? idx : 0);
+  const key = `agent-chat-${nodePart}${sortPart}-${rolePart}-${tsPart}`;
   const timeVal = e.timestamp || e.created_at || e.time || e.sort || e.ts;
   if (e.role === "diff") {
     const agentName = subagentLabel(e, "");
@@ -1591,7 +1666,7 @@ function renderCenterStream() {
       feedEntries.push({
         sort: shown[0].sort - 0.0001,
         node: el("div", { class: "dim", style: "font-size:11px; padding:4px 10px;", "data-key": "thinking-cap-notice" },
-          `showing last ${shown.length} of ${mt.total || mt.entries.length} thinking entries for ${mt.agentId}`),
+          `showing last ${shown.length} of ${mt.total || mt.entries.length} thinking entries`),
       });
     }
     feedEntries.push(...shown.map((entry, i) => ({ sort: entry.sort, node: renderAgentChatEntry(entry, i) })));
@@ -2108,7 +2183,8 @@ function attachRun(runId) {
       state.workbenchTab = "tree";
       state.treeFilter = "";
       state.chatFeedPinned = true;
-      state.mainThinking = { agentId: null, entries: [], next: 0, sortAnchor: undefined };
+      state.mainThinking = { agents: {}, entries: [], total: 0 };
+      state.thinkingOpen = {};
       apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
       // B1-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the snapshot fetch alone
       // left the page frozen at page-load state — the live stream was never
@@ -2170,23 +2246,66 @@ function fetchWorkbenchData(id) {
   if (id === "asm") apiGet("/api/assembly").then((d) => { state.assembly = d; render(); }).catch(() => {});
 }
 
-function loadArtifactsIfNeeded(tag) {
+function loadArtifactsIfNeeded(tag, force = false) {
   const id = state.selectedNode;
   if (!id || !state.nodeDetail) return;
   const targetTag = tag !== undefined ? tag : state.selectedArtifactTag;
-  if (state.artifactsDetail && state.artifactsDetail.nodeId === id && state.artifactsDetail.tag === (targetTag || "current")) {
+  if (!force && state.artifactsDetail && state.artifactsDetail.nodeId === id && state.artifactsDetail.tag === (targetTag || "current")) {
+    // Served once and never refreshed: a live writer appends for hours
+    // while this tab kept showing the artifact as of first open (stale
+    // token counts, stale blocks). `force` bypasses for live refresh.
     return;
   }
   if (targetTag) {
     apiGet(`/api/node/${encodeURIComponent(id)}/version/${encodeURIComponent(targetTag)}`)
-      .then((d) => { state.artifactsDetail = { nodeId: id, tag: targetTag, text: d.text || "" }; render(); })
+      .then((d) => {
+        if (state.selectedNode !== id) return;
+        const text = d.text || "";
+        const cur = state.artifactsDetail;
+        if (!force && cur && cur.nodeId === id && cur.tag === targetTag && cur.text === text) return;
+        state.artifactsDetail = { nodeId: id, tag: targetTag, text };
+        render();
+      })
       .catch(() => {});
   } else {
     apiGet(`/api/node/${encodeURIComponent(id)}/artifact`)
-      .then((d) => { state.artifactsDetail = { nodeId: id, tag: "current", text: d.text || "" }; render(); })
+      .then((d) => {
+        if (state.selectedNode !== id) return;
+        const text = d.text || "";
+        const cur = state.artifactsDetail;
+        if (cur && cur.nodeId === id && cur.tag === "current" && cur.text === text) return;
+        state.artifactsDetail = { nodeId: id, tag: "current", text };
+        render();
+      })
       .catch(() => {});
   }
 }
+
+// Quiet node-detail refresh while the node is live: updates artifact token
+// counts and the header without the loading-placeholder flash that
+// loadNodeDetail's `nodeDetailLoading` cycle causes on every tick.
+function refreshNodeDetailQuiet() {
+  const id = state.selectedNode;
+  if (!id) return;
+  apiGet(`/api/node/${encodeURIComponent(id)}`)
+    .then((d) => {
+      if (state.selectedNode !== id) return;
+      const prev = state.nodeDetail;
+      state.nodeDetail = d;
+      state.nodeDetailLoading = false;
+      state.nodeDetailFailed = false;
+      const prevTok = prev ? prev.artifact_tokens : undefined;
+      const prevLen = prev && typeof prev.artifact === "string" ? prev.artifact.length : undefined;
+      const nextLen = typeof d.artifact === "string" ? d.artifact.length : undefined;
+      if (prevTok !== d.artifact_tokens || prevLen !== nextLen || prev === null) render();
+    })
+    .catch(() => {});
+}
+
+// Throttle stamps for the live artifact/detail refresh below — module-level
+// (like pollingTimer/_es) so they survive re-renders.
+let _lastArtifactPoll = 0;
+let _lastDetailPoll = 0;
 
 function loadDiffIfNeeded(tag) {
   const d = state.nodeDetail;

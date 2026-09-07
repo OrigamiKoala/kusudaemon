@@ -137,6 +137,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
     ) -> None:
         resolved = resolve(provider=provider or "", api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
+        if self.model and self.model.startswith("nvidia/nvidia/"):
+            self.model = self.model.removeprefix("nvidia/")
         self.base_url = resolved.base_url.rstrip("/")
         self.api_key = resolved.api_key
         raw_env_timeout = os.getenv("KUSUDAEMON_HTTP_TIMEOUT")

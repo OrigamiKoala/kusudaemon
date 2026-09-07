@@ -344,22 +344,40 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
     cache is the only caller that passes non-empty starting state; every
     other caller (including ``parse_trace`` itself) starts fresh, so
     behavior there is unchanged."""
+    last_ts: float | str | None = entries[-1].timestamp if entries and entries[-1].timestamp is not None else None
+    if last_ts is None and raw:
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    r = json.loads(line)
+                    t = r.get("timestamp") or r.get("ts") or r.get("time") or r.get("created_at")
+                    if t is not None:
+                        last_ts = t
+                        break
+                except Exception:
+                    pass
+
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
             continue
         if not line.startswith("{"):
-            entries.append(TraceEntry("raw", line))
+            entries.append(TraceEntry("raw", line, timestamp=last_ts))
             continue
         try:
             record = json.loads(line)
         except Exception:
-            entries.append(TraceEntry("raw", line))
+            entries.append(TraceEntry("raw", line, timestamp=last_ts))
             continue
         if not isinstance(record, dict):
-            entries.append(TraceEntry("raw", line))
+            entries.append(TraceEntry("raw", line, timestamp=last_ts))
             continue
         raw_ts = record.get("timestamp") or record.get("ts") or record.get("time") or record.get("created_at")
+        if raw_ts is not None:
+            last_ts = raw_ts
+        effective_ts = raw_ts if raw_ts is not None else last_ts
+
         rtype = record.get("type")
         if rtype == "heartbeat":
             # PLAN-AUDIT.md §F3: a pure liveness signal from the worker
@@ -370,7 +388,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
             # explicit skip keeps it out of the feed entirely.)
             continue
         if rtype == "logdir":
-            entries.append(TraceEntry("logdir", f"session started (logdir={record.get('logdir', '')})", timestamp=raw_ts))
+            entries.append(TraceEntry("logdir", f"session started (logdir={record.get('logdir', '')})", timestamp=effective_ts))
             continue
         if rtype == "usage":
             pt = int(record.get("prompt_tokens", 0) or 0)
@@ -404,7 +422,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                             logs=prev.logs,
                             node_id=prev.node_id,
                             extra=prev.extra,
-                            timestamp=prev.timestamp or raw_ts,
+                            timestamp=prev.timestamp or effective_ts,
                         )
                         attached = True
                         break
@@ -418,7 +436,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                         completion_tokens=ct,
                         reasoning_tokens=rt,
                         cost_usd=cost_val,
-                        timestamp=raw_ts,
+                        timestamp=effective_ts,
                     )
                 )
             continue
@@ -438,7 +456,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                         text=prev.text + str_content,
                         tokens=comb_tok,
                         reasoning_tokens=comb_tok,
-                        timestamp=prev.timestamp or raw_ts,
+                        timestamp=prev.timestamp or effective_ts,
                     )
                 else:
                     entries.append(
@@ -447,7 +465,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                             text=str_content,
                             tokens=tok_int,
                             reasoning_tokens=tok_int,
-                            timestamp=raw_ts,
+                            timestamp=effective_ts,
                         )
                     )
             continue
@@ -465,7 +483,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                         th_str,
                         tokens=int(th_tok) if th_tok is not None else None,
                         reasoning_tokens=int(th_tok) if th_tok is not None else None,
-                        timestamp=raw_ts,
+                        timestamp=effective_ts,
                     )
                 )
             content = record.get("content") or record.get("text")
@@ -485,7 +503,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
             duration_ms = record.get("duration_ms")
 
             if text and role == "assistant":
-                _emit_assistant_content(entries, text, file_state, timestamp=raw_ts)
+                _emit_assistant_content(entries, text, file_state, timestamp=effective_ts)
             elif text or tool_name or tool_output or tool_input is not None:
                 role_out = role if role in ROLE_STYLE else "raw"
                 if role in ("tool", "tool_call"):
@@ -529,11 +547,11 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
                         cost_usd=float(cost_usd) if cost_usd is not None else None,
                         duration_ms=int(duration_ms) if duration_ms is not None else None,
                         logs=logs,
-                        timestamp=raw_ts,
+                        timestamp=effective_ts,
                     )
                 )
             continue
-        entries.append(TraceEntry("raw", json.dumps(record), timestamp=raw_ts))
+        entries.append(TraceEntry("raw", json.dumps(record), timestamp=effective_ts))
 
 
 def role_style(role: str) -> str:

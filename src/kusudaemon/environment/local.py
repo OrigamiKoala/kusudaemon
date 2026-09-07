@@ -8,6 +8,7 @@ import signal
 import time
 from pathlib import Path
 
+import subprocess
 from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..utils.process_group import (
     kill_process_group,
@@ -15,6 +16,55 @@ from ..utils.process_group import (
     track_process_group,
     untrack_process_group,
 )
+
+
+def _get_pgid_cputime(pid: int) -> float:
+    """Total user + sys CPU seconds across all processes in proc's process group."""
+    try:
+        pgid = os.getpgid(pid)
+        out = subprocess.run(
+            ["ps", "-o", "time=", "-g", str(pgid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+        total = 0.0
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(":")
+            if len(parts) == 3:
+                total += int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            elif len(parts) == 2:
+                total += int(parts[0]) * 60 + float(parts[1])
+        return total
+    except Exception:
+        return 0.0
+
+
+def _has_established_socket(pid: int) -> bool:
+    """Check if any process in the process group has an established TCP socket connection."""
+    try:
+        pgid = os.getpgid(pid)
+        pids_out = subprocess.run(
+            ["pgrep", "-g", str(pgid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+        pids = [p.strip() for p in pids_out.split() if p.strip()]
+        if not pids:
+            pids = [str(pid)]
+        pids_arg = ",".join(pids)
+        res = subprocess.run(
+            ["lsof", "-a", "-iTCP", "-sTCP:ESTABLISHED", "-p", pids_arg],
+            capture_output=True,
+            timeout=2.0,
+        )
+        return b"ESTABLISHED" in res.stdout
+    except Exception:
+        return False
 
 
 class LocalEnvironment:
@@ -32,6 +82,8 @@ class LocalEnvironment:
         command: str,
         timeout: int = 300,
         tee_path: str | None = None,
+        grace_period: int | None = None,
+        activity_window: float | None = None,
     ) -> ExecResult:
         raw_env_timeout = os.getenv("KUSUDAEMON_EXEC_TIMEOUT")
         if raw_env_timeout:
@@ -44,6 +96,18 @@ class LocalEnvironment:
         io_task: asyncio.Task[None] | None = None
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
+        activity_ref: list[float] = [start]
+        soft_ext = (
+            int(os.getenv("KUSUDAEMON_SOFT_TIMEOUT_EXTENSION", "1800"))
+            if grace_period is None
+            else grace_period
+        )
+        act_win = (
+            float(os.getenv("KUSUDAEMON_ACTIVITY_WINDOW", "60.0"))
+            if activity_window is None
+            else activity_window
+        )
+        max_deadline = start + timeout + max(0, soft_ext)
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -69,9 +133,53 @@ class LocalEnvironment:
                     tee_path,
                     stdout_chunks,
                     stderr_chunks,
+                    activity_ref,
                 )
             )
-            await asyncio.wait_for(asyncio.shield(io_task), timeout=timeout)
+            last_cpu: list[float] = [_get_pgid_cputime(proc.pid)]
+            last_cpu_time: list[float] = [start]
+
+            while True:
+                now = time.monotonic()
+                time_left = (start + timeout) - now
+                if time_left > 0:
+                    wait_slice = min(time_left, 5.0)
+                else:
+                    # Past base timeout: evaluate true process & socket activity
+                    stream_active = (now - activity_ref[0]) <= act_win
+                    current_cpu = _get_pgid_cputime(proc.pid)
+                    if current_cpu > last_cpu[0] + 0.05:
+                        last_cpu[0] = current_cpu
+                        last_cpu_time[0] = now
+                        cpu_active = True
+                    else:
+                        cpu_active = (now - last_cpu_time[0]) <= act_win
+                    socket_active = _has_established_socket(proc.pid)
+
+                    is_active = stream_active or cpu_active or socket_active
+                    if not is_active or now >= max_deadline:
+                        raise asyncio.TimeoutError()
+                    wait_slice = min(max(0.1, act_win - (now - max(activity_ref[0], last_cpu_time[0]))), max(0.1, max_deadline - now), 5.0)
+
+                try:
+                    await asyncio.wait_for(asyncio.shield(io_task), timeout=wait_slice)
+                    break
+                except asyncio.TimeoutError:
+                    if io_task.done():
+                        break
+                    now = time.monotonic()
+                    if now >= start + timeout:
+                        stream_active = (now - activity_ref[0]) <= act_win
+                        current_cpu = _get_pgid_cputime(proc.pid)
+                        if current_cpu > last_cpu[0] + 0.05:
+                            last_cpu[0] = current_cpu
+                            last_cpu_time[0] = now
+                            cpu_active = True
+                        else:
+                            cpu_active = (now - last_cpu_time[0]) <= act_win
+                        socket_active = _has_established_socket(proc.pid)
+                        if not (stream_active or cpu_active or socket_active) or now >= max_deadline:
+                            raise
             return ExecResult(
                 stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
                 stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
@@ -132,6 +240,7 @@ class LocalEnvironment:
         tee_path: str | None,
         stdout_chunks: list[bytes],
         stderr_chunks: list[bytes],
+        activity_ref: list[float] | None = None,
     ) -> None:
         """Drain both streams while optionally teeing stdout to a live file.
 
@@ -146,15 +255,20 @@ class LocalEnvironment:
             path.parent.mkdir(parents=True, exist_ok=True)
 
         async def _read_stdout() -> None:
-            # Open in binary truncating mode once at episode start. Every later
-            # save is guarded against replacing this partial stream with empty
-            # output.
-            fh = open(path, "wb", buffering=0) if path is not None else None
+            # Open in binary APPEND mode: the trace is append-only across
+            # attempts (v0/runner.py writes a boundary marker between them),
+            # so truncating here would wipe the prior attempt's history that
+            # the dashboard's chat view is rebuilt from.
+            fh = open(path, "ab", buffering=0) if path is not None else None
             try:
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
                         break
+                    # Heartbeats from worker threads do not indicate model progress
+                    is_heartbeat = b'"type": "heartbeat"' in line or b'"type":"heartbeat"' in line
+                    if not is_heartbeat and activity_ref is not None:
+                        activity_ref[0] = time.monotonic()
                     stdout_chunks.append(line)
                     if fh is not None:
                         try:
@@ -170,6 +284,8 @@ class LocalEnvironment:
                 chunk = await proc.stderr.read(64 * 1024)
                 if not chunk:
                     return
+                if activity_ref is not None:
+                    activity_ref[0] = time.monotonic()
                 stderr_chunks.append(chunk)
 
         await asyncio.gather(_read_stdout(), _read_stderr(), proc.wait())

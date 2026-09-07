@@ -20,23 +20,46 @@ During a run, Kusudaemon coordinates four specialized roles:
 | Role | Responsibility | Context Access |
 |---|---|---|
 | **Orchestrator** | Decides which subtask to dispatch next based on dependencies and ready states. | Sees tree status and event log tail. Stateless per round. |
-| **Planner** | Recursively breaks down a larger goal into a flat tree of subtasks. | Sees structural unit labels and token budgets. Never sees raw source content. |
+| **Planner** | Breaks a larger goal into a tree of subtasks. Runs only at T2 and above (see the phase table below). A Writer that measurably overruns its budget may additionally propose a mid-run split, which code validates before grafting. | Sees structural unit labels and token budgets. Never sees raw source content. |
 | **Writer** | Executes a single subtask tool loop (driven by `gptme`, Claude Code, or Codex). | Sees its brief, required inputs, and the quality contract. Writes one specific artifact file. |
 | **Reviewer** | Audits completed artifacts against the quality contract and rubric. | Sees the completed artifact, rubric, and contract. Never sees the Writer's scratchpad or reasoning. |
 
 ---
 
 ### The Sequential Execution Pipeline
-When you execute a goal, Kusudaemon orchestrates the work across eight sequential phases:
+Kusudaemon does **not** run a fixed list of phases. The first phase, `classify`,
+measures the goal and the work object and assigns the run a **tier**; the tier
+then determines which phases run. A one-file edit does not pay for a planner, and
+a book does not survive without one.
 
-1. **Intake:** Questions you about your goal to establish global rubrics, constraints, and target outputs. Any unresolved points become explicit assumptions.
-2. **Survey:** Scans and chunks the target workspace or source material into structured structural units.
-3. **Explore:** Dispatches lightweight, read-only subagent probes to examine target directories or gather preliminary research.
-4. **Plan:** Generates a structured tree of leaf tasks, ensuring each subtask is bounded and achievable within a small token budget.
-5. **Pilot:** Executes a single representative subtask, allowing you to edit the output directly and establish the frozen `contract.md`.
-6. **Execute:** Dispatches Writer episodes for every subtask in the tree, running code-evaluated gates on every submitted artifact.
-7. **Review:** Performs semantic reviews and cross-subtask consistency checks to catch defects or contradictions.
-8. **Assemble:** Combines verified artifacts, runs final verification checks, and compiles the final result.
+| Phase | What it does |
+|---|---|
+| **Classify** | Measures the goal and work object, assigns the tier, and decides which of the phases below will run. Always runs. |
+| **Intake** | Questions you about your goal to establish global rubrics, constraints, and target outputs. Any unresolved points become explicit assumptions. |
+| **Explore** | Chunks the workspace or source material into structural units and dispatches lightweight, read-only subagent probes over them. |
+| **Plan** | Generates a structured tree of leaf tasks, ensuring each subtask is bounded and achievable within a small token budget. |
+| **Pilot** | Executes a single representative subtask, allowing you to edit the output directly and establish the frozen `contract.md`. |
+| **Research** | Runs scheduled research probes against external sources. |
+| **Execute** | Dispatches Writer episodes for every subtask in the tree, running code-evaluated gates on every submitted artifact. |
+| **Review** / **Verify** | Semantic review and cross-subtask consistency checks. `verify` is T0's combined review-and-finalize step; `review` is the T1–T3 form. |
+| **Assemble** | Combines verified artifacts, runs final verification checks, and compiles the final result. |
+
+Which phases a tier runs (`v6/tiering.py`):
+
+| Tier | Phases |
+|---|---|
+| **T0** | classify → execute → verify |
+| **T1** | classify → intake → explore → execute → review |
+| **T2** | classify → intake → explore → **plan** → execute → review → assemble |
+| **T3** | classify → intake → explore → **plan** → **pilot** → research → execute → review → assemble |
+
+**The practical consequence is worth knowing before you run anything:** the
+decomposition tree — the thing Kusudaemon exists to build — is produced by the
+`plan` phase, so **only T2 and T3 runs decompose**. A T0 or T1 run is a single
+Writer episode with gates around it. If a goal you expected to be broken up ran
+as one subagent, check the run's tier first (`kusudaemon status <run-id>`, or
+`tier.json` in the run directory); you can force it up with
+`kusudaemon tier <run-id> T2` or `--tier` at launch.
 
 ---
 
@@ -74,7 +97,7 @@ uv tool upgrade kusudaemon  # or: pip install --upgrade "kusudaemon[gptme]"
 
 ### Choosing an Agent Backend
 
-Subagent episodes (from structural explorers to leaf writers) can run under four agent backends, selected with `--backend` (or `KUSUDAEMON_BACKEND`):
+Subagent episodes (from structural explorers to leaf writers) can run under five agent backends, selected with `--backend` (or `KUSUDAEMON_BACKEND`):
 
 | Backend | CLI required | Notes |
 |---|---|---|
@@ -82,14 +105,15 @@ Subagent episodes (from structural explorers to leaf writers) can run under four
 | `claude` | `claude` (Claude Code, authenticated on its own) | Tool-restricted (hidden run state denied), supports `--resume` after a crash. |
 | `codex` | `codex` (authenticated on its own) | No session resume; sandbox bypassed unless you set one. |
 | `opencode` | `opencode` (authenticated on its own or via provider) | Structured JSON output, session resume (`--session`), permission restrictions. |
+| `antigravity` *(alias `agy`)* | `agy` (authenticated on its own) | No session resume. |
 
 **Each CLI uses its own credentials — the harness never shares your provider key with them.** All subagents (explorers, research probes, writers) can utilize any of the supported backends. Mid-episode interjections are gptme-only.
 
 The backend can be switched for an already-running run — the change takes effect at the next dispatch:
 
 ```bash
-kusudaemon pipeline backend <run-id> codex   # or: gptme | claude | opencode
-kusudaemon pipeline backend <run-id> default # clear the override
+kusudaemon backend <run-id> codex   # or: gptme | claude | opencode | antigravity
+kusudaemon backend <run-id> default # clear the override
 ```
 
 or from the dashboard: the backend selector in the run header, the new-run modal's "subagent backend" field, or the `/backend` command.
@@ -381,10 +405,17 @@ The Top Rail displays the execution Tier assigned by the classifier based on tas
 | Badge | Tier | Scope & Execution Behavior |
 |---|---|---|
 | `T0` | **Direct** | Single-episode task; no task tree generated. 1 episode, ≤3 model calls. |
-| `T1` | **Single Node** | Single node task with basic review; no recursive planning. |
-| `T2` | **Shallow Plan** | Multi-node flat plan (2–8 leaves); no pilot or recursive nesting. |
+| `T1` | **Single Node** | Single node task with basic review. No `plan` phase, so **no decomposition** — and no mid-run split either, since the split handler is only installed at T2 and above. |
+| `T2` | **Shallow Plan** | Multi-node flat plan (2–8 leaves); no pilot. Mid-run splits enabled. |
 | `T3` | **Full Pipeline** | Full recursive decomposition pipeline with pilot, contract freeze, & deep review. |
 | `T2↑T3` | **Escalated** | Tier was automatically promoted mid-run due to measured size overrun. |
+
+The classifier reads the *number of output files* a goal implies, not the amount
+of writing it implies, so a goal that produces one large document ("write 100
+sections into `book.md`") currently classifies **T1** and runs as a single
+episode. If that is not what you want, set the tier explicitly with `--tier T2`.
+Making the classifier read declared output size is tracked in
+`PLAN-BENCH-INTEGRITY.md` §1.
 
 ---
 
@@ -395,3 +426,23 @@ In the Task Tree view, each node displays a series of small pips representing co
 * `▪` **Solid Pip:** Machine gate passed (e.g. file exists, non-empty, token budget within limits, linters/compiles clean).
 * `▫` **Hollow Pip:** Machine gate unrun or failed.
 *(Hovering over any pip in the UI reveals the exact gate specification and failure detail.)*
+
+---
+
+## 5. Project Documentation Map
+
+This README is the user guide. The design and evaluation documents are separate,
+and each owns one question:
+
+| Document | Owns |
+|---|---|
+| `CLAUDE.md` | Commands and architecture overview for working on the codebase. |
+| `BENCHMARKING.md` | Everything about benchmarking: the experimental design (§0), setup and commands (§2–§6), and the hermetic-suite gate that precedes any sweep (§9). |
+| `PLAN-BENCH-INTEGRITY.md` | What the first sweeps found, which runs must be quarantined, and the repairs still open. |
+| `docs/PLAN-WORKSPACE-MODE.md` | Why arm C underperforms a bare backend on workspace tasks, and the flagged fixes for it. |
+| `PLAN-CONCURRENCY-AND-SHARED-STATE.md` | Parallelism, worktrees and rate-limit control — proposals with the case against each. Nothing there is decided. |
+| `docs/PLAN-REVIEW-LATENCY.md`, `docs/PLAN-REVIEW-LATENCY-STATUS.md` | Review-path latency work and its current status. |
+| `docs/TESTING.md`, `docs/TEST-PLAN.md` | **Archived.** Superseded by `BENCHMARKING.md`; kept for the historical record of the Phase 0/1 repairs and the original benchmark design notes. |
+
+When two documents appear to disagree, the one in this table's "Owns" column
+wins for that question.

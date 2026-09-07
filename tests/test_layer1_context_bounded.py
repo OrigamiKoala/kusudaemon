@@ -1,4 +1,4 @@
-"""Layer 1 mechanism benchmark: context boundedness (TEST-PLAN.md §1.2).
+"""Layer 1 mechanism benchmark: context boundedness (BENCHMARKING.md §9.1 / docs/TEST-PLAN.md §1.2).
 
 Verifies that model context sizes (specifically the orchestrator's) do not grow
 with corpus size or run length.

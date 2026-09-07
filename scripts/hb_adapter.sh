@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HarnessBench <-> kusudaemon bridge (TESTING.md §2 "Shape A").
+# HarnessBench <-> kusudaemon bridge (BENCHMARKING.md §0.2 "Shape A").
 #
 # HarnessBench's `generic_cli` adapter invokes this with cwd set to the task
 # workspace. It is registered in harness-bench's config/harness.yaml as e.g.
@@ -165,7 +165,7 @@ STATUS=$?
 # run_harness_bench.py merges the per-round records for accounting.
 cp -f "$SANDBOX/kusudaemon-record-r${ROUND}.json" "$SANDBOX/kusudaemon-record.json" 2>/dev/null || true
 
-# A halt is a recorded outcome, not a crash (TESTING.md §4), and HarnessBench
+# A halt is a recorded outcome, not a crash (BENCHMARKING.md §0.4), and HarnessBench
 # stops issuing rounds the moment an adapter exits non-zero -- which would
 # forfeit rounds 2..N of the eight multi-round tasks and grade a workspace that
 # never got its later instructions. Exit 0 so the oracle always sees the real

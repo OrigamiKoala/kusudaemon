@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive LongGenBench against kusudaemon across arms (TESTING.md §1, §2 Shape B).
+"""Drive LongGenBench against kusudaemon across arms (BENCHMARKING.md §0.1, §0.2 Shape B).
 
 LongGenBench (github.com/mozhu621/LongGenBench, ICLR 2025) hands you a prompt
 demanding N structurally-delimited entries -- 52 weekly diary entries, 100
@@ -23,8 +23,13 @@ upstream's own prediction format so `scripts/eval_longgen_free.py` can score it.
     python3 scripts/run_longgen_bench.py --longgen-dir ~/LongGenBench \\
         --limit 8 --arms A C --seeds 1 2 3
 
-Arms follow TESTING.md §1: A is the bare backend CLI, C is the full pipeline.
-Arm B (decomposition only) is skipped per the user note in TESTING.md §1.
+    # 4. score artifacts already on disk (finished or parked runs) without
+    #    spending anything on generation
+    python3 scripts/run_longgen_bench.py --tasks 300 --arms C --seeds 2 3 \\
+        --score-only
+
+Arms follow BENCHMARKING.md §0.1: A is the bare backend CLI, C is the full pipeline.
+Arm B (decomposition only) is skipped per the user note in BENCHMARKING.md §0.1.
 """
 
 from __future__ import annotations
@@ -52,7 +57,7 @@ from longgen_common import (  # noqa: E402
 
 LONGGEN_REPO = "https://github.com/mozhu621/LongGenBench.git"
 DEFAULT_BACKEND = "opencode"
-DEFAULT_MODEL = "opencode/nemotron-3.5-lightning-free"
+DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 DATASETS = {
     "short": "Dataset/Dataset_short.json",
@@ -149,7 +154,7 @@ def build_bench_cmd(
     if runs_root:
         cmd += ["--runs-root", runs_root]
     if arm != "A":
-        # TESTING.md §2 Shape B: source material and a rubric, no container.
+        # BENCHMARKING.md §0.2 Shape B: source material and a rubric, no container.
         # The prompt is the whole corpus, so it is also the --source; without
         # this the run measures an empty workspace, which forces the shell
         # tool allowlist onto a prose writer and collapses the spine to a
@@ -164,21 +169,45 @@ def build_bench_cmd(
     return cmd
 
 
-def harvest_artifact(arm: str, artifact_path: Path, record: dict[str, Any]) -> str:
+def harvest_artifact(
+    arm: str,
+    artifact_path: Path,
+    record: dict[str, Any],
+    *,
+    runs_root: Path | None = None,
+    task_id: str = "",
+    seed: int = 1,
+) -> str:
     """Read back the text the run produced.
 
     `bench` reports where it landed on the record; the explicit --output-dir
-    path is the fallback for an older build that does not.
+    path is the fallback. If a run timed out or was killed before copying,
+    search the runs directory for out/*.md.
     """
     candidates = []
     reported = record.get("artifact_path")
     if reported:
         candidates.append(Path(reported))
     candidates.append(artifact_path)
+    root = runs_root or (Path.home() / ".kusudaemon" / "runs")
+    if root.is_dir() and task_id:
+        pattern = f"*{task_id}*arm{arm}*s{seed}*"
+        for rdir in sorted(root.glob(pattern), reverse=True):
+            out_dir = rdir / "out"
+            if out_dir.is_dir():
+                for out_file in out_dir.glob("*.md"):
+                    candidates.append(out_file)
     for path in candidates:
         try:
             if path.is_file():
-                return path.read_text(encoding="utf-8", errors="replace")
+                text = path.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    if not artifact_path.is_file():
+                        try:
+                            artifact_path.write_text(text, encoding="utf-8")
+                        except OSError:
+                            pass
+                    return text
         except OSError:
             continue
     return ""
@@ -212,53 +241,70 @@ def run_one(
     artifact_path = raw_dir / (f"{stem}.txt" if arm == "A" else f"{stem}.md")
     record_path = bench_dir / f"{stem}.json"
 
-    cmd = build_bench_cmd(
-        arm=arm,
-        prompt_file=prompt_file,
-        workspace=ws_dir,
-        artifact_path=artifact_path,
-        record_path=record_path,
-        task_id=task_id,
-        seed=seed,
-        backend=args.backend,
-        model=args.model,
-        tier=args.tier,
-        work_object=args.work_object,
-        budget_tokens=args.budget_tokens,
-        max_rounds=args.max_rounds,
-        runs_root=args.runs_root,
-    )
+    # --score-only: the artifact is already on disk (a finished or parked
+    # run) — skip the model subprocess entirely and go straight to
+    # harvest + score. Same record/prediction/summary shape as a real run.
+    score_only = bool(getattr(args, "score_only", False))
+    if score_only:
+        cmd: list[str] = []
+    else:
+        cmd = build_bench_cmd(
+            arm=arm,
+            prompt_file=prompt_file,
+            workspace=ws_dir,
+            artifact_path=artifact_path,
+            record_path=record_path,
+            task_id=task_id,
+            seed=seed,
+            backend=args.backend,
+            model=args.model,
+            tier=args.tier,
+            work_object=args.work_object,
+            budget_tokens=args.budget_tokens,
+            max_rounds=args.max_rounds,
+            runs_root=args.runs_root,
+        )
 
     if args.dry_run:
-        print("  " + " ".join(cmd))
+        if cmd:
+            print("  " + " ".join(cmd))
+        else:
+            print(f"  (score-only) {stem}")
         return {"task_id": task_id, "arm": arm, "seed": seed, "dry_run": True}
 
-    env = dict(os.environ)
-    env.setdefault("KUSUDAEMON_NO_NOTIFY", "1")
-    env.setdefault("KUSUDAEMON_PROVIDER_CONFIG", str(_REPO_ROOT / "provider.json"))
-    env.setdefault("KUSUDAEMON_ENV_FILE", str(_REPO_ROOT / ".env"))
-    env.setdefault("PYTHONPATH", str(_REPO_ROOT / "src"))
+    if score_only:
+        wall_clock_s = 0.0
+        timed_out = False
+        stderr = ""
+        returncode = 0
+    else:
+        env = dict(os.environ)
+        env.setdefault("KUSUDAEMON_NO_NOTIFY", "1")
+        env.setdefault("KUSUDAEMON_PROVIDER_CONFIG", str(_REPO_ROOT / "provider.json"))
+        env.setdefault("KUSUDAEMON_ENV_FILE", str(_REPO_ROOT / ".env"))
+        env.setdefault("PYTHONPATH", str(_REPO_ROOT / "src"))
 
-    t0 = time.time()
-    timed_out = False
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(_REPO_ROOT),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=args.timeout_sec,
-        )
-        stderr = proc.stderr or ""
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stderr = f"timeout after {args.timeout_sec}s"
-        returncode = -1
-        # A timeout still leaves whatever the run exported on disk.
-        _ = exc
-    wall_clock_s = round(time.time() - t0, 3)
+        t0 = time.time()
+        timed_out = False
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(_REPO_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=args.timeout_sec,
+                stdin=subprocess.DEVNULL,
+            )
+            stderr = proc.stderr or ""
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stderr = f"timeout after {args.timeout_sec}s"
+            returncode = -1
+            # A timeout still leaves whatever the run exported on disk.
+            _ = exc
+        wall_clock_s = round(time.time() - t0, 3)
 
     if args.verbose and stderr:
         print(stderr[-2000:], file=sys.stderr)
@@ -270,7 +316,14 @@ def run_one(
         except json.JSONDecodeError:
             record = {}
 
-    raw_text = harvest_artifact(arm, artifact_path, record)
+    raw_text = harvest_artifact(
+        arm,
+        artifact_path,
+        record,
+        runs_root=Path(args.runs_root) if getattr(args, "runs_root", None) else None,
+        task_id=task_id,
+        seed=seed,
+    )
     blocks = to_output_blocks(raw_text, item)
     parsed = parse_blocks(blocks, str(item.get("type", "")))
     completion = calculate_completion_rate(parsed, int(item.get("number", 0)))
@@ -306,6 +359,33 @@ def run_one(
 # --------------------------------------------------------------------------
 # aggregation
 # --------------------------------------------------------------------------
+
+
+def _read_records_file(path: Path) -> list[dict[str, Any]]:
+    """Prior run records (records.jsonl is append-only across sweeps)."""
+    records: list[dict[str, Any]] = []
+    if not path.is_file():
+        return records
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Latest wins per (task_id, arm, seed) so a re-scored cell never
+    double-counts in the summary."""
+    merged: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for rec in records:
+        merged[(rec.get("task_id"), rec.get("arm"), rec.get("seed"))] = rec
+    return list(merged.values())
 
 
 def _total_tokens(rec: dict[str, Any]) -> int:
@@ -346,7 +426,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "empty_artifacts": bucket["empty_artifacts"],
             "halts": bucket["halts"],
         }
-    # TESTING.md §1: report cost-per-point, not just the pass rate, or a
+    # BENCHMARKING.md §0.1: report cost-per-point, not just the pass rate, or a
     # more expensive arm looks better for the wrong reason.
     for arm, stats in summary["arms"].items():
         rate = stats["mean_completion_rate"]
@@ -418,7 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Take the first N tasks instead of round-robining across types.")
 
     p.add_argument("--arms", nargs="+", default=["A", "C"], choices=["A", "B", "C"],
-                   help="Arms to run (default A C; TESTING.md §1 skips B).")
+                   help="Arms to run (default A C; BENCHMARKING.md §0.1 skips B).")
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3],
                    help="Seeds per (task, arm) (default 1 2 3).")
 
@@ -427,7 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tier", default="auto", choices=("auto", "T0", "T1", "T2", "T3"),
                    help="Arm B/C tier floor (default auto).")
     p.add_argument("--work-object", default="text", choices=("text", "workspace"),
-                   help="Arm B/C work-object kind (default text, per TESTING.md §2 Shape B).")
+                   help="Arm B/C work-object kind (default text, per BENCHMARKING.md §0.2 Shape B).")
     p.add_argument("--budget-tokens", type=int, default=None,
                    help="Arm B/C token ceiling. Unset means unbounded.")
     p.add_argument("--max-rounds", type=int, default=None, help="Arm B/C round ceiling.")
@@ -438,6 +518,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--results-dir", default=str(_REPO_ROOT / "bench_results" / "longgen"))
     p.add_argument("--resume", action="store_true",
                    help="Skip a cell whose bench record already exists.")
+    p.add_argument("--score-only", action="store_true",
+                   help="Skip the model subprocess per cell; harvest the "
+                        "artifact already on disk (finished or parked run) "
+                        "and run the identical harvest + score + predictions "
+                        "+ summary path. No generation, no API calls.")
     p.add_argument("--list-tasks", action="store_true", help="Print the selection and exit.")
     p.add_argument("--dry-run", action="store_true", help="Print the matrix and exit.")
     p.add_argument("--verbose", action="store_true", help="Echo subprocess stderr.")
@@ -526,7 +611,15 @@ def main() -> int:
         return 0
 
     preds = write_predictions(records, tasks, results_dir)
-    summary = summarize(records)
+    if getattr(args, "score_only", False):
+        # The current sweep scored a subset; summarize the whole history
+        # (deduped, latest wins) so summary.json never regresses to a
+        # partial view and re-scored cells don't double-count.
+        summary = summarize(
+            _dedupe_records(_read_records_file(records_path) + records)
+        )
+    else:
+        summary = summarize(records)
     (results_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

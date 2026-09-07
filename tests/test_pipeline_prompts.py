@@ -294,8 +294,13 @@ class InlineSpansTest(unittest.TestCase):
         expected = (
             f"Write your artifact to `{run_dir / 'out' / 'a.md'}` using your file "
             "tools (e.g. save, patch, write, or edit). That file is the deliverable; "
-            "nothing else you write or say is.\n\n"
-
+            "nothing else you write or say is. When producing a long or multi-part document, write and save "
+            "your work incrementally in chunks (e.g. 10–20 sections at a time) rather than buffering "
+            "the entire text in a single massive call, so progress is saved to disk as you go. "
+            "You may freely edit, revise, or delete sections as the work requires — but preserve "
+            "finished sections you are not deliberately changing: before any whole-file overwrite, "
+            "read the current file and carry its existing content forward, so an interrupted run "
+            "never loses completed work.\n\n"
             "Your brief: Write the intro.\n\n"
             "Inputs (read them with your tools before writing, and cite them "
             f"where relevant):\n- {run_dir / 'spine' / 'unit-01.md'}"

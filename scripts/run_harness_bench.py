@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Drive HarnessBench against kusudaemon across arms (TESTING.md §1, §3.1, §5).
+"""Drive HarnessBench against kusudaemon across arms (BENCHMARKING.md §0.1, §0.5, §0.4).
 
 HarnessBench owns the environment, the prompt and the grader; this script owns
 the experimental matrix. For each (task, arm, seed) it shells out to
 HarnessBench's own CLI -- so the score is HarnessBench's oracle, never ours --
 and merges that verdict with the accounting kusudaemon's `bench` entry point
-writes into the sandbox, producing one record per the TESTING.md §5 schema.
+writes into the sandbox, producing one record per the BENCHMARKING.md §0.4 schema.
 
 HarnessBench runs tasks in a plain filesystem sandbox (`fixtures/` copied into
 `sandbox/workspace`). There are no containers and nothing to download beyond
@@ -397,7 +397,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "per_task_scores": per_task,
         "caveat": (
             "Token spend must be within ~10% across arms for the comparison to "
-            "mean anything (TESTING.md §1). Check mean_tokens_per_run before "
+            "mean anything (BENCHMARKING.md §0.1). Check mean_tokens_per_run before "
             "reading any delta as a harness effect."
         ),
     }
@@ -431,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--arms", nargs="+", default=["A", "C"], choices=["A", "B", "C"],
                    help="Arms to run (default: A C -- arm B skipped for cost).")
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3],
-                   help="Seeds; N=3 minimum (TESTING.md §1).")
+                   help="Seeds; N=3 minimum (BENCHMARKING.md §0.1).")
     p.add_argument("--backend", default=DEFAULT_BACKEND)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--tier", default="auto")
@@ -460,7 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--results-dir", default=str(_REPO_ROOT / "bench_results"))
     p.add_argument("--drop-solved-by-a", action="store_true",
                    help="Skip a task in later arms if every arm-A seed solved it "
-                        "(TESTING.md §4).")
+                        "(BENCHMARKING.md §0.4).")
     p.add_argument("--dry-run", action="store_true", help="Print the matrix and exit.")
     p.add_argument("--verbose", action="store_true", help="Echo HarnessBench stderr.")
     return p
@@ -510,7 +510,7 @@ def main() -> int:
         print("no tasks matched the filters", file=sys.stderr)
         return 2
 
-    # Arm A first: cheapest arm, and it establishes the baseline (TESTING.md §4).
+    # Arm A first: cheapest arm, and it establishes the baseline (BENCHMARKING.md §0.4).
     arms = sorted({a.upper() for a in args.arms}, key=lambda a: {"A": 0, "B": 1, "C": 2}[a])
     total = len(tasks) * len(arms) * len(args.seeds)
 

@@ -1,4 +1,4 @@
-"""Unit tests for the `kusudaemon bench` CLI entry point (TESTING.md §2).
+"""Unit tests for the `kusudaemon bench` CLI entry point (BENCHMARKING.md §0.2).
 
 Hermetic tests: no network, no live model calls, no external agent binary.
 Verifies:
@@ -259,7 +259,7 @@ class TestBenchCLI(unittest.TestCase):
         with unittest.mock.patch("sys.stdout", stdout_buf):
             code = cmd_bench(args, driver_factory=fake_driver_factory)
 
-        # Must exit non-zero on halt per TESTING.md §2
+        # Must exit non-zero on halt per BENCHMARKING.md §0.2
         self.assertEqual(code, 1)
         data = json.loads(output_file.read_text(encoding="utf-8"))
         self.assertFalse(data["resolved"])

@@ -171,6 +171,25 @@ def _now() -> float:
     return time.time()
 
 
+def _merge_by_timestamp(
+    file_entries: list[TraceEntry], extra_entries: list[TraceEntry]
+) -> list[TraceEntry]:
+    """Stable chronological merge of file-backed + store-backed entries.
+
+    Entries without a timestamp keep their relative file order at the head
+    (the trace's bootstrap ``logdir`` line has none); timestamped entries
+    follow in ascending order. Stable, so equal timestamps preserve the
+    file-then-store order."""
+
+    def _sort_key(entry: TraceEntry) -> tuple[int, float]:
+        stamp = entry.timestamp
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            return (0, 0.0)
+        return (1, float(stamp))
+
+    return sorted([*file_entries, *extra_entries], key=_sort_key)
+
+
 class RunState:
     """Per-process store for the dashboard server. Thread-safe: the driver,
     job workers, and the server's own request/SSE handlers all touch this
@@ -212,6 +231,11 @@ class RunState:
         # an episode runs) into O(bytes appended since the last poll).
         # Bounded and locked the same way as ``_file_cache``.
         self._trace_cache: dict[str, "_TraceCacheEntry"] = {}
+        # Per-session opencode-store entry cache for ``trace_entries``'
+        # sqlite merge (see ``dashboard/opencode_store.py``) — keyed by
+        # session id, value is ``(watermark, entries)``; guarded by
+        # ``_cache_lock`` like the other two caches.
+        self._opencode_cache: dict[str, Any] = {}
 
     def _cached_read(
         self,
@@ -1672,11 +1696,21 @@ class RunState:
         only the bytes appended since the last call instead of re-parsing
         the whole file. Returns ``None`` exactly when ``trace()`` would —
         no run attached, an unsafe node id — so callers can keep the same
-        404-vs-200-empty-list distinction."""
+        404-vs-200-empty-list distinction.
+
+        Plus the opencode merge: CLI-backend episodes stream (almost)
+        nothing to stdout mid-run — their thinking lives in opencode's own
+        sqlite store. Entries translated from there (``opencode_store``)
+        are merged in timestamp order so Chat/main-stream show subagent
+        thinking live, for benchmark runs and interactive runs alike."""
         path = self._resolve_trace_path(node_id)
         if path is None:
             return None
-        return self._parse_trace_incremental(path)
+        entries = self._parse_trace_incremental(path)
+        extra = self._opencode_session_entries(node_id)
+        if not extra:
+            return entries
+        return _merge_by_timestamp(entries, extra)
 
     def _parse_trace_incremental(self, path: Path) -> list[TraceEntry]:
         key = str(path)
@@ -1746,6 +1780,41 @@ class RunState:
                 del self._trace_cache[next(iter(self._trace_cache))]
             self._trace_cache[key] = cached
         return list(cached.entries)
+
+    def _opencode_session_entries(self, node_id: str) -> list[TraceEntry]:
+        """Translated opencode-store entries for ``node_id``'s sessions.
+
+        The node's opencode session ids come from ``events.jsonl``'s
+        ``session_captured`` rows; their live thinking/tool/usage parts come
+        from opencode's sqlite store (``dashboard/opencode_store.py``).
+        Read-only and best-effort — any failure yields ``[]`` so a missing
+        or locked DB can never break the thinking endpoint."""
+        try:
+            from . import opencode_store
+        except Exception:
+            return []
+        try:
+            run_dir = self._attached_dir()
+            if run_dir is None:
+                return []
+            session_ids = opencode_store.opencode_session_ids(
+                self._cached_events(run_dir), node_id
+            )
+            if not session_ids:
+                return []
+            db_path = opencode_store.default_db_path()
+            merged: list[TraceEntry] = []
+            with self._cache_lock:
+                cache = self._opencode_cache
+                for session_id in session_ids:
+                    merged.extend(
+                        opencode_store.read_session_entries(
+                            db_path, session_id, cache, node_id=node_id
+                        )
+                    )
+            return merged
+        except Exception:
+            return []
 
     def spec_text(self) -> str:
         run_dir = self._attached_dir()
@@ -2403,6 +2472,14 @@ def _summarize_subagent(
     else:
         derived_status = "idle"
 
+    t_path = node_trace_path(run_dir, node_id)
+    mtime = None
+    try:
+        if t_path.exists():
+            mtime = t_path.stat().st_mtime
+    except Exception:
+        pass
+
     return {
         "id": node_id,
         "kind": _kind_of(node_id),
@@ -2414,6 +2491,7 @@ def _summarize_subagent(
         "error": error,
         "live": live,
         "has_logdir": logdir is not None,
+        "mtime": mtime,
     }
 
 

@@ -124,6 +124,8 @@ _OPENCODE_TYPES = {
     "tool_result",
     "error",
     "message.part.updated",
+    "message.part.delta",
+    "message.part.removed",
 }
 _ANTIGRAVITY_EVENTS = {
     "init",
@@ -478,7 +480,7 @@ def translate_codex(record: dict[str, Any], session_dir: str) -> list[str] | Non
 def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | None:
     """One OpenCode json record → trace lines, or None to drop the line."""
     rtype = record.get("type")
-    part = record.get("part") if isinstance(record.get("part"), dict) else {}
+    part = record.get("part") if isinstance(record.get("part"), dict) else (record.get("properties", {}).get("part") if isinstance(record.get("properties"), dict) else {})
     if rtype in ("step-start", "step_start"):
         session_id = str(
             record.get("sessionID")
@@ -617,13 +619,20 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
                             out.append(json.dumps({"type": "thinking", "content": t}))
             return out or None
         return None
-    if rtype == "message.part.updated":
+    if rtype in ("message.part.updated", "message.part.delta") or (rtype and str(rtype).startswith("message.part.")):
         if isinstance(part, dict):
             ptype = part.get("type")
             if ptype in ("thinking", "reasoning"):
-                t = str(part.get("text") or part.get("thinking") or "").strip()
+                t = str(part.get("text") or part.get("thinking") or part.get("reasoning") or part.get("delta") or "").strip()
                 if t:
                     return [json.dumps({"type": "thinking", "content": t})]
+            elif ptype == "text":
+                t = str(part.get("text") or part.get("content") or "").strip()
+                if t:
+                    return [json.dumps({"type": "message", "role": "assistant", "content": t})]
+        delta = record.get("delta") or (record.get("properties", {}).get("delta") if isinstance(record.get("properties"), dict) else None)
+        if delta and str(delta).strip():
+            return [json.dumps({"type": "thinking", "content": str(delta).strip()})]
         return None
     if rtype == "error":
         msg = str(record.get("message") or record.get("error") or part.get("message") or part.get("error") or "")
@@ -805,7 +814,8 @@ def translate_line(line: str, fmt: str, session_dir: str = "") -> list[str] | No
             return [line]
         return translate_codex(record, session_dir)
     if fmt == OPENCODE:
-        if record.get("type") not in _OPENCODE_TYPES:
+        rec_type = str(record.get("type") or "")
+        if rec_type not in _OPENCODE_TYPES and not rec_type.startswith("message.part."):
             return [line]
         return translate_opencode(record, session_dir)
     if fmt in (ANTIGRAVITY, AGY):
@@ -846,11 +856,15 @@ async def _pump(proc: asyncio.subprocess.Process, fmt: str, session_dir: str) ->
                     rec = json.loads(emitted)
                 except json.JSONDecodeError:
                     rec = None
-                if isinstance(rec, dict) and rec.get("type") == "logdir":
-                    key = (str(rec.get("logdir") or ""), str(rec.get("session_id") or ""))
-                    if key in emitted_sessions:
-                        continue
-                    emitted_sessions.add(key)
+                if isinstance(rec, dict):
+                    if rec.get("type") == "logdir":
+                        key = (str(rec.get("logdir") or ""), str(rec.get("session_id") or ""))
+                        if key in emitted_sessions:
+                            continue
+                        emitted_sessions.add(key)
+                    if "ts" not in rec and "timestamp" not in rec and "time" not in rec and "created_at" not in rec:
+                        rec["ts"] = time.time()
+                        emitted = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
             print(emitted, flush=True)
 
 
@@ -960,6 +974,12 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
                 cmd.insert(idx + 1, "--print-logs")
             else:
                 cmd.append("--print-logs")
+        if "--thinking" not in cmd:
+            if "run" in cmd:
+                idx = cmd.index("run")
+                cmd.insert(idx + 1, "--thinking")
+            else:
+                cmd.append("--thinking")
         log_path = os.path.expanduser("~/.local/share/opencode/log/opencode.log")
         if os.path.exists(log_path):
             try:

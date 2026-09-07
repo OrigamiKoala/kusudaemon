@@ -1,4 +1,4 @@
-"""Layer 1 mechanism benchmark: Crash matrix (TEST-PLAN.md §1.1).
+"""Layer 1 mechanism benchmark: Crash matrix (BENCHMARKING.md §9.1 / docs/TEST-PLAN.md §1.1).
 
 Tests resume correctness across all 24 (tier, phase) crash points, verifying:
 - terminal_events_per_node <= 1

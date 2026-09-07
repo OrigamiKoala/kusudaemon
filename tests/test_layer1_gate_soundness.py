@@ -1,4 +1,4 @@
-"""PLAN.md §7 / TEST-PLAN.md §1.3 — Gate false-accept corpus.
+"""PLAN.md §7 / BENCHMARKING.md §9.1 / docs/TEST-PLAN.md §1.3 — Gate false-accept corpus.
 
 Pure, hermetic soundness benchmarks for evaluate_gates across all 10 gate kinds:
 exists, nonempty, len, max_tokens, contains, headers_std, problems_min,
@@ -236,7 +236,7 @@ class Layer1GateSoundnessTest(unittest.TestCase):
         fa_rate = false_accepts / total_fail_tested if total_fail_tested else 0.0
         fr_rate = false_rejects / total_pass_tested if total_pass_tested else 0.0
 
-        # Headline assertion from TEST-PLAN.md §1.3:
+        # Headline assertion from BENCHMARKING.md §9.1 / docs/TEST-PLAN.md §1.3:
         # "Report false-accept and false-reject rates as numbers; assert FA == 0 on the adversarial set."
         self.assertEqual(
             false_accepts,

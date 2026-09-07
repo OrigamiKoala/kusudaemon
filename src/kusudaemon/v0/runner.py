@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,69 @@ def _completion_consumed(
     return False
 
 
+def _continuation_prompt(
+    run_dir: Path, node_id: str, prompt: str, resume_session_id: str | None
+) -> str:
+    """Frame ANY redispatch as a continuation, not a restart.
+
+    Every redispatch prompt is otherwise byte-identical to the first
+    attempt's — with no continue-framing the model reads it as "do it
+    again" and rewrites the artifact from scratch (observed live: a long
+    doc back at block 1 after a timeout-resume, each whole-file `write`
+    wiping all previously appended progress). Appended last so it has the
+    final word.
+
+    ``resume_session_id`` is set on the resumed-session path (the CLI
+    session keeps full conversation history); on the fresh-session paths
+    (``resume_unsupported``, ``no_session_captured``) it is None, and the
+    framing instead points the model at the partial artifact already on
+    disk — a previous attempt may still have written to it.
+    """
+    try:
+        artifact = node_artifact_path(run_dir, node_id)
+        existing_bytes = artifact.stat().st_size if artifact.exists() else 0
+    except OSError:
+        existing_bytes = 0
+    if resume_session_id is not None:
+        opening = (
+            f"This episode continues your previous session ({resume_session_id}), "
+            "which ended before the artifact was complete."
+        )
+    else:
+        opening = (
+            "This is a fresh session, but a previous attempt at this same "
+            "task already ran before it."
+        )
+    if existing_bytes > 0:
+        state_line = (
+            f"Your partial artifact at `{artifact}` already holds "
+            f"{existing_bytes} bytes of prior work. Read its tail to see exactly "
+            "where the previous attempt left off, then continue with the "
+            "remaining sections."
+        )
+        overwrite_rule = (
+            "You may edit, revise, or delete sections as the work requires, "
+            "but preserve the finished sections you are not deliberately "
+            "changing: if your file tools replace whole-file content on "
+            "write, read the current content first and carry it forward, "
+            "rather than restarting the document from scratch."
+        )
+    else:
+        state_line = (
+            f"Your artifact path is `{artifact}` (currently empty — nothing "
+            "usable survived the prior attempt)."
+        )
+        overwrite_rule = (
+            "Write incrementally and append as you go so a later "
+            "interruption never loses finished sections."
+        )
+    return (
+        f"{prompt}\n\n[Harness notice — CONTINUATION, not a fresh task]\n"
+        f"{opening} {state_line}\n"
+        f"{overwrite_rule}"
+    )
+
+
 async def run_node(
     run_dir: str | Path,
     node_id: str,
@@ -85,10 +149,26 @@ async def run_node(
     session = EventLog.scan(events, node_id, "session_captured")
     supports_resume = bool(getattr(adapter, "supports_session_resume", False))
 
+    # Sessions/logdirs already captured by prior attempts of this node. The
+    # trace file is append-only across attempts (below), so the watcher must
+    # skip these stale lines rather than re-capturing them as fresh.
+    known_session_ids = {
+        str(event.get("session_id"))
+        for event in events
+        if event.get("node_id") == node_id and event.get("session_id")
+    }
+    known_logdirs = {
+        str(event.get("logdir"))
+        for event in events
+        if event.get("node_id") == node_id and event.get("logdir")
+    }
+
     resume_session_id: str | None = None
+    dispatch_reason = "dispatched"
     if session is not None and session.get("session_id"):
         if supports_resume:
             resume_session_id = session.get("session_id")
+            dispatch_reason = "resumed_session"
             log.append(
                 {
                     "node_id": node_id,
@@ -103,6 +183,7 @@ async def run_node(
             # Codex today) has no continuation mechanism. Falling back to a
             # fresh redispatch is the documented behavior rather than an
             # error — see ClaudeCodeAdapter.supports_session_resume.
+            dispatch_reason = "resume_unsupported"
             log.append(
                 {
                     "node_id": node_id,
@@ -120,6 +201,7 @@ async def run_node(
         # call — a caller may legitimately supply a different one on a
         # redispatch (PLAN-zeromem.md §9: a retry's prompt carries the prior
         # attempt's located defect forward, so it differs from the first).
+        dispatch_reason = "no_session_captured"
         log.append(
             {
                 "node_id": node_id,
@@ -139,14 +221,44 @@ async def run_node(
             }
         )
 
+    if dispatch_reason != "dispatched":
+        # Every redispatch — resumed session or fresh — gets
+        # continue-where-you-left-off framing. Without it the model reads
+        # the byte-identical prompt as "do it again" and rewrites the
+        # artifact from scratch (observed live: a 300-block doc back at
+        # block 1 after a timeout-resume, each whole-file `write` wiping
+        # all prior appended progress).
+        prompt = _continuation_prompt(run_dir, node_id, prompt, resume_session_id)
+
     trace_path = ensure_node_trace_path(run_dir, node_id)
-    # A prior crashed attempt can leave stale content in trace_path. Clear it
-    # before dispatching so the watcher below can't race the new subprocess
-    # and mistake a leftover line from the old attempt for a fresh capture —
-    # LocalEnvironment.exec truncates and recreates this file itself once the
-    # new subprocess actually starts, but that happens a few awaits later.
-    if trace_path.exists():
-        trace_path.unlink()
+    # The trace is append-only across attempts: a prior attempt's entries
+    # stay on disk and the new episode's lines are appended after a visible
+    # boundary marker. Truncating here (the old behavior) wiped the
+    # dashboard's main chat on every retry/timeout-resume, and the
+    # incremental parse cache treated the rewritten file as a reset.
+    # LocalEnvironment exec opens the tee in append mode to match; the
+    # session watcher below skips already-captured ids so stale lines can
+    # never be mistaken for a fresh capture.
+    if trace_path.exists() and trace_path.stat().st_size > 0:
+        try:
+            with open(trace_path, "a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "role": "system",
+                            "content": (
+                                f"── new attempt ({dispatch_reason}): "
+                                "continuing below; everything above is "
+                                "the prior attempt's history ──"
+                            ),
+                            "ts": time.time(),
+                        }
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
 
     # LocalEnvironment.exec tees stdout to trace_path live, line by line, as
     # the subprocess runs — so this tail can see session_id the instant the
@@ -196,7 +308,14 @@ async def run_node(
     watcher: asyncio.Task[None] | None = None
     if supports_resume:
         watcher = asyncio.create_task(
-            _watch_for_session_id(trace_path, log, node_id, stop_watching)
+            _watch_for_session_id(
+                trace_path,
+                log,
+                node_id,
+                stop_watching,
+                skip_session_ids=known_session_ids,
+                skip_logdirs=known_logdirs,
+            )
         )
     episode_kwargs: dict[str, Any] = {"live_trajectory_path": str(trace_path)}
     if resume_session_id is not None:
@@ -346,6 +465,9 @@ async def _watch_for_session_id(
     log: EventLog,
     node_id: str,
     stop: asyncio.Event,
+    *,
+    skip_session_ids: set[str] | None = None,
+    skip_logdirs: set[str] | None = None,
 ) -> None:
     while not trace_path.exists():
         if stop.is_set():
@@ -353,7 +475,13 @@ async def _watch_for_session_id(
         await asyncio.sleep(_SESSION_POLL_INTERVAL_SECONDS)
 
     offset = 0
-    captured_logdirs: set[str] = set()
+    # The trace is append-only across attempts, so a redispatch re-scans the
+    # prior attempt's lines: ids/logdirs already captured (seeded here) are
+    # skipped instead of re-emitted, and only a genuinely new capture ends
+    # the watch. (Session ids share `captured_logdirs` below — pre-existing
+    # conflation, kept so the skip check covers both.)
+    captured_logdirs: set[str] = set(skip_logdirs or ()) | set(skip_session_ids or ())
+    captured_sessions: set[str] = set(skip_session_ids or ())
     while True:
         try:
             # Binary mode and byte offsets: text-mode seek only accepts
@@ -394,7 +522,10 @@ async def _watch_for_session_id(
                             "session_id": session_id,
                         }
                     )
-                return
+                    return
+                # Stale line from a prior attempt (append-only trace):
+                # skip it and keep polling for a genuinely new capture.
+                continue
             # PLAN-AUDIT.md §E13: don't hardcode session_id as the only
             # event shape a resume-capable adapter can emit. A
             # `{"type": "logdir", ...}` line (the shape _gptme_worker.py

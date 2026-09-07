@@ -40,13 +40,15 @@ kusudaemon serve                                             # dashboard on :876
 kusudaemon run --goal "..." --workspace ./                   # headless run
 kusudaemon run --goal "..." --workspace ./ --output-dir ./out # headless run with custom output dir
 kusudaemon resume <run-id>                                   # resume after interruption/crash
-kusudaemon bench --workspace ./ --goal "..." --backend opencode --arm C --json # benchmark task (TESTING.md §2)
+kusudaemon bench --workspace ./ --goal "..." --backend opencode --arm C --json # benchmark task (BENCHMARKING.md §0.2)
 ```
 
 External benchmarks (HarnessBench all 8 classes, LongGenBench, WritingBench,
 HelloBench, Terminal-Bench via Harbor, GAIA, SWE-bench Verified) have a
-step-by-step setup and run guide in `BENCHMARKING.md`; `TESTING.md` holds the
-experimental design those runs implement.
+step-by-step setup and run guide in `BENCHMARKING.md`, which is now the
+all-in-one benchmark document: experimental design (§0), setup and commands
+(§2-§6), and the hermetic-suite gate that precedes any sweep (§9). The earlier
+`TESTING.md` and `TEST-PLAN.md` are archived under `docs/`.
 
 Provider config lives in `provider.json` (copy from `provider.example.json`) and `.env` (copy from `.env.example`) in the invoking working directory — see README.md §2 for the schema (per-backend blocks; only `gptme` takes a multi-provider `providers` map).
 
@@ -87,7 +89,8 @@ Provider config lives in `provider.json` (copy from `provider.example.json`) and
 - `KUSUDAEMON_ROLE_TRANSPORT=http`: direct REST API call via `OpenAICompatibleProvider` to `/chat/completions`. Fast (~1-3s), uses `response_format`/native JSON mode, requires `api_key` and `base_url`.
 - `KUSUDAEMON_ROLE_TRANSPORT=backend`: one-shot tool-less CLI episode via `BackendRoleProvider` (`opencode run`, etc.). No API key needed in harness, but higher latency (subprocess startup) and risk of model tool-confusion or schema echoing. `json_io.py` automatically unwraps schema-echoed `properties`/`type`, repairs single-item review objects, strips unexpected keys on strict schemas, defaults missing `questions` and `objections` to empty lists for scope/intake schemas, and auto-fills missing booleans and verdicts. Default timeouts configured to 120s for reviewer/triage and 300s for other roles; the driver's explicit 45s reviewer/triage budget is threaded through `make_role_provider` into `BackendRoleProvider` on the backend path too. `document_review` automatically short-circuits with a clean result when `len(entries) <= 1` and `keep_depth_pass=False`, eliminating redundant multi-minute review attempts on single-node documents. Defaulted by `provider.json` and `scripts/run_harness_bench.py`.
 - **OpenCode Stream Error & Quota Hang Protection:** `_agent_worker.py` monitors child stderr (with `--print-logs` injected) and `~/.local/share/opencode/log/opencode.log`. When OpenCode CLI hits non-interactive fatal stream errors (e.g. `Rate limit exceeded` / `AI_APICallError`), the worker immediately terminates the process within seconds instead of hanging until the 300s episode timeout, emitting a system error trace line and non-zero exit code. `BackendRoleProvider` backs off on rate-limit errors before retrying.
-- **OpenCode Model Identifier Normalization:** OpenCode CLI syntax for third-party providers (e.g. NVIDIA NIM) requires `<provider>/<vendor>/<model>` (e.g. `nvidia/nvidia/nemotron-3.5-lightning-30b-a3b`). `OpenCodeAdapter` and `provider_config.py` automatically normalize shorthand aliases like `nvidia/nemotron-...` by prepending the missing vendor segment.
+- **OpenCode Model Identifier Normalization:** OpenCode CLI syntax for third-party providers (e.g. NVIDIA NIM) requires `<provider>/<vendor>/<model>` (e.g. `nvidia/nvidia/nemotron-3.5-lightning-30b-a3b`). `OpenCodeAdapter`, `provider_config.py`, and `cmd_bench` automatically normalize shorthand aliases like `nvidia/nemotron-...` by prepending the missing vendor segment.
+- **Benchmark Stdin Isolation:** `cmd_bench` and `scripts/run_longgen_bench.py` execute subprocesses with `stdin=subprocess.DEVNULL` to prevent non-interactive CLIs (such as `opencode run`) from hanging on an inherited open stdin pipe.
 
 **Workspace mode & tiering follow-ups (PLAN-WORKSPACE-MODE.md, STATUS §10):**
 - `ScopeEstimate.work_kind` (`document`/`procedure`/`code-edit`/`unknown`) is model-supplied evidence only: explicit `procedure` floors the tier at T1 with a `tier_work_kind_floor` event, nothing else moves, and the model can never lower a floor.
@@ -95,4 +98,25 @@ Provider config lives in `provider.json` (copy from `provider.example.json`) and
 - Workspace-kind runs force `DEFAULT_TOOL_ALLOWLIST` in `build_writer_adapter` (prose/reference template tool opinions no longer deny bash on repo tasks); `code-dominant` shape exists in `_SHAPES` with full shell+patch tools.
 - Small-workspace guards key off measured input AND output signals (`_measured_small` + `PLAN_MIN_WORKSPACE_TOKENS = 2000` shared with `tiering._T1_WORK_TOKENS_CEILING`); K0/K1/K2-gate/K2-tools/K3 workspace prompt stay behind default-off flags (`KUSUDAEMON_TIER_TRUST_SIGNALS`, `KUSUDAEMON_PLAN_SINGLE_UNIT_WORKSPACE`, `KUSUDAEMON_DIRECT_TEMPLATE`, `KUSUDAEMON_DIRECT_TOOLS`, `KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT`).
 
+**Subagent Chat Timestamps & Benchmark Harvesting:**
+- `dashboard/rendering.py`: `parse_trace_lines` pre-scans and propagates `effective_ts` across all message, tool call, and thinking trace entries from preceding timestamps/heartbeats instead of dropping to `None`.
+- `adapters/_agent_worker.py`: automatically stamps missing `ts` with `time.time()` on every emitted JSON event.
+- `dashboard/state.py`: `_summarize_subagent` attaches `mtime` from `trace_path.stat().st_mtime`.
+- `dashboard/static/app.js`: guards `timestamp !== undefined && timestamp !== null` so valid timestamps are retained and fallback is trace `mtime` rather than `Date.now()`.
+- `scripts/run_longgen_bench.py`: `harvest_artifact` checks `~/.kusudaemon/runs/*/out/*.md` on timeout or missing `--output-dir` to recover and preserve completed generated artifacts.
 
+**Dashboard Thinking Persistence & Toggle:**
+- `dashboard/static/app.js`:
+  - `state.thinkingOpen`: tracks user-explicit toggle state per entry key (`ontoggle`).
+  - `MORPH_OPTS.onBeforeElUpdated`: synchronizes `open` attribute on `<details>` elements to prevent morphdom from collapsing toggled thinking cards on background render ticks.
+  - `loadMainThinking`: retains historical thinking across all phases and subagents in `state.mainThinking.agents`, merging unified entries chronologically into the feed rather than wiping entries when active agent transitions.
+  - `mainAgentId`: falls back to live/active worker subagents during `execute` phase to capture live stream.
+  - `renderAgentChatEntry`: scopes DOM keys by `node_id` to ensure stable identity across agents.
+
+**Chunked Writing & Stream-Aware Liveness Timeout:**
+- `pipeline/prompts.py`: `_artifact_instruction` explicitly guides writers to write and save long or multi-part documents incrementally in batches (10–20 sections at a time) rather than buffering in a single monolithic edit call, ensuring intermediate progress is committed to disk.
+- `environment/local.py` & `base.py`: Implemented stream-aware soft timeout extension up to 1,800s (`KUSUDAEMON_SOFT_TIMEOUT_EXTENSION=1800`, `KUSUDAEMON_ACTIVITY_WINDOW=60.0`). Replaces passive worker thread heartbeats with true liveness verification:
+  - Measures process group CPU time advancement (`_get_pgid_cputime`).
+  - Inspects active established TCP network sockets (`_has_established_socket`).
+  - Filters out background heartbeat JSON lines from resetting activity timers.
+  - Allows active model generation and thinking streams to complete uninterrupted without prematurely cutting off in-flight tool calls.

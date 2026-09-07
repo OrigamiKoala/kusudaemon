@@ -71,7 +71,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         format: str = "json",
         auto_approve: bool = True,
         variant: str | None = None,
-        thinking: bool = False,
+        thinking: bool = True,
         pure: bool = False,
         print_logs: bool = True,
         log_level: str | None = None,

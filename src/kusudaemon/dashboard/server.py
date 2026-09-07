@@ -92,8 +92,10 @@ _STREAM_INTERVAL = 1.5
 # §PERF: the /api/node/<id>/thinking payload cap (see the route). The chat
 # tab is polled every _STREAM_INTERVAL while an episode runs; a long
 # episode's full trace is megabytes and grows every turn, so the server
-# returns only the tail and reports the real total.
-MAX_THINKING_ENTRIES = 1500
+# returns only the tail and reports the real total. Sized so a long
+# single-node run's whole history (opencode-store merge included) fits the
+# initial fetch — chat history must never visibly vanish mid-run.
+MAX_THINKING_ENTRIES = 5000
 
 # §C4: the maximum number of concurrently-hosted runs the dashboard will
 # accept. Each hosted run owns a driver thread with a process and a provider

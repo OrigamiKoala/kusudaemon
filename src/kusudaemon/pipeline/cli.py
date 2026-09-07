@@ -244,7 +244,7 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
 
     bench_parser = sub.add_parser(
         "bench",
-        help="Run a task in a benchmark environment (TESTING.md §2: Shape A integration).",
+        help="Run a task in a benchmark environment (BENCHMARKING.md §0.2: Shape A integration).",
     )
     bench_parser.add_argument("--goal-file", default=None, help="File containing task goal/instruction.")
     bench_parser.add_argument("--goal", default="", help="Task goal/instruction string.")
@@ -254,7 +254,7 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument(
         "--source",
         default="",
-        help="TESTING.md §2 Shape B: corpus text, @path, or - for stdin. Supplying "
+        help="BENCHMARKING.md §0.2 Shape B: corpus text, @path, or - for stdin. Supplying "
              "it selects the text work object instead of measuring --workspace, "
              "which is what long-form generation benchmarks (LongGenBench, "
              "WritingBench, HelloBench) need: they hand you source material and a "
@@ -846,7 +846,7 @@ def cmd_bench(
     driver_factory: Any = None,
     subprocess_runner: Any = None,
 ) -> int:
-    """TESTING.md §2 Shape A benchmark integration entry point.
+    """BENCHMARKING.md §0.2 Shape A benchmark integration entry point.
 
     Runs a task under a benchmark harness across three arms:
       - Arm A: bare backend CLI alone (opencode run, etc.)
@@ -854,7 +854,7 @@ def cmd_bench(
       - Arm C: full kusudaemon pipeline
 
     Exits non-zero on halt/failure and emits a machine-readable summary
-    per TESTING.md §5.
+    per BENCHMARKING.md §0.4.
     """
     goal = ""
     if getattr(argv, "goal_file", None):
@@ -892,6 +892,9 @@ def cmd_bench(
             model = None
     if not model and backend == "opencode":
         model = "opencode/nemotron-3.5-lightning-free"
+    if backend == "opencode" and model:
+        from ..adapters.opencode import normalize_opencode_model
+        model = normalize_opencode_model(model)
 
     commit = "unknown"
     try:
@@ -963,12 +966,17 @@ def cmd_bench(
             cmd = [backend, goal]
 
         t0 = time.time()
+        runner_kwargs: dict[str, Any] = {
+            "cwd": str(ws_path),
+            "capture_output": True,
+            "text": True,
+        }
+        if runner is subprocess.run:
+            runner_kwargs["stdin"] = subprocess.DEVNULL
         try:
             res = runner(
                 cmd,
-                cwd=str(ws_path),
-                capture_output=True,
-                text=True,
+                **runner_kwargs,
             )
             exit_code = res.returncode
             halt_reason = None if exit_code == 0 else f"bare process exited with code {exit_code}: {res.stderr[:200]}"
@@ -987,7 +995,7 @@ def cmd_bench(
             if parsed_usage["total"] > 0:
                 tokens_by_role = {"bare": parsed_usage["total"]}
 
-        # A generation benchmark (TESTING.md §2 Shape B) grades the produced
+        # A generation benchmark (BENCHMARKING.md §0.2 Shape B) grades the produced
         # text, not the final state of a container, so arm A's stdout *is* its
         # artifact. Arm C already exports one via --output-dir; without this,
         # the two arms are not comparable because arm A leaves nothing behind.
@@ -1040,7 +1048,7 @@ def cmd_bench(
         from .approvals import Approver
         from .run_dir import halt_path, tier_path
 
-        # TESTING.md §2: Shape A (a container to operate on) measures the
+        # BENCHMARKING.md §0.2: Shape A (a container to operate on) measures the
         # workspace; Shape B (source material plus a rubric) is the text work
         # object and must not be measured as a directory. Measuring an empty
         # workspace for a generation task is not merely imprecise -- it forces
@@ -1139,7 +1147,7 @@ def cmd_bench(
 
         if report is not None and report.status != "done" and not halt_reason:
             # A non-"done" report is a recorded outcome, not a silent failure
-            # (TESTING.md §4). "halted" keeps its bare detail; every other
+            # (BENCHMARKING.md §0.4). "halted" keeps its bare detail; every other
             # terminal status (notably "error": provider down, auth refused,
             # rate limit) carries the phase so a sweep is diagnosable after
             # the fact instead of showing up as resolved=false, reason=null.

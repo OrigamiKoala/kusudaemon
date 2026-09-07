@@ -193,7 +193,13 @@ def _artifact_instruction(
         instruction = (
             f"Write your artifact to `{absolute_path}` using your file tools "
             "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
-            "else you write or say is."
+            "else you write or say is. When producing a long or multi-part document, write and save "
+            "your work incrementally in chunks (e.g. 10–20 sections at a time) rather than buffering "
+            "the entire text in a single massive call, so progress is saved to disk as you go. "
+            "You may freely edit, revise, or delete sections as the work requires — but preserve "
+            "finished sections you are not deliberately changing: before any whole-file overwrite, "
+            "read the current file and carry its existing content forward, so an interrupted run "
+            "never loses completed work."
         )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
         claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")

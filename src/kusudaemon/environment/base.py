@@ -12,6 +12,8 @@ class Environment(Protocol):
         command: str,
         timeout: int = 300,
         tee_path: str | None = None,
+        grace_period: int | None = None,
+        activity_window: float | None = None,
     ) -> ExecResult: ...
 
     async def screenshot(self) -> bytes: ...
