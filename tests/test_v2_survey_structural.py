@@ -116,7 +116,7 @@ class DriverSurveyModeTest(unittest.TestCase):
     def test_deterministic_mode_runs_zero_model_calls(self) -> None:
         with tempfile.TemporaryDirectory() as root_str:
             run_dir = Path(root_str) / "run"
-            source = "## Part 1\n" + ("word " * 1000) + "\n\n## Part 2\n" + ("word " * 1000)
+            source = "## Part 1\n" + ("word " * 1500) + "\n\n## Part 2\n" + ("word " * 1500)
             provider = FakeProvider([])
 
             driver = RecursiveDriver(

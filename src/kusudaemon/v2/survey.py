@@ -33,7 +33,7 @@ from ..v1.gates import estimate_tokens
 from ..roles.protocol import RoleProvider
 from .run_dir import spine_path, spine_unit_path
 
-DEFAULT_MIN_CHUNK_TOKENS = 50
+DEFAULT_MIN_CHUNK_TOKENS = 80
 # A2-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): size the window to the
 # payload, not to a mental model of "12 big chunks". Each chunk contributes
 # only a ~25-word preview (~40 tokens), so a window of 12 was absurdly
@@ -46,7 +46,7 @@ DEFAULT_WINDOW_STRIDE = 56
 # degrades to deterministic chunking for the remainder instead of issuing
 # thousands of requests (the only unbounded call loop in the harness).
 DEFAULT_MAX_SURVEY_CALLS = 60
-DEFAULT_MIN_UNIT_TOKENS = 800
+DEFAULT_MIN_UNIT_TOKENS = 1_320
 DEFAULT_CONFIDENCE_FLOOR = 0.5
 
 DEFAULT_BOUNDARY_PERCENTILE = 0.75  # keep the top quartile of dissimilarity
@@ -111,7 +111,7 @@ def _merge_small_segments(segments: list[str], min_tokens: int) -> list[str]:
     return merged
 
 
-DEFAULT_TARGET_UNIT_TOKENS = 16_000
+DEFAULT_TARGET_UNIT_TOKENS = 26_500
 DEFAULT_TARGET_MAX_CHUNKS = 100
 
 
@@ -364,6 +364,8 @@ class SpineUnit:
     # Additive with a default so every existing spine.json (which has no
     # "members" key) loads unchanged -- see load_spine below.
     members: tuple[str, ...] = ()
+    units_expected: int | None = None
+    unit_delimiter: str | None = None
 
 
 def assemble_spine(
@@ -523,3 +525,137 @@ def unit_input_path(run_dir: str | Path, unit: SpineUnit) -> str:
     if path.exists() and path.stat().st_size > 0:
         return str(path.relative_to(Path(run_dir)))
     return unit.id
+
+
+def _extract_constraints_for_range(goal: str, start: int, end: int, noun: str) -> list[str]:
+    """Extract code-routed constraints matching a unit's index range (PLAN-TOKEN-ACCOUNTING.md §J2)."""
+    raw_lines = [line.strip() for line in re.split(r"(?<=[.!?])\s+|\n+", goal) if line.strip()]
+    matched: list[str] = []
+    for line in raw_lines:
+        is_hit = False
+        # 1. Range: e.g. "floors 63 to 67", "floors 63-67"
+        for m in re.finditer(
+            rf"\b(?:{noun}|floor|block|unit|item|entry|chapter|day|week|step|part)s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            r_s, r_e = int(m.group(1)), int(m.group(2))
+            if max(start, r_s) <= min(end, r_e):
+                is_hit = True
+                break
+        if is_hit:
+            matched.append(line)
+            continue
+
+        # 2. Single ordinals: e.g. "floor 51"
+        for m in re.finditer(
+            rf"\b(?:{noun}|floor|block|unit|item|entry|chapter|day|week|step|part)\s+(\d+)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            val = int(m.group(1))
+            if start <= val <= end:
+                is_hit = True
+                break
+        if is_hit:
+            matched.append(line)
+            continue
+
+        # 3. Periodic rules: "every 20 floors starting from 40"
+        m_per = re.search(
+            rf"\bevery\s+(\d+)\s*(?:{noun}|floor|block|unit|item|entry|chapter|day|week|step|part)s?\s*(?:starting\s+from|from|after)?\s*(\d+)?",
+            line,
+            re.IGNORECASE,
+        )
+        if m_per:
+            step = int(m_per.group(1))
+            start_val = int(m_per.group(2)) if m_per.group(2) else step
+            first_in_range = start_val
+            if first_in_range < start:
+                rem = (start - first_in_range) % step
+                first_in_range = start if rem == 0 else start + (step - rem)
+            if first_in_range <= end:
+                is_hit = True
+        if is_hit:
+            matched.append(line)
+
+    return matched
+
+
+def synthesize_output_spine(
+    goal: str,
+    *,
+    token_budget: int = 50_000,
+    target_leaf_tokens: int = 4_000,
+) -> tuple[list[Chunk], list[SpineUnit]]:
+    """Synthesize an output spine when goal declares N >= _PLAN_MIN_OUTPUT_UNITS (PLAN-TOKEN-ACCOUNTING.md §J2)."""
+    import math
+    from ..tokens import count_tokens, expected_units, extract_unit_delimiter
+
+    n = expected_units(goal)
+    if not n or n < 8:
+        return [], []
+
+    delim = extract_unit_delimiter(goal)
+
+    nouns = ("floor", "block", "chapter", "entry", "item", "problem", "section", "day", "week", "scene", "step", "part")
+    noun = "unit"
+    for cand in nouns:
+        if re.search(rf"\b{cand}s?\b", goal, re.IGNORECASE):
+            noun = cand
+            break
+
+    m_words = re.search(r"(?:at least|around|about|approximately|minimum of)?\s*(\d+)\s*words\s*(?:per|for each|each|in each)\b", goal, re.IGNORECASE)
+    if not m_words:
+        m_words = re.search(r"(?:each|every)\s+\w+\s+(?:should be|must be|is|needs to be)?\s*(?:at least|around|about|approximately)?\s*(\d+)\s*words\b", goal, re.IGNORECASE)
+    if m_words:
+        words = int(m_words.group(1))
+        tokens_per_unit = count_tokens("word " * words)
+    else:
+        tokens_per_unit = 200
+
+    units_per_leaf = max(1, target_leaf_tokens // max(tokens_per_unit, 50))
+    units_per_leaf = max(5, min(25, units_per_leaf))
+    if n <= units_per_leaf:
+        units_per_leaf = max(1, math.ceil(n / 2))
+
+    num_leaves = math.ceil(n / units_per_leaf)
+    chunks: list[Chunk] = []
+    units: list[SpineUnit] = []
+
+    for i in range(num_leaves):
+        start_idx = i * units_per_leaf + 1
+        end_idx = min(n, (i + 1) * units_per_leaf)
+        count_in_leaf = end_idx - start_idx + 1
+
+        label = f"{noun.capitalize()}s {start_idx} to {end_idx}"
+        unit_id = f"unit-{i + 1:02d}"
+
+        constraints = _extract_constraints_for_range(goal, start_idx, end_idx, noun)
+        constraint_bullets = "\n".join(f"- {c}" for c in constraints) if constraints else "- None specifically assigned to this range."
+        delim_instruction = f"Use '{delim}' to separate the documentation for each {noun}." if delim else f"Format each {noun} clearly."
+
+        context_text = (
+            f"# Assigned Range: {noun.capitalize()}s {start_idx} to {end_idx} (Total: {count_in_leaf} {noun}s)\n\n"
+            f"{delim_instruction}\n\n"
+            f"## Specific Constraints for {label}:\n"
+            f"{constraint_bullets}\n\n"
+            f"## Complete Task Specification & Global Rules (Reference):\n"
+            f"{goal.strip()}\n"
+        )
+
+        tokens = count_tokens(context_text)
+        chunks.append(Chunk(index=i, text=context_text, tokens=tokens))
+        units.append(
+            SpineUnit(
+                id=unit_id,
+                label=label,
+                start_chunk=i,
+                end_chunk=i,
+                tokens=count_in_leaf * tokens_per_unit,
+                units_expected=count_in_leaf,
+                unit_delimiter=delim,
+            )
+        )
+
+    return chunks, units

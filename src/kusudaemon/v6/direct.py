@@ -51,17 +51,17 @@ SINGLE_NODE_ID = "single"
 # tier-agnostic -- CLAUDE.md/PLAN.md's own stated design constraint).
 DIRECT_MAX_ATTEMPTS = 2
 
-# A gate result's `.gate` string is the raw gate spec ("max_tokens:24000"),
-# and `_transition_after_writer` joins `f"{gate}: {detail}"` into
-# `last_defect` (v1/round_loop.py) -- so a size-class failure's defect text
-# always contains this substring. No runtime "calls exceeded" gate exists
-# today (driver.py: "NodeBudget.calls stays deliberately unwired"), so
-# max_tokens is the only size-class defect a T0/T1 dispatch can produce.
-_SIZE_DEFECT_MARKER = "max_tokens:"
+_SIZE_DEFECT_MARKERS = (
+    "max_tokens:",
+    "episode_timeout",
+    "episode did not complete",
+    "units_min:",
+    "units_expected",
+)
 
 
 def is_size_defect(last_defect: str) -> bool:
-    return _SIZE_DEFECT_MARKER in last_defect
+    return any(marker in last_defect for marker in _SIZE_DEFECT_MARKERS)
 
 
 def direct_node_path(run_dir: str | Path) -> Path:
@@ -94,12 +94,31 @@ def build_direct_node(
     degenerated into repetition (observed live against a 129.8 MB
     source.txt)."""
     shape = "direct" if os.getenv("KUSUDAEMON_DIRECT_TEMPLATE") == "1" else "prose-dominant"
+    from ..tokens import expected_units_info, extract_unit_delimiter
+    units_expected, units_source = expected_units_info(goal)
+    delimiter = extract_unit_delimiter(goal)
+
+    gates = ["nonempty", f"max_tokens:{token_budget}"]
+    warn_gates: list[str] = []
+    if units_expected and units_expected > 0:
+        units_gate = f"units_min:{units_expected}@{delimiter}" if delimiter else f"units_min:{units_expected}"
+        if units_source == "declared":
+            gates.append(units_gate)
+        else:
+            warn_gates.append(units_gate)
+
     node = TaskNode(
         id=node_id,
         brief=goal,
         artifact=f"out/{node_id}.md",
-        gates=["nonempty", f"max_tokens:{token_budget}"],
-        budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
+        gates=gates,
+        warn_gates=warn_gates,
+        budget=NodeBudget(
+            tokens=token_budget,
+            calls=tool_call_cap,
+            units_expected=units_expected,
+            unit_delimiter=delimiter,
+        ),
         inputs=inputs,
         shape=shape,
     )

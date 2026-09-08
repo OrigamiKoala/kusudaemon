@@ -245,7 +245,7 @@ class PromptPreservationTest(unittest.TestCase):
             text = _artifact_instruction(node, Path(root_str))
         self.assertIn("freely edit", text)
         self.assertNotIn("Do NOT rewrite", text)
-        self.assertIn("carry its existing content forward", text)
+        self.assertNotIn("carry its existing content forward", text)
 
 
 if __name__ == "__main__":

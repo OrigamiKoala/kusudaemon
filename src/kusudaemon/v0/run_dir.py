@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 def write_text_atomic(path: str | Path, text: str) -> None:
@@ -113,6 +114,49 @@ def ensure_node_trace_path(run_dir: str | Path, node_id: str) -> Path:
 
 def node_artifact_path(run_dir: str | Path, node_id: str) -> Path:
     return Path(run_dir) / "out" / f"{node_id}.md"
+
+
+def node_parts_dir(run_dir: str | Path, node_id: str) -> Path:
+    """Directory holding part files for multi-part artifacts (PLAN-TOKEN-ACCOUNTING.md §O5a)."""
+    return Path(run_dir) / "out" / node_id
+
+
+def ensure_node_parts_dir(run_dir: str | Path, node_id: str) -> Path:
+    d = node_parts_dir(run_dir, node_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def node_artifact_text(run_dir: str | Path, node_or_id: str | Any) -> str:
+    """Read a node's artifact text, resolving part files or single-file layout (PLAN-TOKEN-ACCOUNTING.md §O5a)."""
+    node_id = getattr(node_or_id, "id", node_or_id)
+    parts_d = node_parts_dir(run_dir, node_id)
+    if parts_d.is_dir():
+        md_files = [p for p in parts_d.glob("*.md") if p.is_file()]
+        if md_files:
+            import re
+
+            def _part_sort_key(p: Path) -> tuple[int, str]:
+                nums = re.findall(r"\d+", p.name)
+                return (int(nums[0]) if nums else 0, p.name)
+
+            sorted_parts = sorted(md_files, key=_part_sort_key)
+            texts = []
+            for p in sorted_parts:
+                try:
+                    t = p.read_text(encoding="utf-8")
+                    # §O10a: Retiring a part is elision; skip empty or whitespace parts
+                    if t.strip():
+                        texts.append(t.rstrip())
+                except OSError:
+                    pass
+            if texts:
+                return "\n\n".join(texts) + "\n"
+
+    path = node_artifact_path(run_dir, node_id)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Artifact missing for node {node_id} at {path} or {parts_d}")
 
 
 def resolve_stored(run_dir: str | Path, ref: str) -> Path:

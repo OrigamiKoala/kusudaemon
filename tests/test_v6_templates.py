@@ -289,7 +289,8 @@ class WorkspaceModeTemplatesTest(unittest.TestCase):
     def test_prose_dominant_unaffected(self) -> None:
         tpl = template_for("prose-dominant")
         self.assertEqual(tpl.name, "prose")
-        self.assertEqual(tpl.gates, ("headers:std",))
+        self.assertEqual(tpl.gates, ())
+        self.assertEqual(tpl.warn_gates, ("headers:std",))
         self.assertEqual(tpl.tools, ("read", "save"))
 
 

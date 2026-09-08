@@ -86,6 +86,8 @@ class TreeValidationError(ValueError):
 class NodeBudget:
     tokens: int = 50_000
     calls: int = 15
+    units_expected: int | None = None
+    unit_delimiter: str | None = None
 
 
 @dataclass
@@ -144,6 +146,12 @@ class TaskNode:
             budget=NodeBudget(
                 tokens=int(budget_data.get("tokens", 50_000)),
                 calls=int(budget_data.get("calls", 15)),
+                units_expected=(
+                    int(budget_data["units_expected"])
+                    if budget_data.get("units_expected") is not None
+                    else None
+                ),
+                unit_delimiter=budget_data.get("unit_delimiter"),
             ),
             judgment=list(data.get("judgment") or []),
             rubric=dict(data.get("rubric") or {}),

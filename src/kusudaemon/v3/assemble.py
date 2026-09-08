@@ -87,9 +87,11 @@ def render_index_md(entries: list[IndexEntry]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+from ..v0.run_dir import node_artifact_path, node_artifact_text
+
+
 def _read_artifact(run_dir: Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    return node_artifact_text(run_dir, node_id)
 
 
 def _default_render(node: TaskNode, text: str) -> str:

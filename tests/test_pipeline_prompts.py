@@ -291,16 +291,9 @@ class InlineSpansTest(unittest.TestCase):
         # inputs. With no spec.md, contract, or hidden paths, the stable
         # blocks are absent and the prompt begins with the artifact
         # instruction, then the brief, then inputs.
+        from kusudaemon.pipeline.prompts import _artifact_instruction
         expected = (
-            f"Write your artifact to `{run_dir / 'out' / 'a.md'}` using your file "
-            "tools (e.g. save, patch, write, or edit). That file is the deliverable; "
-            "nothing else you write or say is. When producing a long or multi-part document, write and save "
-            "your work incrementally in chunks (e.g. 10–20 sections at a time) rather than buffering "
-            "the entire text in a single massive call, so progress is saved to disk as you go. "
-            "You may freely edit, revise, or delete sections as the work requires — but preserve "
-            "finished sections you are not deliberately changing: before any whole-file overwrite, "
-            "read the current file and carry its existing content forward, so an interrupted run "
-            "never loses completed work.\n\n"
+            f"{_artifact_instruction(node, run_dir)}\n\n"
             "Your brief: Write the intro.\n\n"
             "Inputs (read them with your tools before writing, and cite them "
             f"where relevant):\n- {run_dir / 'spine' / 'unit-01.md'}"
@@ -482,6 +475,34 @@ class WorkspaceModePromptsTest(unittest.TestCase):
                 # text/corpus mode (is_workspace=False) keeps standard prompt
                 p_corpus = build_node_prompt(single_node, run_dir, is_workspace=False)
                 self.assertIn("That file is the deliverable; nothing else you write or say is.", p_corpus)
+
+    def test_declared_inputs_manifest_segment(self) -> None:
+        from kusudaemon.v1.tree import NodeBudget
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            (run_dir / "doc.txt").write_text("hello " * 200, encoding="utf-8")
+            node = _node(inputs=["doc.txt"], budget=NodeBudget(tokens=1000))
+            labels = []
+            prompt = build_node_prompt(
+                node, run_dir, segment_tokens=lambda l, t: labels.append(l)
+            )
+            self.assertIn("declared_inputs", labels)
+            self.assertIn("Declared inputs:", prompt)
+            self.assertIn("doc.txt", prompt)
+
+    def test_context_disclosure_flag(self) -> None:
+        import os
+        from unittest import mock
+        from kusudaemon.v1.tree import NodeBudget
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            node = _node(budget=NodeBudget(tokens=5000))
+            with mock.patch.dict(os.environ, {"KUSUDAEMON_CONTEXT_DISCLOSURE": "1"}):
+                prompt = build_node_prompt(node, run_dir)
+                self.assertIn("Context window usage notice: leaf token budget is ~5,000 tokens.", prompt)
+            with mock.patch.dict(os.environ, {"KUSUDAEMON_CONTEXT_DISCLOSURE": "0"}):
+                prompt = build_node_prompt(node, run_dir)
+                self.assertNotIn("Context window usage notice", prompt)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gptme = ["gptme"]
+tokenizers = ["tiktoken>=0.7", "tokenizers>=0.20"]
 dev = ["tomli; python_version < '3.11'"]
 
 [project.urls]

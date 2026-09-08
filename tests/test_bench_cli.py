@@ -447,6 +447,103 @@ class TestBenchCLI(unittest.TestCase):
         self.assertIsNotNone(data["halt_reason"])
         self.assertTrue(data["attended"])
 
+    def test_manifest_salvage_on_non_done(self) -> None:
+        """PLAN-BENCH-INTEGRITY.md §2.1: a non-done driver report with a passing
+        manifest entry salvages the artifact and records partial: True."""
+        output_file = Path(self.tmp_dir) / "salvage.json"
+
+        def fake_driver_factory(run_dir, provider, options, env):
+            out_file = run_dir / "out" / "single.md"
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text("# Completed Document\nAll 100 sections.\n", encoding="utf-8")
+
+            manifest_file = run_dir / "manifest.jsonl"
+            manifest_entry = {
+                "node": "single",
+                "artifact": str(out_file),
+                "gates": "pass",
+                "unmet_gates": [],
+                "tokens": 50,
+                "ts": 123.0,
+            }
+            manifest_file.write_text(json.dumps(manifest_entry) + "\n", encoding="utf-8")
+
+            return DummyDriver(
+                run_dir,
+                status="error",
+                detail="The read operation timed out",
+                options=options,
+            )
+
+        parser = build_pipeline_parser()
+        args = parser.parse_args([
+            "bench",
+            "--workspace", str(self.ws_dir),
+            "--goal", "LongGen Task",
+            "--arm", "C",
+            "--runs-root", str(self.runs_root),
+            "--output", str(output_file),
+            "--json",
+        ])
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdout", buf):
+            code = cmd_bench(args, driver_factory=fake_driver_factory)
+
+        self.assertEqual(code, 1)
+        data = json.loads(output_file.read_text(encoding="utf-8"))
+        self.assertFalse(data["resolved"])
+        self.assertEqual(data["score"], 0.0)  # Preserved as 0.0, not faked
+        self.assertTrue(data["partial"])
+        self.assertEqual(data["nodes_passed"], 1)
+        self.assertIsNotNone(data["artifact_path"])
+        self.assertTrue(Path(data["artifact_path"]).is_file())
+
+    def test_tier_measured_and_final_reading(self) -> None:
+        """PLAN-BENCH-INTEGRITY.md §2.3: tier_measured reads measured_tier/measured."""
+        output_file = Path(self.tmp_dir) / "tier_keys.json"
+
+        def fake_driver_factory(run_dir, provider, options, env):
+            from kusudaemon.pipeline.run_dir import tier_path
+            tier_path(run_dir).write_text(
+                json.dumps({"measured_tier": "T1", "tier": "T2", "tier_degraded": False}),
+                encoding="utf-8",
+            )
+            return DummyDriver(run_dir, status="done", options=options)
+
+        parser = build_pipeline_parser()
+        args = parser.parse_args([
+            "bench",
+            "--workspace", str(self.ws_dir),
+            "--goal", "Check tier keys",
+            "--arm", "C",
+            "--runs-root", str(self.runs_root),
+            "--output", str(output_file),
+            "--json",
+        ])
+        buf = io.StringIO()
+        with unittest.mock.patch("sys.stdout", buf):
+            code = cmd_bench(args, driver_factory=fake_driver_factory)
+
+        self.assertEqual(code, 0)
+        data = json.loads(output_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["tier_measured"], "T1")
+        self.assertEqual(data["tier_final"], "T2")
+
+    def test_select_tasks_exclude(self) -> None:
+        """Verify select_tasks properly excludes tasks like 300-block."""
+        sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+        from run_longgen_bench import select_tasks
+        data = [
+            {"type": "Week", "number": 52, "prompt": "p1"},
+            {"type": "Floor", "number": 100, "prompt": "p2"},
+            {"type": "Block", "number": 100, "prompt": "p3"},
+            {"type": "Menu Week", "number": 52, "prompt": "p4"},
+        ]
+        # Exclude by index and task_id
+        res = select_tasks(data, limit=4, indices=None, exclude_tasks=["002-block"], types=None, stratify=False)
+        self.assertEqual(len(res), 3)
+        self.assertEqual([i for i, _ in res], [0, 1, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

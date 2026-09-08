@@ -177,7 +177,7 @@ class WorkspaceFloorConstantTest(unittest.TestCase):
         from kusudaemon.pipeline import driver as driver_module
         from kusudaemon.v6 import tiering as tiering_module
 
-        self.assertEqual(PLAN_MIN_WORKSPACE_TOKENS, 2_000)
+        self.assertEqual(PLAN_MIN_WORKSPACE_TOKENS, 3_320)
         self.assertEqual(PLAN_MIN_WORKSPACE_TOKENS, tiering_module._T1_WORK_TOKENS_CEILING)
         self.assertIs(driver_module.PLAN_MIN_WORKSPACE_TOKENS, PLAN_MIN_WORKSPACE_TOKENS)
 

@@ -59,6 +59,17 @@ class ListDirTest(unittest.TestCase):
             with self.assertRaises(WorkspaceReadError):
                 list_dir(root, "a/b/../../../../etc")
 
+    def test_format_list_decorates_files_with_tokens(self) -> None:
+        from kusudaemon.adapters.tools.workspace_read import _format_list
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            _write(root / "hello.py", "x" * 400)
+            (root / "subdir").mkdir()
+            formatted = _format_list(".", ["hello.py", "subdir/"], root=root)
+            self.assertIn("hello.py (~100 tokens)", formatted)
+            self.assertIn("subdir/", formatted)
+            self.assertNotIn("subdir/ (~", formatted)
+
 
 class GrepTest(unittest.TestCase):
     def test_finds_matches_across_files_with_line_numbers(self) -> None:

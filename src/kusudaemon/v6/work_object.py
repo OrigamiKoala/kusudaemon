@@ -455,7 +455,7 @@ def is_empty_workspace_spine(units: list[Any]) -> bool:
 # than by accident. Kept in sync with tiering._T1_WORK_TOKENS_CEILING by
 # construction (same value, shared concept of "measured small"); the §R1
 # output-signal conjunction lives in _plan_will_partition, not here.
-PLAN_MIN_WORKSPACE_TOKENS = 2_000
+PLAN_MIN_WORKSPACE_TOKENS = 3_320
 
 
 def _chunk_by_token_ceiling(

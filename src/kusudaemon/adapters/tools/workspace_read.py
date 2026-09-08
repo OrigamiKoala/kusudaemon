@@ -152,11 +152,24 @@ def grep(root: Path, pattern: str, rel: str = ".") -> list[str]:
     return matches
 
 
-def _format_list(rel: str, entries: list[str]) -> str:
+def _format_list(rel: str, entries: list[str], root: Path | None = None) -> str:
     if not entries:
         return f"(empty) {rel}"
+    if root is None:
+        root = probe_root()
     lines = [f"Listing of {rel}:"]
-    lines.extend(f"  {entry}" for entry in entries)
+    for entry in entries:
+        token_str = ""
+        try:
+            target = _resolve_within_root(root, entry)
+            if target.is_file():
+                size = target.stat().st_size
+                tok = size // 4
+                if tok > 0:
+                    token_str = f" (~{tok:,} tokens)"
+        except Exception:
+            pass
+        lines.append(f"  {entry}{token_str}")
     return "\n".join(lines)
 
 
@@ -193,7 +206,7 @@ def execute_workspace_read(
     try:
         if action == "list":
             rel = rest or "."
-            yield Message("system", _format_list(rel, list_dir(root, rel)))
+            yield Message("system", _format_list(rel, list_dir(root, rel), root=root))
         elif action == "grep":
             pattern, _, rel = rest.partition(" ")
             rel = rel.strip() or "."

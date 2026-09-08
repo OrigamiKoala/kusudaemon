@@ -469,14 +469,60 @@ def build_tree(
             if input_path_for is not None
             else [unit.id for unit in slice_units]
         )
+        from ..tokens import expected_units_info, extract_unit_delimiter
+        import re
+
+        units_expected: int | None = None
+        units_source: str | None = None
+
+        m_range = re.search(
+            r"\b(?:floor|block|unit|item|problem|section|chapter|part)s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
+            candidate.brief,
+            re.IGNORECASE,
+        )
+        if m_range:
+            units_expected = int(m_range.group(2)) - int(m_range.group(1)) + 1
+            units_source = "declared"
+        else:
+            u_info, u_src = expected_units_info(candidate.brief)
+            if u_info is not None and u_info > 0:
+                units_expected = u_info
+                units_source = u_src
+            elif slice_units:
+                u_sum = sum(getattr(u, "units_expected", None) or 0 for u in slice_units)
+                if u_sum > 0:
+                    units_expected = u_sum
+                    units_source = "declared"
+
+        delimiter = extract_unit_delimiter(candidate.brief)
+        if not delimiter and slice_units:
+            for u in slice_units:
+                if getattr(u, "unit_delimiter", None):
+                    delimiter = u.unit_delimiter
+                    break
+
+        warn_gates: list[str] = []
+        if units_expected and units_expected > 0:
+            units_gate = f"units_min:{units_expected}@{delimiter}" if delimiter else f"units_min:{units_expected}"
+            if units_source == "declared":
+                gates.append(units_gate)
+            else:
+                warn_gates.append(units_gate)
+
         node = TaskNode(
             id=node_id,
             brief=candidate.brief,
             artifact=f"out/{node_id}.md",
             gates=gates,
+            warn_gates=warn_gates,
             shape=candidate.shape,
             inputs=inputs,
-            budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
+            budget=NodeBudget(
+                tokens=token_budget,
+                calls=tool_call_cap,
+                units_expected=units_expected,
+                unit_delimiter=delimiter,
+            ),
             depends_on=list(deps if deps is not None else (candidate.depends_on or [])),
         )
         # PLAN.md §C1: apply the shape's node-type template's gates /
@@ -493,9 +539,14 @@ def build_tree(
 
     def forced_leaf(slice_units: list[SpineUnit], node_id: str, reason: str) -> str | None:
         tokens = sum(unit.tokens for unit in slice_units)
+        brief = (
+            f"Produce the artifact for {slice_units[0].label}."
+            if reason == slice_units[0].label
+            else f"Produce the artifact for {slice_units[0].label} ({reason})."
+        )
         candidate = Candidate(
             id=node_id,
-            brief=f"Produce the artifact for {slice_units[0].label} ({reason}).",
+            brief=brief,
             shape="prose-dominant",
             unit_start=0,
             unit_end=len(slice_units) - 1,
@@ -519,6 +570,13 @@ def build_tree(
         if depth >= depth_cap:
             leaf_id = forced_leaf(slice_units, path or f"depth{depth}", "depth cap reached")
             return [leaf_id] if leaf_id else []
+        if all(getattr(u, "units_expected", None) is not None for u in slice_units):
+            leaves = []
+            for unit in slice_units:
+                leaf_id = forced_leaf([unit], f"{path}.{unit.id}" if path else unit.id, unit.label)
+                if leaf_id:
+                    leaves.append(leaf_id)
+            return leaves
         if code_tile_planner:
             if all(u.tokens >= token_budget for u in slice_units):
                 leaves = []

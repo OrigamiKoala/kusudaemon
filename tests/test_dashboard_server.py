@@ -219,7 +219,7 @@ class DashboardServerTest(_ServerTestCase):
         self.assertEqual(status, 200)
         self.assertIn("Cut every historical aside.", payload["text"])
         self.assertGreater(payload["tokens"], 0)
-        self.assertEqual(payload["ceiling"], 1500)
+        self.assertEqual(payload["ceiling"], 2500)
 
     def test_static_path_traversal_is_rejected(self) -> None:
         status, payload = self._get("/static/../server.py")

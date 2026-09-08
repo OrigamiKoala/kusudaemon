@@ -182,7 +182,7 @@ class PhaseRetryPolicyTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_transient_5xx_error_is_retried_and_capped_at_two_attempts(self) -> None:
+    def test_transient_5xx_error_is_retried_and_capped_at_four_attempts(self) -> None:
         import asyncio
 
         from kusudaemon.v1.provider import ProviderHTTPError
@@ -199,10 +199,8 @@ class PhaseRetryPolicyTest(unittest.TestCase):
                 driver._phase_classify = fake_classify  # type: ignore[method-assign]
                 report = await driver._run_phase("classify", round_index=0)
                 self.assertEqual(report.status, "error")
-                # Capped at 2 total attempts (the old code allowed 3) —
-                # a transient error that never clears still fails, just
-                # not after wasting a third call.
-                self.assertEqual(calls["n"], 2)
+                # PLAN-BENCH-INTEGRITY.md §3.4: Capped at 4 attempts
+                self.assertEqual(calls["n"], 4)
 
         asyncio.run(scenario())
 

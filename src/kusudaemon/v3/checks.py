@@ -41,9 +41,14 @@ class CheckResult:
     details: list[str] = field(default_factory=list)
 
 
+from ..v0.run_dir import node_artifact_path, node_artifact_text
+
+
 def _read_artifact(run_dir: Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (OSError, FileNotFoundError):
+        return ""
 
 
 def _read_manifest_by_node(manifest_path: Path) -> dict[str, dict[str, Any]]:
@@ -82,11 +87,14 @@ def check_artifacts_exist_and_nonempty(run_dir: str | Path, tree: TaskTree) -> C
     for node in tree.nodes.values():
         if node.status != "passed":
             continue
-        path = node_artifact_path(run_dir, node.id)
-        if not path.exists():
-            problems.append(f"{node.id}: artifact missing at {path}")
-        elif not path.read_text(encoding="utf-8").strip():
-            problems.append(f"{node.id}: artifact is empty")
+        try:
+            text = node_artifact_text(run_dir, node.id)
+            if not text.strip():
+                problems.append(f"{node.id}: artifact is empty")
+        except FileNotFoundError as exc:
+            problems.append(f"{node.id}: artifact missing at {exc}")
+        except OSError:
+            problems.append(f"{node.id}: artifact missing")
     return CheckResult(name="artifacts_exist_and_nonempty", passed=not problems, details=problems)
 
 

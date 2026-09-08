@@ -65,6 +65,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -506,14 +507,21 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
             inp = tokens.get("input", 0) or tokens.get("prompt_tokens", 0) or 0
             outp = tokens.get("output", 0) or tokens.get("completion_tokens", 0) or 0
             reas = tokens.get("reasoning", 0) or tokens.get("reasoning_tokens", 0) or 0
+            cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+            cache_read = cache.get("read", 0) or tokens.get("cache_read", 0) or tokens.get("cache_read_input_tokens", 0) or 0
+            cache_write = cache.get("write", 0) or tokens.get("cache_write", 0) or tokens.get("cache_creation_input_tokens", 0) or 0
+            tot = tokens.get("total") or tokens.get("total_tokens")
+            total_tokens = int(tot) if tot is not None and isinstance(tot, (int, float)) else (inp + outp + reas + cache_read + cache_write)
             return [
                 json.dumps(
                     {
                         "type": "usage",
-                        "prompt_tokens": inp,
+                        "prompt_tokens": inp + cache_read + cache_write,
                         "completion_tokens": outp,
                         "reasoning_tokens": reas,
-                        "total_tokens": inp + outp + reas,
+                        "cache_read_tokens": cache_read,
+                        "cache_write_tokens": cache_write,
+                        "total_tokens": total_tokens,
                     }
                 )
             ]
@@ -893,6 +901,28 @@ def _is_opencode_fatal_error(line: str) -> str | None:
     return None
 
 
+def _terminate_proc_group(proc: asyncio.subprocess.Process) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+
+
+def _kill_proc_group(proc: asyncio.subprocess.Process) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def _pump_stderr(
     proc: asyncio.subprocess.Process,
     fmt: str,
@@ -916,10 +946,7 @@ async def _pump_stderr(
             if err:
                 fatal_holder["error"] = err
                 fatal_event.set()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+                _terminate_proc_group(proc)
 
 
 async def _watch_opencode_log(
@@ -943,10 +970,7 @@ async def _watch_opencode_log(
                 if err:
                     fatal_holder["error"] = err
                     fatal_event.set()
-                    try:
-                        proc.terminate()
-                    except ProcessLookupError:
-                        pass
+                    _terminate_proc_group(proc)
                     break
     except Exception:
         pass
@@ -958,10 +982,7 @@ async def _fatal_killer(proc: asyncio.subprocess.Process, fatal_event: asyncio.E
         if proc.returncode is not None:
             return
         await asyncio.sleep(0.1)
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        pass
+    _kill_proc_group(proc)
 
 
 async def _run(fmt: str, command: list[str], session_dir: str) -> int:
@@ -993,6 +1014,7 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE if fmt == OPENCODE else None,
         limit=_MAX_LINE_BYTES,
+        start_new_session=True,
     )
 
     fatal_event = asyncio.Event()
@@ -1020,10 +1042,7 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
         try:
             await asyncio.wait_for(asyncio.shield(wait_proc), timeout=1.5)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_proc_group(proc)
             await wait_proc
         pump_task.cancel()
         if stderr_task:

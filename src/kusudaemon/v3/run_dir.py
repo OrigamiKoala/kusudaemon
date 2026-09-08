@@ -85,3 +85,103 @@ def versions_dir(run_dir: str | Path, node_id: str) -> Path:
 
 def version_snapshot_path(run_dir: str | Path, node_id: str, tag: str) -> Path:
     return versions_dir(run_dir, node_id) / f"{tag}.md"
+
+
+def _versions_dir_no_create(run_dir: str | Path, node_id: str) -> Path:
+    """Read-path variant of versions_dir without the mkdir side effect.
+
+    PLAN-SWEEP-REPAIR.md §A notes versions_dir creates its directory on every
+    call, which makes `if v_dir.is_dir()` guards vacuous and litters empty
+    .versions dirs on pure reads. Listing/restore paths use this instead."""
+    return Path(run_dir) / "out" / ".versions" / node_id
+
+
+def list_attempt_snapshots(run_dir: str | Path, node_id: str) -> list[Path]:
+    """Pre-writer snapshots for a node, oldest-first.
+
+    PLAN-SWEEP-REPAIR.md §B4 option (a): snapshots are either single files
+    (attempt_<ts>.md, the legacy single-file layout) or directories
+    (attempt_<ts>/, a copy of out/<node>/ part files). Only attempt_*
+    entries count — repair outputs (1~repair1.md) and pilot-original.md share
+    this directory but are not pre-writer state and must never feed the
+    shrink comparison. Sorted by mtime so [-1] is the latest prior state."""
+    v_dir = _versions_dir_no_create(run_dir, node_id)
+    if not v_dir.is_dir():
+        return []
+    snaps: list[Path] = []
+    try:
+        for p in v_dir.glob("attempt_*.md"):
+            if p.is_file():
+                snaps.append(p)
+        for p in v_dir.glob("attempt_*"):
+            if p.is_dir():
+                snaps.append(p)
+    except OSError:
+        return []
+    try:
+        snaps.sort(key=lambda p: p.stat().st_mtime)
+    except OSError:
+        pass
+    return snaps
+
+
+def read_attempt_snapshot_text(snap: Path) -> str:
+    """Resolved text of one snapshot, mirroring node_artifact_text's rules."""
+    if snap.is_dir():
+        md_files = [p for p in snap.glob("*.md") if p.is_file()]
+        if not md_files:
+            return ""
+        import re
+
+        def _part_sort_key(p: Path) -> tuple[int, str]:
+            nums = re.findall(r"\d+", p.name)
+            return (int(nums[0]) if nums else 0, p.name)
+
+        texts = []
+        for p in sorted(md_files, key=_part_sort_key):
+            try:
+                t = p.read_text(encoding="utf-8")
+                if t.strip():
+                    texts.append(t.rstrip())
+            except OSError:
+                pass
+        return "\n\n".join(texts) + "\n" if texts else ""
+    return snap.read_text(encoding="utf-8")
+
+
+def restore_attempt_snapshot(run_dir: str | Path, node_id: str, snap: Path) -> None:
+    """Restore a snapshot taken by _snapshot_pre_writer (option (a)).
+
+    Directory snapshots replace the current parts dir contents (the only
+    granularity at which a lost part can come back without overwriting good
+    parts with a stale concatenation); file snapshots replace the single
+    file. The non-restored layout is cleared so the resolved read
+    (parts-win in node_artifact_text) lands on the restored state instead of
+    shadowing it into a silent no-op — the exact failure §B4 removes."""
+    import contextlib
+    import shutil
+
+    from ..v0.run_dir import node_artifact_path, node_parts_dir, write_text_atomic
+
+    run_dir_p = Path(run_dir)
+    if snap.is_dir():
+        parts_d = node_parts_dir(run_dir_p, node_id)
+        parts_d.mkdir(parents=True, exist_ok=True)
+        for existing in list(parts_d.glob("*.md")):
+            with contextlib.suppress(OSError):
+                existing.unlink()
+        for src in sorted(snap.glob("*.md")):
+            if src.is_file():
+                shutil.copy2(src, parts_d / src.name)
+        # The single file is shadowed by any non-empty parts dir — remove it
+        # so the restored parts are what the next read resolves to.
+        with contextlib.suppress(OSError):
+            Path(node_artifact_path(run_dir_p, node_id)).unlink()
+    else:
+        text = snap.read_text(encoding="utf-8")
+        parts_d = node_parts_dir(run_dir_p, node_id)
+        if parts_d.is_dir():
+            for existing in list(parts_d.glob("*.md")):
+                with contextlib.suppress(OSError):
+                    existing.unlink()
+        write_text_atomic(node_artifact_path(run_dir_p, node_id), text)

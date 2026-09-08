@@ -97,14 +97,9 @@ def _count_words(text: str) -> int:
 
 
 def estimate_tokens(text: str) -> int:
-    """Whitespace-token heuristic (~1.33 tokens/word for English prose).
-
-    No tokenizer dependency in this repo (pyproject.toml: stdlib only plus
-    packaging/tomli) — this is an approximation, good enough for a budget
-    gate and the promotion cap, not for billing.
-    """
-    words = _count_words(text)
-    return int(words / 0.75) if words else 0
+    """PLAN-TOKEN-ACCOUNTING.md §A2/§A3: Token count estimation delegating to tokens.count_tokens."""
+    from ..tokens import count_tokens
+    return count_tokens(text)
 
 
 def _evaluate_one(gate: str, text: str) -> GateResult:
@@ -164,6 +159,39 @@ def _gate_contains(gate: str, arg: str, text: str) -> GateResult:
     return GateResult(gate=gate, passed=passed, detail=detail)
 
 
+def _gate_units_min(gate: str, arg: str, text: str) -> GateResult:
+    delim = ""
+    if "@" in arg:
+        arg_num, _, delim = arg.partition("@")
+    else:
+        arg_num = arg
+    try:
+        min_units = int(arg_num)
+    except ValueError:
+        return GateResult(gate=gate, passed=False, detail=f"malformed limit {arg!r}")
+
+    if delim:
+        # PLAN-TOKEN-ACCOUNTING.md §I3: delimiter-specific unit count
+        delim_pattern = re.compile(r"(?m)^\s*" + re.escape(delim))
+        matches = len(delim_pattern.findall(text))
+        if matches == 0:
+            matches = len(re.findall(re.escape(delim), text))
+    else:
+        # §I3: expanded nouns and arbitrary prefix delimiters (#*#, ===, ---, ##)
+        matches = len(
+            re.findall(
+                r"(?im)^(?:\#\*\#\s*|===+\s*|---+\s*|#{1,6}\s*)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+",
+                text,
+            )
+        )
+        if matches == 0:
+            matches = len(_MD_HEADING_RE.findall(text))
+
+    passed = matches >= min_units
+    detail = "" if passed else f"units_found:{matches} < units_expected:{min_units}"
+    return GateResult(gate=gate, passed=passed, detail=detail)
+
+
 # --- §C1: node-type template gates (ship at warn severity first) ------------
 
 # A markdown heading of any level, at the start of its line.
@@ -179,6 +207,10 @@ def _gate_headers_std(gate: str, arg: str, text: str) -> GateResult:
     (`arg` accepted but reserved for future policy shapes)."""
     headings = _MD_HEADING_RE.findall(text)
     if not headings:
+        # PLAN-TOKEN-ACCOUNTING.md §I5: pass vacuously when the artifact contains
+        # a consistent non-markdown delimiter (e.g. #*# Floor N:, ---, ===).
+        if re.search(r"(?m)^(?:\#\*\#|===+|---+)\s*", text):
+            return GateResult(gate=gate, passed=True, detail="vacuous pass: non-markdown delimiter present")
         return GateResult(gate=gate, passed=False, detail="no markdown headings found")
     levels: list[int] = []
     for line in headings:
@@ -448,6 +480,7 @@ _HANDLERS = {
     "len": _gate_len,
     "max_tokens": _gate_max_tokens,
     "contains": _gate_contains,
+    "units_min": _gate_units_min,
     # §C1 (warn severity first): node-type template gates — registered
     # here so they evaluate when present on `node.warn_gates`, but a
     # failure never blocks a node (``all_passed`` looks at `gates` only;

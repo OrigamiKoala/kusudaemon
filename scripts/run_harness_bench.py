@@ -41,6 +41,15 @@ from pathlib import Path
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from bench_common import (
+    check_identical_seeds,
+    classify_halt,
+    dedupe_records,
+    parse_flags,
+    read_records_jsonl,
+)
 
 HARNESS_BENCH_REPO = "https://github.com/Qihoo360/harness-bench"
 DEFAULT_BACKEND = "opencode"
@@ -255,6 +264,7 @@ def run_one(
     tier: str,
     extra_env: dict[str, str],
     verbose: bool,
+    max_parallel: int = 1,
 ) -> dict[str, Any]:
     task_id = task["task_id"]
     env = os.environ.copy()
@@ -267,6 +277,7 @@ def run_one(
         "KUSU_BENCH_BUDGET_TOKENS": "" if budget_tokens is None else str(budget_tokens),
         "KUSU_BENCH_MAX_ROUNDS": "" if max_rounds is None else str(max_rounds),
         "KUSU_BENCH_TIER": tier,
+        "KUSU_BENCH_MAX_PARALLEL": str(max_parallel),
         "KUSU_BENCH_NAME": "harness-bench",
         # kusudaemon resolves provider.json/.env from cwd; the wrapper runs
         # with cwd set to the task workspace, so pin both.
@@ -319,6 +330,9 @@ def run_one(
         "halt_reason": kusu.get("halt_reason"),
         "commit": kusu.get("commit", "unknown"),
         "rounds": kusu.get("rounds", 1),
+        "flags": dict(extra_env),
+        "max_parallel": kusu.get("max_parallel", max_parallel),
+        "max_parallel_derived": kusu.get("max_parallel_derived"),
         # HarnessBench's own view, kept verbatim so the score is auditable.
         "harness_bench": {
             "outcome_score": oracle.get("outcome_score"),
@@ -340,6 +354,11 @@ def run_one(
             or f"harnessbench produced no result JSON (exit {proc.returncode}): "
                f"{proc.stderr.strip()[-300:] or proc.stdout.strip()[-300:]}"
         )
+    halt_category = classify_halt(record.get("halt_reason"))
+    # PLAN-SWEEP-REPAIR.md §C2: "unknown" quarantined like transport/budget.
+    is_valid = halt_category not in ("transport", "budget", "unknown")
+    record["valid"] = is_valid
+    record["invalid_reason"] = halt_category if not is_valid else None
     return record
 
 
@@ -357,21 +376,36 @@ def _total_tokens(rec: dict[str, Any]) -> int:
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Per-arm aggregates: mean score, resolve rate, spend, cost per solve."""
+    """Per-arm aggregates: mean score, resolve rate, spend, cost per solve.
+    PLAN-BENCH-INTEGRITY.md §4.2: quarantine transport and budget halts.
+    PLAN-SWEEP-REPAIR.md §C2: "unknown" halts quarantined the same way."""
     by_arm: dict[str, list[dict[str, Any]]] = {}
     for r in records:
         by_arm.setdefault(r["arm"], []).append(r)
 
     arms: dict[str, Any] = {}
     for arm, recs in sorted(by_arm.items()):
-        n = len(recs)
-        scores = [float(r.get("score") or 0.0) for r in recs]
-        solved = sum(1 for r in recs if r.get("resolved"))
-        tokens = sum(_total_tokens(r) for r in recs)
+        total_runs = len(recs)
+        valid_recs = [
+            r for r in recs
+            if r.get("valid", True) and classify_halt(r.get("halt_reason")) not in ("transport", "budget", "unknown")
+        ]
+        invalid_recs = [r for r in recs if r not in valid_recs]
+        n = len(valid_recs)
+        scores = [float(r.get("score") or 0.0) for r in valid_recs]
+        solved = sum(1 for r in valid_recs if r.get("resolved"))
+        tokens = sum(_total_tokens(r) for r in valid_recs)
         mean = sum(scores) / n if n else 0.0
         var = sum((s - mean) ** 2 for s in scores) / n if n else 0.0
-        arms[arm] = {
-            "runs": n,
+
+        excluded_by_reason: dict[str, int] = {}
+        for r in invalid_recs:
+            reason = r.get("invalid_reason") or classify_halt(r.get("halt_reason"))
+            excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
+
+        arm_stats: dict[str, Any] = {
+            "runs": total_runs,
+            "valid_runs": n,
             "mean_score": round(mean, 4),
             "score_stdev": round(var ** 0.5, 4),
             "resolved": solved,
@@ -380,17 +414,33 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_tokens_per_run": round(tokens / n, 1) if n else 0.0,
             "tokens_per_solved_task": round(tokens / solved, 1) if solved else None,
             "mean_wall_clock_s": round(
-                sum(float(r.get("wall_clock_s") or 0) for r in recs) / n, 2
-            ) if n else 0.0,
+                sum(float(r.get("wall_clock_s") or 0) for r in recs) / total_runs, 2
+            ) if total_runs else 0.0,
             "halts": sum(1 for r in recs if r.get("halt_reason")),
+            "excluded": {
+                "total": len(invalid_recs),
+                "by_reason": excluded_by_reason,
+            },
         }
+        if total_runs > 0 and (len(invalid_recs) / total_runs) > 0.20:
+            arm_stats["excessive_exclusions"] = True
+            print(f"\n[WARNING] Arm {arm} has {len(invalid_recs)}/{total_runs} "
+                  f"({len(invalid_recs)/total_runs*100:.1f}%) excluded runs! Not a defensible result.",
+                  file=sys.stderr)
+        arms[arm] = arm_stats
 
     per_task: dict[str, Any] = {}
     for r in records:
         slot = per_task.setdefault(r["task_id"], {"class": r.get("task_class", ""), "arms": {}})
         slot["arms"].setdefault(r["arm"], []).append(round(float(r.get("score") or 0.0), 4))
 
-    return {
+    suspect = check_identical_seeds(
+        records,
+        key_field="task_id",
+        arm_field="arm",
+        size_extractor=lambda r: int(((r.get("harness_bench") or {}).get("elapsed_sec") or 0) * 100),
+    )
+    summary: dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "commit": next((r.get("commit") for r in records if r.get("commit")), "unknown"),
         "arms": arms,
@@ -401,6 +451,9 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "reading any delta as a harness effect."
         ),
     }
+    if suspect:
+        summary["suspect_identical_seeds"] = suspect
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -435,6 +488,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default=DEFAULT_BACKEND)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--tier", default="auto")
+    p.add_argument("--max-parallel", type=int, default=1,
+                   help="Arm C concurrency cap; 1 runs sequentially (default 1).")
     p.add_argument("--budget-tokens", type=int, default=None,
                    help="Optional per-task token ceiling. Unset by default: "
                         "HarnessBench imposes no token budget, and kusudaemon "
@@ -458,6 +513,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "RUBRIC_BASE_URL / RUBRIC_API_KEY / RUBRIC_MODEL.")
 
     p.add_argument("--results-dir", default=str(_REPO_ROOT / "bench_results"))
+    p.add_argument("--resume", action="store_true",
+                   help="Skip a cell whose bench record already exists.")
+    p.add_argument("--flags", default=None,
+                   help="Comma- or space-separated env flags to pass through (e.g. KUSUDAEMON_TIER_OUTPUT_SIGNALS=1).")
     p.add_argument("--drop-solved-by-a", action="store_true",
                    help="Skip a task in later arms if every arm-A seed solved it "
                         "(BENCHMARKING.md §0.4).")
@@ -542,6 +601,8 @@ def main() -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     extra_env: dict[str, str] = {}
+    if args.flags:
+        extra_env.update(parse_flags(args.flags))
     if args.skip_process_grade:
         extra_env["HARNESSBENCH_SKIP_PROCESS_GRADE"] = "1"
         extra_env["HARNESSBENCH_SKIP_ORACLE_QUALITY_LLM"] = "1"
@@ -568,25 +629,45 @@ def main() -> int:
                     continue
             for seed in args.seeds:
                 done += 1
+                out = results_dir / f"harness-bench_{tid}_arm{arm}_seed{seed}.json"
+                if args.resume and out.is_file() and not args.dry_run:
+                    print(f"  [{done}/{total}] {tid} arm={arm} seed={seed}: skipped (--resume)")
+                    continue
                 print(f"  [{done}/{total}] {tid} arm={arm} seed={seed} ...", flush=True)
                 rec = run_one(
                     bench_dir=bench_dir, bench_python=bench_python, task=task,
                     arm=arm, seed=seed, backend=args.backend, model=args.model,
                     budget_tokens=args.budget_tokens, max_rounds=args.max_rounds,
                     tier=args.tier, extra_env=extra_env, verbose=args.verbose,
+                    max_parallel=args.max_parallel,
                 )
                 records.append(rec)
                 if arm == "A":
                     solved_by_a.setdefault(tid, []).append(bool(rec["resolved"]))
-                out = results_dir / f"harness-bench_{tid}_arm{arm}_seed{seed}.json"
                 out.write_text(json.dumps(rec, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                with open(results_dir / "records.jsonl", "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 status = "resolved" if rec["resolved"] else (rec.get("halt_reason") or "unresolved")
                 print(f"      score={rec['score']:.3f} tokens={_total_tokens(rec)} "
                       f"{rec['wall_clock_s']}s -- {str(status)[:120]}")
 
-    (results_dir / "records.jsonl").write_text(
-        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
-    summary = summarize(records)
+    # PLAN-BENCH-INTEGRITY.md §4.1: Rebuild record list from disk before aggregating
+    # PLAN-SWEEP-REPAIR.md §C1: same shape as the longgen script — records.jsonl
+    # and the per-cell JSON files are append-only across sweeps, so filter to
+    # this invocation's selected tasks; rows for unselected tasks were never
+    # part of this matrix and would otherwise contaminate the summary.
+    disk_records: list[dict[str, Any]] = []
+    for f in sorted(results_dir.glob("harness-bench_*.json")):
+        try:
+            disk_records.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    selected_task_ids = {t.get("task_id") for t in tasks}
+    all_records = [
+        r for r in dedupe_records(read_records_jsonl(results_dir / "records.jsonl") + disk_records + records)
+        if r.get("task_id") in selected_task_ids
+    ]
+    summary = summarize(all_records)
     (results_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -595,7 +676,7 @@ def main() -> int:
         print(f"  arm {arm}: mean={agg['mean_score']:.3f} +/-{agg['score_stdev']:.3f}  "
               f"resolved {agg['resolved']}/{agg['runs']}  "
               f"tokens/run={agg['mean_tokens_per_run']}  halts={agg['halts']}")
-    print(f"\n{len(records)} records -> {results_dir}")
+    print(f"\n{len(all_records)} records -> {results_dir}")
     return 0
 
 

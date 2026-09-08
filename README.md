@@ -441,6 +441,8 @@ and each owns one question:
 | `PLAN-BENCH-INTEGRITY.md` | What the first sweeps found, which runs must be quarantined, and the repairs still open. |
 | `docs/PLAN-WORKSPACE-MODE.md` | Why arm C underperforms a bare backend on workspace tasks, and the flagged fixes for it. |
 | `PLAN-CONCURRENCY-AND-SHARED-STATE.md` | Parallelism, worktrees and rate-limit control — proposals with the case against each. Nothing there is decided. |
+| `PLAN-TOKEN-ACCOUNTING.md` | Token accounting and output-size accounting: the estimator replacement (§A–§C), prompt disclosure (§D–§F), and output-size decomposition, retry continuation and part files (§H–§O). |
+| `PLAN-SWEEP-REPAIR.md` | What must land before the next LongGenBench sweep, why the 2026-09-08 sweep produced no measurement, and what each step is verified to do. |
 | `docs/PLAN-REVIEW-LATENCY.md`, `docs/PLAN-REVIEW-LATENCY-STATUS.md` | Review-path latency work and its current status. |
 | `docs/TESTING.md`, `docs/TEST-PLAN.md` | **Archived.** Superseded by `BENCHMARKING.md`; kept for the historical record of the Phase 0/1 repairs and the original benchmark design notes. |
 

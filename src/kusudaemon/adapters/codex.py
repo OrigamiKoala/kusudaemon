@@ -36,6 +36,7 @@ import json
 import os
 import shlex
 import sys
+import warnings
 from pathlib import Path
 
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
@@ -177,6 +178,13 @@ def mcp_server_overrides(path: str) -> list[str]:
         try:
             import tomli as tomllib
         except ModuleNotFoundError:
+            warnings.warn(
+                "Neither 'tomllib' (Python 3.11+) nor 'tomli' is installed; "
+                f"ignoring configured Codex MCP servers from {path}. "
+                "Install tomli to enable Codex MCP servers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return []
     try:
         with open(path, "rb") as fh:

@@ -895,19 +895,25 @@ runtime state — local servers, git repositories, seeded secrets — which is w
 you run through HarnessBench's CLI rather than invoking `kusudaemon bench`
 against the task directory yourself.
 
-**Timeouts.** `timeout_sec` in `harness.yaml` (2400 s by default from
-`--harness-timeout-sec`) overrides the per-task value in `task.yaml`. A
-`subprocess.TimeoutExpired` inside the adapter propagates and aborts the run,
-and that is the one bound whose expiry is *not* graceful.
+**Timeouts and wall-clock budget.** `timeout_sec` in `harness.yaml` (2400 s by default from
+`--harness-timeout-sec`) overrides the per-task value in `task.yaml`. In LongGenBench,
+`--timeout-sec` defaults to 5400 s (matching 3 attempts × 1800 s episode box).
+To ensure clean termination with recorded outcomes rather than ungraceful external process kills,
+pass `--wall-clock-budget` into `kusudaemon bench` / `driver.py`. The driver clamps each
+node's episode box against the remaining wall-clock budget (`_budget_seconds`), and halts with
+a recorded reason if remaining wall-clock budget is exhausted.
 
-There is no token ceiling by default (see §3.10), so for a long arm-C run the
-things that can stop it are the round limit (100, kusudaemon's own default) and
-this wall-clock cap. Prefer to be stopped by the round limit: it ends the run
-cleanly with a recorded outcome, whereas a wall-clock expiry raises
-`TimeoutExpired` inside the adapter and loses the data point. So raise
-`--harness-timeout-sec` generously rather than trimming it, and if you want a
-guaranteed graceful stop, set `--budget-tokens` explicitly — a budget halt is a
-recorded outcome; a killed subprocess is not.
+Subprocess execution uses dedicated process groups (`start_new_session=True` with `killpg` on SIGTERM/SIGKILL)
+so background workers never leak across runs.
+
+**Flags pass-through and quarantine (PLAN-BENCH-INTEGRITY.md §4, §5).**
+Both `scripts/run_longgen_bench.py` and `scripts/run_harness_bench.py` support `--flags`
+(e.g. `--flags KUSUDAEMON_TIER_OUTPUT_SIGNALS=1,KUSUDAEMON_TIER_TRUST_SIGNALS=1`) to cleanly
+A/B test pipeline capabilities.
+Transport and provider errors (HTTP 404/429/5xx, rate limits, socket timeouts, billing/quota)
+are automatically classified and quarantined (`valid: false, invalid_reason: "transport"`) rather
+than scored as 0.0 model capability failures. `summarize()` excludes quarantined runs from
+performance aggregates and reports an `excluded` breakdown.
 
 **Wall clock is a first-class metric.** kusudaemon runs subagents strictly in
 series, so a wide decomposition can exhaust a wall-clock cap while spending
@@ -936,7 +942,8 @@ What still bounds every arm-C run:
 | Bound | Default | On expiry |
 |---|---|---|
 | Round limit (`--max-rounds`) | 100, kusudaemon's own default | clean stop, recorded outcome |
-| Wall clock (`--harness-timeout-sec`) | 2400 s | `TimeoutExpired`, run aborted, data point lost |
+| Wall clock (`--harness-timeout-sec`) | 2400 s (LongGenBench: 5400 s) | `TimeoutExpired`, process group killed, quarantined |
+| Pipeline wall budget (`--wall-clock-budget`) | **unset** | clean halt with recorded budget reason |
 | Token ceiling (`--budget-tokens`) | **unset** | clean halt, recorded outcome |
 
 Arm A has none of these except wall clock — it is the bare CLI, and
@@ -1650,12 +1657,12 @@ in §9.2, stop and fix that before spending model calls on a sweep.
    on an output-bound task at all.
 3. **The crash matrix covers `max_parallel=1` only.** That is the configuration
    documented as producing a byte-identical event sequence, and that determinism
-   is what makes the matrix tractable. Every number in `bench_results/` to date
-   was also produced at `max_parallel=1`. If
-   `PLAN-CONCURRENCY-AND-SHARED-STATE.md` §B1 raises the default, the matrix
-   either covers a configuration you no longer run or must cover a much larger
-   interleaving state space — decide which deliberately, and record the decision
-   here rather than discovering it from a flaky sweep.
+   is what makes the matrix tractable. `PLAN-CONCURRENCY-AND-SHARED-STATE.md` §B1
+   and §B8 widened auto-derivation to ready-set width clamped by available memory,
+   with optimistic git worktrees (§B4), jittered wave starts (§B7.4), and AIMD wave
+   throttling (§B7.3). The Layer 1 hermetic crash matrix remains anchored on
+   `max_parallel=1` to guarantee strict event sequence determinism, while parallel
+   waves guarantee optimistic file isolation and sequential trunk gate application.
 
 ### 9.3 The one experiment never run: does review earn its tokens?
 

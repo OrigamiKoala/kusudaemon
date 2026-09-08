@@ -134,7 +134,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
         phase: str = "unknown",
         node_id: str = "-",
         on_usage: Callable[[int, int, int], None] | None = None,
+        admission_controller: Any | None = None,
     ) -> None:
+        self.admission_controller = admission_controller
         resolved = resolve(provider=provider or "", api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
         if self.model and self.model.startswith("nvidia/nvidia/"):
@@ -222,14 +224,27 @@ class OpenAICompatibleProvider(RoleProviderBase):
             })
 
     def complete(
-        self, messages: list[dict[str, str]], *, temperature: float = 0.0
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
     ) -> ProviderResponse:
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "stream": False,
         }
+        effective_max = max_tokens
+        if effective_max is None and os.getenv("KUSUDAEMON_ROLE_MAX_TOKENS"):
+            try:
+                effective_max = int(os.environ["KUSUDAEMON_ROLE_MAX_TOKENS"])
+            except ValueError:
+                pass
+        if effective_max is not None:
+            payload["max_tokens"] = effective_max
+
         raw = self._call(payload)
         message = _first_choice_message(raw)
         content = message.get("content") or ""
@@ -249,6 +264,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         retries: int = _DEFAULT_STRUCTURED_RETRIES,
         on_reasoning: Callable[[str], None] | None = None,
         streaming: bool = False,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         base_messages: list[dict[str, str]] = list(messages)
         last_error = "empty response"
@@ -273,13 +289,35 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 *base_messages,
             ]
 
+        def _default_max_tokens(sch: dict[str, Any]) -> int:
+            props = sch.get("properties") or {}
+            if len(props) <= 4 and all(
+                isinstance(p, dict) and p.get("type") in ("string", "integer", "number", "boolean")
+                for p in props.values()
+            ):
+                return 1024
+            if "questions" in props or "objections" in props:
+                return 2048
+            return 4096
+
         def make_payload(with_format: bool) -> dict[str, Any]:
-            payload = {
+            payload: dict[str, Any] = {
                 "model": self.model,
                 "messages": make_messages(with_format),
                 "temperature": temperature,
                 "stream": streaming,
             }
+            effective_max_tokens = max_tokens
+            if effective_max_tokens is None and os.getenv("KUSUDAEMON_ROLE_MAX_TOKENS"):
+                try:
+                    effective_max_tokens = int(os.environ["KUSUDAEMON_ROLE_MAX_TOKENS"])
+                except ValueError:
+                    pass
+            if effective_max_tokens is None:
+                effective_max_tokens = _default_max_tokens(schema)
+            if effective_max_tokens:
+                payload["max_tokens"] = effective_max_tokens
+
             if streaming:
                 payload["stream_options"] = {"include_usage": True}
             if with_format:
@@ -376,6 +414,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
         switches = 0
         tried_models: set[str] = {self.model}
         while True:
+            if self.admission_controller is not None:
+                self.admission_controller.wait_sync()
             try:
                 with self._throttle:
                     if stream:
@@ -387,6 +427,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 if exc.status == 400 or (exc.status < 500 and exc.status != 429):
                     raise
                 if exc.status == 429:
+                    if self.admission_controller is not None:
+                        delay_hint = exc.retry_after if exc.retry_after is not None else RATE_LIMIT_BACKOFFS[min(attempt, len(RATE_LIMIT_BACKOFFS) - 1)]
+                        self.admission_controller.record_backoff(delay_hint)
                     # §G4: on the second 429 rung (attempt == 1), try a model fallback if configured
                     if attempt == 1 and switches < 4:
                         from ..provider_config import get_fallback_model, resolve as resolve_provider
@@ -451,17 +494,34 @@ class OpenAICompatibleProvider(RoleProviderBase):
     ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        # PLAN-SWEEP-REPAIR.md §F2: name the phase, role and elapsed time at
+        # the raise site so the next execute-phase halt is self-diagnosing
+        # ("error in execute: The read operation timed out" today names none
+        # of the three). Elapsed is measured around urlopen; the timeout value
+        # is included so a reader can tell a slow endpoint from a short fuse.
+        t0 = time.time()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            elapsed = time.time() - t0
             detail = exc.read().decode("utf-8", errors="replace")
             retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
             raise ProviderHTTPError(
-                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}", retry_after=retry_after
+                exc.code,
+                f"HTTP {exc.code} from provider"
+                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
+                retry_after=retry_after,
             ) from exc
-        except urllib.error.URLError as exc:
-            raise ProviderError(f"provider request failed: {exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            elapsed = time.time() - t0
+            reason = getattr(exc, "reason", exc)
+            raise ProviderError(
+                f"provider request failed"
+                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
+            ) from exc
 
 
     def _http_stream_transport(
@@ -481,18 +541,32 @@ class OpenAICompatibleProvider(RoleProviderBase):
         consumes, so validation/reprompt logic upstream is unchanged."""
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        # PLAN-SWEEP-REPAIR.md §F2: same phase/role/elapsed context as
+        # _http_transport for the streaming twin.
+        t0 = time.time()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 lines = (line.decode("utf-8", errors="replace").rstrip("\n") for line in response)
                 return _consume_sse_lines(lines, on_reasoning)
         except urllib.error.HTTPError as exc:
+            elapsed = time.time() - t0
             detail = exc.read().decode("utf-8", errors="replace")
             retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
             raise ProviderHTTPError(
-                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}", retry_after=retry_after
+                exc.code,
+                f"HTTP {exc.code} from provider"
+                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
+                retry_after=retry_after,
             ) from exc
-        except urllib.error.URLError as exc:
-            raise ProviderError(f"provider request failed: {exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            elapsed = time.time() - t0
+            reason = getattr(exc, "reason", exc)
+            raise ProviderError(
+                f"provider request failed"
+                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
+            ) from exc
 
 
 def _consume_sse_lines(

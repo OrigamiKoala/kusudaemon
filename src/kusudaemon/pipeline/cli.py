@@ -332,6 +332,18 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory or file path to copy final artifact to upon completion.",
     )
+    bench_parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=1,
+        help="Writer episodes dispatched concurrently per round (PLAN.md §C2).",
+    )
+    bench_parser.add_argument(
+        "--wall-clock-budget",
+        type=float,
+        default=None,
+        help="Ceiling for total wall-clock execution (seconds).",
+    )
     return parser
 
 
@@ -824,20 +836,71 @@ def _parse_opencode_usage(output: str) -> dict[str, int]:
             continue
         if not isinstance(rec, dict):
             continue
-        usage = rec.get("usage")
+        part = rec.get("part") if isinstance(rec.get("part"), dict) else {}
+        usage = rec.get("usage") or rec.get("token_usage") or part.get("usage") or part.get("token_usage")
+        tokens = rec.get("tokens") or part.get("tokens")
         if isinstance(usage, dict):
-            inp = usage.get("input_tokens", 0) or 0
-            outp = usage.get("output_tokens", 0) or 0
+            inp = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0
+            outp = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0
             prompt_tokens += inp
             completion_tokens += outp
-            total_tokens += (inp + outp)
-        elif rec.get("type") == "usage":
-            inp = rec.get("prompt_tokens", 0) or 0
-            outp = rec.get("completion_tokens", 0) or 0
+            total_tokens += usage.get("total_tokens", inp + outp) or (inp + outp)
+        elif isinstance(tokens, dict):
+            inp = tokens.get("input", 0) or tokens.get("prompt_tokens", 0) or tokens.get("input_tokens", 0) or 0
+            outp = tokens.get("output", 0) or tokens.get("completion_tokens", 0) or tokens.get("output_tokens", 0) or 0
+            reas = tokens.get("reasoning", 0) or tokens.get("reasoning_tokens", 0) or 0
+            prompt_tokens += inp
+            completion_tokens += outp + reas
+            total_tokens += tokens.get("total", inp + outp + reas) or (inp + outp + reas)
+        elif rec.get("type") in ("usage", "step-finish", "step_finish"):
+            inp = rec.get("prompt_tokens", 0) or rec.get("input_tokens", 0) or 0
+            outp = rec.get("completion_tokens", 0) or rec.get("output_tokens", 0) or 0
             prompt_tokens += inp
             completion_tokens += outp
             total_tokens += rec.get("total_tokens", inp + outp) or (inp + outp)
+
+    if total_tokens == 0:
+        import re
+        # Fallback for text logs
+        m_tot = re.search(r"total[ _]tokens?:\s*(\d+)", output, re.IGNORECASE)
+        if m_tot:
+            total_tokens = int(m_tot.group(1))
+        m_io = re.search(r"(\d+)\s*(?:prompt|input)\s*(?:tokens?)?.*?,?\s*(\d+)\s*(?:completion|output)\s*(?:tokens?)?", output, re.IGNORECASE)
+        if m_io:
+            prompt_tokens = int(m_io.group(1))
+            completion_tokens = int(m_io.group(2))
+        if total_tokens == 0 and (prompt_tokens > 0 or completion_tokens > 0):
+            total_tokens = prompt_tokens + completion_tokens
+        if total_tokens == 0:
+            m = re.search(r"\btokens?:\s*(\d+)", output, re.IGNORECASE)
+            if m:
+                total_tokens = int(m.group(1))
+
     return {"total": total_tokens, "prompt": prompt_tokens, "completion": completion_tokens}
+
+
+def _derive_termination(resolved: bool, halt_reason: str | None, tree: Any = None) -> str:
+    """PLAN-TOKEN-ACCOUNTING.md §M1: explicit termination enum."""
+    if resolved:
+        return "gates_satisfied"
+    low = (halt_reason or "").lower()
+    if "episode_timeout" in low or "episode wall clock" in low:
+        return "episode_timeout"
+    if "wall_clock_budget" in low or "timeout after" in low or "harness_timeout" in low or "timed out after" in low:
+        return "harness_timeout"
+    if any(k in low for k in ("429", "500", "502", "503", "504", "rate limit", "quota", "provider", "auth", "remoteprotocolerror", "connection")):
+        return "provider_error"
+    if tree is not None:
+        try:
+            if any(getattr(n, "status", None) == "blocked" for n in tree.nodes.values()):
+                return "attempts_exhausted"
+        except Exception:
+            pass
+    if "attempt" in low or "blocked" in low or "exhaust" in low:
+        return "attempts_exhausted"
+    if "timeout" in low or "timed out" in low:
+        return "harness_timeout"
+    return "attempts_exhausted"
 
 
 def cmd_bench(
@@ -1009,7 +1072,14 @@ def cmd_bench(
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                dest.write_text(res.stdout or "", encoding="utf-8")
+                raw_out = res.stdout or ""
+                dest_text = raw_out
+                if backend == "opencode":
+                    from ..adapters.trace_output import extract_visible_output
+                    clean = extract_visible_output(raw_out)
+                    if clean.strip():
+                        dest_text = clean
+                dest.write_text(dest_text, encoding="utf-8")
                 arm_a_artifact = str(dest)
             except OSError as exc:
                 print(f"could not write arm A artifact to {dest}: {exc}", file=sys.stderr)
@@ -1026,6 +1096,10 @@ def cmd_bench(
             "backend": backend,
             "score": 1.0 if resolved else 0.0,
             "resolved": resolved,
+            "termination": _derive_termination(resolved, halt_reason),
+            "token_unit": "tokenizer-v1",
+            "max_parallel": 1,
+            "max_parallel_derived": 1,
             "tier_measured": None,
             "tier_final": None,
             "escalations": [],
@@ -1079,6 +1153,24 @@ def cmd_bench(
         raw_tier = getattr(argv, "tier", "auto")
         tier_override = None if (raw_tier == "auto" or not raw_tier) else raw_tier
         disable_review = (arm == "B")
+        attended = bool(getattr(argv, "attended", False))
+
+        wall_clock_budget = getattr(argv, "wall_clock_budget", None)
+        max_attempts = getattr(argv, "max_attempts", 3)
+        from ..types import EpisodeBudget
+        max_duration_seconds = EpisodeBudget.max_duration_seconds
+        if wall_clock_budget is not None and max_attempts * max_duration_seconds >= wall_clock_budget:
+            headroom = min(300.0, float(wall_clock_budget) * 0.1)
+            clamped = int((float(wall_clock_budget) - headroom) / max(1, max_attempts))
+            if clamped < 60:
+                print(
+                    f"error: run configuration invalid: max_attempts ({max_attempts}) * "
+                    f"max_duration_seconds ({max_duration_seconds}s) >= wall_clock_budget ({wall_clock_budget}s), "
+                    f"and clamped episode duration {clamped}s is below 60s",
+                    file=sys.stderr,
+                )
+                return 1
+            EpisodeBudget.max_duration_seconds = clamped
 
         options = RunOptions(
             goal=goal,
@@ -1089,11 +1181,13 @@ def cmd_bench(
             source_text=source_text,
             workspace_root=str(ws_path),
             max_rounds=getattr(argv, "max_rounds", 100),
-            max_attempts=getattr(argv, "max_attempts", 3),
+            max_attempts=max_attempts,
             tier_override=tier_override,
             max_total_tokens=getattr(argv, "budget_tokens", None),
             disable_review=disable_review,
             output_dir=getattr(argv, "output_dir", None),
+            attended=attended,
+            wall_clock_budget=wall_clock_budget,
         )
 
         env = LocalEnvironment(tmp_dir=str(run_dir / "tmp"))
@@ -1163,12 +1257,14 @@ def cmd_bench(
 
         tier_measured = None
         tier_final = None
+        tier_degraded = False
         t_file = tier_path(run_dir)
         if t_file.is_file():
             try:
                 t_data = json.loads(t_file.read_text(encoding="utf-8"))
-                tier_measured = t_data.get("measured")
-                tier_final = t_data.get("final") or t_data.get("effective") or tier_measured
+                tier_measured = t_data.get("measured_tier") or t_data.get("measured")
+                tier_final = t_data.get("tier") or t_data.get("final") or t_data.get("effective") or tier_measured
+                tier_degraded = bool(t_data.get("tier_degraded", False))
             except Exception:
                 pass
 
@@ -1186,16 +1282,16 @@ def cmd_bench(
                 tokens_by_role[role] = tokens_by_role.get(role, 0) + t
 
         # The driver records where the assembled artifact landed on the
-        # run_completed event; surfacing it here means a Shape B sweep can
-        # collect generated text without reparsing the event log itself.
         artifact_path: str | None = None
+        max_parallel_req = int(getattr(argv, "max_parallel", 1) or 1)
+        max_parallel_der = max_parallel_req
         events_file = run_dir / "events.jsonl"
         if events_file.is_file():
             try:
                 with open(events_file, encoding="utf-8") as fh:
                     for line in fh:
                         line = line.strip()
-                        if not line or '"run_completed"' not in line:
+                        if not line:
                             continue
                         try:
                             ev = json.loads(line)
@@ -1203,8 +1299,104 @@ def cmd_bench(
                             continue
                         if ev.get("type") == "run_completed":
                             artifact_path = ev.get("export_path") or ev.get("artifact_path")
+                        elif ev.get("type") == "max_parallel_derived":
+                            max_parallel_der = int(ev.get("derived") or max_parallel_der)
             except OSError:
                 pass
+
+        # PLAN-BENCH-INTEGRITY.md §2.1: Manifest salvage when driver returns non-done
+        partial = False
+        nodes_passed = 0
+        nodes_total = 0
+        manifest_file = run_dir / "manifest.jsonl"
+        if manifest_file.is_file():
+            try:
+                from ..v1.manifest import read_all_manifest_entries
+                entries = read_all_manifest_entries(manifest_file)
+                passed_entries = [e for e in entries if e.get("gates") == "pass"]
+                nodes_passed = len(passed_entries)
+
+                t_path = tree_path(run_dir)
+                if t_path.is_file():
+                    try:
+                        nodes_total = len(TaskTree.load(t_path).nodes)
+                    except Exception:
+                        nodes_total = len(entries)
+                else:
+                    nodes_total = len(entries)
+
+                if not resolved and nodes_passed > 0:
+                    partial = True
+                    if not artifact_path:
+                        assembly_main = run_dir / "assembly" / "main.md"
+                        if assembly_main.is_file():
+                            artifact_path = str(assembly_main)
+                        elif passed_entries:
+                            cand = passed_entries[-1].get("artifact")
+                            if cand and Path(cand).is_file():
+                                artifact_path = str(cand)
+                        # PLAN-SWEEP-REPAIR.md §B5: per-node resolution before
+                        # the bare glob — a parts-compliant writer's artifact
+                        # lives in out/<node>/ and never matches *.md. The
+                        # resolved concatenation is materialized under
+                        # assembly/ (never back into out/<node>.md, which the
+                        # parts dir would shadow) so there is a real file to
+                        # copy to --output-dir below.
+                        if not artifact_path:
+                            try:
+                                from ..v0.run_dir import node_artifact_text
+                                for entry in passed_entries:
+                                    nid = entry.get("node")
+                                    if not nid:
+                                        continue
+                                    try:
+                                        text = node_artifact_text(run_dir, str(nid))
+                                    except (FileNotFoundError, OSError):
+                                        continue
+                                    if text.strip():
+                                        export_dir = run_dir / "assembly"
+                                        export_dir.mkdir(parents=True, exist_ok=True)
+                                        export_p = export_dir / f"salvage_{nid}.md"
+                                        export_p.write_text(text, encoding="utf-8")
+                                        artifact_path = str(export_p)
+                                        break
+                            except Exception:
+                                pass
+                        if not artifact_path:
+                            out_dir = run_dir / "out"
+                            if out_dir.is_dir():
+                                mds = sorted(out_dir.glob("*.md"))
+                                if mds:
+                                    artifact_path = str(mds[0])
+            except Exception:
+                pass
+
+        output_dir_arg = getattr(argv, "output_dir", None)
+        if output_dir_arg and artifact_path and Path(artifact_path).is_file():
+            try:
+                import shutil
+                target_p = Path(output_dir_arg)
+                if target_p.is_dir() or not target_p.suffix:
+                    target_p.mkdir(parents=True, exist_ok=True)
+                    dest = target_p / f"{run_dir.name}.md"
+                else:
+                    target_p.parent.mkdir(parents=True, exist_ok=True)
+                    dest = target_p
+                if dest.resolve() != Path(artifact_path).resolve():
+                    shutil.copy2(artifact_path, dest)
+                artifact_path = str(dest)
+            except Exception:
+                pass
+
+        loaded_tree_for_term = None
+        t_path = tree_path(run_dir)
+        if t_path.is_file():
+            try:
+                loaded_tree_for_term = TaskTree.load(t_path)
+            except Exception:
+                pass
+
+        termination = _derive_termination(resolved, halt_reason, loaded_tree_for_term)
 
         record = {
             "benchmark": benchmark,
@@ -1216,8 +1408,13 @@ def cmd_bench(
             "artifact_path": artifact_path,
             "score": score,
             "resolved": resolved,
+            "termination": termination,
+            "token_unit": "tokenizer-v1",
+            "max_parallel": max_parallel_req,
+            "max_parallel_derived": max_parallel_der,
             "tier_measured": tier_measured,
             "tier_final": tier_final,
+            "tier_degraded": tier_degraded,
             "escalations": escalations,
             "calls_by_role": calls_by_role,
             "tokens_by_role": tokens_by_role,
@@ -1225,6 +1422,9 @@ def cmd_bench(
             "halt_reason": halt_reason,
             "commit": commit,
             "attended": attended,
+            "partial": partial,
+            "nodes_passed": nodes_passed,
+            "nodes_total": nodes_total,
         }
 
     json_str = json.dumps(record, indent=2)

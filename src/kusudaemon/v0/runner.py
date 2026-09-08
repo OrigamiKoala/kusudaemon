@@ -37,6 +37,8 @@ _SESSION_POLL_INTERVAL_SECONDS = 0.05
 _REPLAY_INVALIDATING_TYPES = frozenset(
     {
         "node_gate_failed",           # round loop transitioned the node
+        "node_episode_timeout",       # round loop transitioned the node on timeout
+        "node_throttled",             # round loop transitioned the node on rate limit
         "node_review_failed",         # review consumed the completion
         "node_redispatch_requested",  # operator redispatch — new attempt series
         "node_reopened",              # operator direct reset — new attempt series
@@ -54,6 +56,65 @@ def _completion_consumed(
         if event.get("type") in _REPLAY_INVALIDATING_TYPES and (event.get("ts") or 0) > base:
             return True
     return False
+
+
+def _snapshot_pre_writer(run_dir: str | Path, node_id: str, max_keep: int = 3) -> Path | None:
+    """PLAN-TOKEN-ACCOUNTING.md §L5: Snapshot prior artifact to out/.versions/<node>/ before writer overwrite.
+
+    PLAN-SWEEP-REPAIR.md §B3/B4 option (a): snapshot the resolved artifact,
+    not the single file. When out/<node>/ holds part files, the snapshot is
+    a directory copy (out/.versions/<node>/attempt_<ts>/) so §L4 can restore
+    the parts layout instead of writing a concatenation into out/<node>.md
+    where the parts dir would shadow it into a silent no-op. Single-file
+    artifacts keep the legacy attempt_<ts>.md file snapshot."""
+    try:
+        from ..v3.run_dir import versions_dir
+        from .run_dir import node_artifact_text, node_parts_dir
+        try:
+            resolved = node_artifact_text(run_dir, node_id)
+        except (FileNotFoundError, OSError):
+            return None
+        if not resolved.strip():
+            return None
+        v_dir = versions_dir(run_dir, node_id)
+        import shutil
+        import time
+        ts = int(time.time() * 1000)
+        parts_d = node_parts_dir(run_dir, node_id)
+        part_files = (
+            [p for p in parts_d.glob("*.md") if p.is_file()]
+            if parts_d.is_dir()
+            else []
+        )
+        non_empty_parts = [p for p in part_files if p.stat().st_size > 0]
+        if non_empty_parts:
+            snap_p = v_dir / f"attempt_{ts}"
+            snap_p.mkdir(parents=True, exist_ok=True)
+            for src in non_empty_parts:
+                shutil.copy2(src, snap_p / src.name)
+        else:
+            from .run_dir import node_artifact_path
+            art_p = node_artifact_path(run_dir, node_id)
+            if not art_p.exists() or art_p.stat().st_size == 0:
+                return None
+            snap_p = v_dir / f"attempt_{ts}.md"
+            shutil.copy2(art_p, snap_p)
+        # Prune oldest attempt_* snapshots (files and directories) to max_keep.
+        try:
+            from ..v3.run_dir import list_attempt_snapshots
+            snaps = list_attempt_snapshots(run_dir, node_id)
+            if len(snaps) > max_keep:
+                for old in snaps[:-max_keep]:
+                    with contextlib.suppress(OSError):
+                        if old.is_dir():
+                            shutil.rmtree(old)
+                        else:
+                            old.unlink()
+        except Exception:
+            pass
+        return snap_p
+    except Exception:
+        return None
 
 
 def _continuation_prompt(
@@ -75,9 +136,19 @@ def _continuation_prompt(
     disk — a previous attempt may still have written to it.
     """
     try:
+        from .run_dir import node_artifact_path, node_artifact_text
         artifact = node_artifact_path(run_dir, node_id)
-        existing_bytes = artifact.stat().st_size if artifact.exists() else 0
-    except OSError:
+        try:
+            existing_text = node_artifact_text(run_dir, node_id)
+            existing_bytes = len(existing_text.encode("utf-8"))
+        except (FileNotFoundError, OSError):
+            existing_bytes = 0
+    except Exception:
+        try:
+            from .run_dir import node_artifact_path as _nap
+            artifact = _nap(run_dir, node_id)
+        except Exception:
+            artifact = Path(run_dir) / "out" / f"{node_id}.md"
         existing_bytes = 0
     if resume_session_id is not None:
         opening = (
@@ -321,6 +392,9 @@ async def run_node(
     if resume_session_id is not None:
         episode_kwargs["resume_session_id"] = resume_session_id
 
+    # PLAN-TOKEN-ACCOUNTING.md §L5: snapshot before writer overwrite
+    _snapshot_pre_writer(run_dir, node_id)
+
     episode_task = asyncio.create_task(adapter.run_episode(prompt, env, budget, **episode_kwargs))
 
     async def _watch_for_bypass() -> None:
@@ -369,7 +443,14 @@ async def run_node(
     # fact. Only fall back when the agent never actually wrote anything
     # (crash, or an adapter with no file tools that relies on "last message
     # becomes the artifact").
-    existing = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+    # PLAN-SWEEP-REPAIR.md §B: the artifact may live in out/<node>/ part
+    # files — resolve via node_artifact_text so a parts-compliant writer is
+    # never mistaken for an empty one here.
+    from .run_dir import node_artifact_text
+    try:
+        existing = node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        existing = ""
     if not existing.strip():
         if getattr(adapter, "has_file_tools", False):
             # PLAN.md §D0: an adapter that can write files (gptme) had every
@@ -377,6 +458,7 @@ async def run_node(
             # genuine failure, not raw log noise to paper over — write "" so
             # the `nonempty` gate fails cleanly instead of a chat sentence
             # (or a stray save-fence) masquerading as a passed node.
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_text("", encoding="utf-8")
         else:
             visible_output = result.metadata.get("assistant_visible_output") or ""

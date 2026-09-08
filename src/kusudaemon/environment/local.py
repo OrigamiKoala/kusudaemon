@@ -67,10 +67,31 @@ def _has_established_socket(pid: int) -> bool:
         return False
 
 
+_ENV_MUTATING_PATTERNS = (
+    "pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
+    "npm install", "npm i ", "npm uninstall", "npm ci",
+    "yarn add", "yarn remove", "yarn install",
+    "pnpm add", "pnpm install",
+    "apt-get", "apt ", "dpkg",
+    "brew install", "brew uninstall",
+    "docker ", "podman ",
+    "cargo install", "cargo add",
+    "go install", "go get",
+    "http.server",
+)
+
+
+def is_env_mutating_command(cmd: str) -> bool:
+    """PLAN-CONCURRENCY-AND-SHARED-STATE.md §B4: dynamic command inspection."""
+    low = cmd.lower()
+    return any(pat in low for pat in _ENV_MUTATING_PATTERNS)
+
+
 class LocalEnvironment:
-    def __init__(self, tmp_dir: str | None = None) -> None:
+    def __init__(self, tmp_dir: str | None = None, *, env_lock: asyncio.Lock | None = None) -> None:
         # Library usage falls back to user-scoped scratch storage.
         self._tmp_dir = Path(tmp_dir).expanduser() if tmp_dir else Path(DEFAULT_TMP_DIR)
+        self._env_lock = env_lock or asyncio.Lock()
 
     @property
     def staging_dir(self) -> Path:
@@ -78,6 +99,31 @@ class LocalEnvironment:
         return self._tmp_dir
 
     async def exec(
+        self,
+        command: str,
+        timeout: int = 300,
+        tee_path: str | None = None,
+        grace_period: int | None = None,
+        activity_window: float | None = None,
+    ) -> ExecResult:
+        if is_env_mutating_command(command):
+            async with self._env_lock:
+                return await self._exec_impl(
+                    command,
+                    timeout=timeout,
+                    tee_path=tee_path,
+                    grace_period=grace_period,
+                    activity_window=activity_window,
+                )
+        return await self._exec_impl(
+            command,
+            timeout=timeout,
+            tee_path=tee_path,
+            grace_period=grace_period,
+            activity_window=activity_window,
+        )
+
+    async def _exec_impl(
         self,
         command: str,
         timeout: int = 300,

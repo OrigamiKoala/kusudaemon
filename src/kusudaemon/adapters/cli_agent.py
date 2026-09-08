@@ -41,6 +41,7 @@ def extract_tokens_from_actions_log(
     prompt_tokens = 0
     completion_tokens = 0
     reasoning_tokens = 0
+    reported_total_tokens = 0
     cost_usd = 0.0
     has_usage = False
 
@@ -58,9 +59,12 @@ def extract_tokens_from_actions_log(
             pt = int(rec.get("prompt_tokens", 0) or 0)
             ct = int(rec.get("completion_tokens", 0) or 0)
             rt = int(rec.get("reasoning_tokens", 0) or 0)
+            tt = int(rec.get("total_tokens", 0) or 0)
             prompt_tokens += pt
             completion_tokens += ct
             reasoning_tokens += rt
+            if tt > 0:
+                reported_total_tokens += tt
             if rec.get("cost_usd") is not None:
                 try:
                     cost_usd += float(rec["cost_usd"])
@@ -80,7 +84,8 @@ def extract_tokens_from_actions_log(
         if out_text:
             completion_tokens = max(1, estimate_tokens(out_text))
 
-    total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
+    calc_total = prompt_tokens + completion_tokens + reasoning_tokens
+    total_tokens = max(calc_total, reported_total_tokens)
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -195,8 +200,15 @@ class CommandAgentAdapter:
         duration_ms = int((time.monotonic() - start) * 1000)
         if result.termination_reason == "timeout":
             status = "timeout"
+        elif result.exit_code != 0:
+            combined = (result.stderr or "") + "\n" + (result.stdout or "")
+            low = combined.lower()
+            if any(p in low for p in ("rate limit", "429", "too many requests", "quota exceeded", "ai_apicallerror")):
+                status = "throttled"
+            else:
+                status = "error"
         else:
-            status = "done" if result.exit_code == 0 else "error"
+            status = "done"
         stdout_log = result.stdout
         actions_log = stdout_log
         visible_output = (

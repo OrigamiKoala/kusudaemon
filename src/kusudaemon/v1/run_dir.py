@@ -16,6 +16,8 @@ from ..v0.run_dir import (  # noqa: F401 — re-exported for v1 callers
     events_path,
     manifest_path,
     node_artifact_path,
+    node_artifact_text,
+    node_parts_dir,
     node_scratch_dir,
     node_trace_path,
 )

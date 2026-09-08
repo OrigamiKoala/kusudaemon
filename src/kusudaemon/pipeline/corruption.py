@@ -73,10 +73,11 @@ def check_artifact_text_corruption(
 
 
 def is_artifact_corrupted(run_dir: str | Path, node: TaskNode) -> tuple[bool, str]:
-    """Read node artifact from disk and evaluate whether it is corrupted."""
-    artifact_path = Path(run_dir) / node.artifact
+    """Read node artifact from disk and evaluate whether it is corrupted.
+    PLAN-TOKEN-ACCOUNTING.md §O10b: evaluated on concatenated artifact, never per part."""
+    from ..v0.run_dir import node_artifact_text
     try:
-        text = artifact_path.read_text(encoding="utf-8")
+        text = node_artifact_text(run_dir, node)
     except OSError as err:
         return True, f"artifact missing or unreadable ({err})"
     except UnicodeDecodeError:

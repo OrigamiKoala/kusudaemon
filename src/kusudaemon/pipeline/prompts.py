@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +49,7 @@ from ..v2.contract import load_contract
 from ..v2.retrieval import DEFAULT_TOP_K, retrieve_spans, top_k_for_budget
 from ..v2.run_dir import contract_path
 from ..v2.survey import load_spine
+from ..tokens import count_file_tokens
 from .corruption import is_artifact_corrupted
 from .run_dir import resolve_stored
 
@@ -190,16 +192,14 @@ def _artifact_instruction(
             f"for the deliverables."
         )
     else:
+        parts_dir = run_dir / "out" / node.id
         instruction = (
             f"Write your artifact to `{absolute_path}` using your file tools "
             "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
-            "else you write or say is. When producing a long or multi-part document, write and save "
-            "your work incrementally in chunks (e.g. 10–20 sections at a time) rather than buffering "
-            "the entire text in a single massive call, so progress is saved to disk as you go. "
-            "You may freely edit, revise, or delete sections as the work requires — but preserve "
-            "finished sections you are not deliberately changing: before any whole-file overwrite, "
-            "read the current file and carry its existing content forward, so an interrupted run "
-            "never loses completed work."
+            "else you write or say is. When producing a long or multi-part document, you may "
+            f"write part files under `{parts_dir}` (e.g. `part-01.md`, `units-001-020.md`, etc.), "
+            "which will be concatenated in order, or write the single artifact directly. "
+            "You may freely edit, revise, or delete sections as the work requires."
         )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
         claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")
@@ -252,6 +252,76 @@ def _promotions_of(node: TaskNode, run_dir: Path) -> str:
         promotion = latest_by_node.get(dep_id)
         if promotion:
             lines.append(f"- [{dep_id}] {promotion}")
+    return "\n".join(lines)
+
+
+def _format_declared_inputs(node: TaskNode, run_dir: Path) -> str:
+    """PLAN-TOKEN-ACCOUNTING.md §D: manifest table of declared inputs with token counts
+    and ratios against leaf budget."""
+    if not node.inputs:
+        return ""
+    leaf_budget = (
+        node.budget.tokens
+        if (node.budget and node.budget.tokens and node.budget.tokens > 0)
+        else 30_000
+    )
+    lines = ["Declared inputs:"]
+    has_entries = False
+
+    for item in node.inputs:
+        p = resolve_stored(run_dir, item)
+        if not p.exists():
+            if (run_dir / item).exists():
+                p = run_dir / item
+            elif Path(item).exists():
+                p = Path(item)
+
+        rel_name = item
+        if p.is_dir():
+            files = [f for f in p.rglob("*") if f.is_file()]
+            n_files = len(files)
+            total_bytes = sum(f.stat().st_size for f in files)
+            total_tokens = sum(count_file_tokens(f) for f in files)
+            if total_bytes >= 1024 * 1024:
+                size_str = f"{total_bytes / (1024 * 1024):.1f} MB"
+            elif total_bytes >= 1024:
+                size_str = f"{total_bytes / 1024:.1f} KB"
+            else:
+                size_str = f"{total_bytes} B"
+            ratio_str = ""
+            if leaf_budget > 0 and total_tokens > 0:
+                ratio = total_tokens / leaf_budget
+                if ratio >= 1.0:
+                    ratio_str = f"   ({ratio:.1f}x your leaf budget)"
+                elif ratio >= 0.10:
+                    ratio_str = f"   ({int(round(ratio * 100))}% of your leaf budget)"
+            dir_label = rel_name if rel_name.endswith("/") else f"{rel_name}/"
+            lines.append(f"  {dir_label:<24} {n_files} files, {size_str}  ~{total_tokens:,} tokens{ratio_str}")
+            has_entries = True
+        elif p.is_file():
+            size_bytes = p.stat().st_size
+            tokens = count_file_tokens(p)
+            if size_bytes >= 1024 * 1024:
+                size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+            elif size_bytes >= 1024:
+                size_str = f"{size_bytes / 1024:.1f} KB"
+            else:
+                size_str = f"{size_bytes} B"
+            ratio_str = ""
+            if leaf_budget > 0 and tokens > 0:
+                ratio = tokens / leaf_budget
+                if ratio >= 1.0:
+                    ratio_str = f"   ({ratio:.1f}x your leaf budget)"
+                elif ratio >= 0.10:
+                    ratio_str = f"   ({int(round(ratio * 100))}% of your leaf budget)"
+            lines.append(f"  {rel_name:<24} {size_str:>8}  ~{tokens:,} tokens{ratio_str}")
+            has_entries = True
+        else:
+            continue
+
+    if not has_entries:
+        return ""
+    lines.append(f"Leaf budget: ~{leaf_budget:,} tokens.")
     return "\n".join(lines)
 
 
@@ -318,6 +388,16 @@ def segments(
         )
         add("judgment_rubric", f"Judgment rubric the Reviewer will hold you to:\n{rubric_lines}")
     add("brief", f"Your brief: {node.brief}")
+    manifest = _format_declared_inputs(node, run_dir)
+    if manifest:
+        add("declared_inputs", manifest)
+    if os.getenv("KUSUDAEMON_CONTEXT_DISCLOSURE") == "1":
+        leaf_budget = (
+            node.budget.tokens
+            if (node.budget and node.budget.tokens and node.budget.tokens > 0)
+            else 30_000
+        )
+        add("context_disclosure", f"Context window usage notice: leaf token budget is ~{leaf_budget:,} tokens.")
     if node.inputs:
         def _abs(item: str) -> str:
             return str(resolve_stored(run_dir, item))
@@ -378,10 +458,25 @@ def segments(
                 retry_cap = node.budget.tokens if node.budget and node.budget.tokens > 0 else DEFAULT_ARTIFACT_CAP_TOKENS
                 prior_artifact = _prior_attempt_artifact(node, run_dir, ceiling_tokens=retry_cap)
                 if prior_artifact is not None:
-                    retry_block += (
-                        "\n\nYour previous artifact (fix it in place, then save the "
-                        f"corrected version over it):\n\n{prior_artifact}"
-                    )
+                    _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
+                    units_found = len(_u_re.findall(prior_artifact))
+                    units_exp = node.budget.units_expected if node.budget else None
+                    if prior_artifact.startswith("[ARTIFACT EXCEEDS INLINE CAP:"):
+                        retry_block += (
+                            f"\n\n{prior_artifact}\n\n"
+                            "Do not rewrite earlier units. Open the file or parts on disk and append the remaining units."
+                        )
+                    elif units_found > 1 and units_exp and units_found < units_exp:
+                        # PLAN-TOKEN-ACCOUNTING.md §L1: append framing
+                        retry_block += (
+                            f"\n\nYour artifact currently contains units 1–{units_found} of {units_exp}. Do not rewrite them. "
+                            f"Append units {units_found + 1}–{units_exp} to the end of the file using your editing tools, then stop."
+                        )
+                    else:
+                        retry_block += (
+                            "\n\nYour previous artifact (fix it in place; update or append to it using your file tools):\n\n"
+                            f"{prior_artifact}"
+                        )
             add("retry", retry_block)
     return segs
 
@@ -434,17 +529,26 @@ def build_node_prompt(
 
 
 def _prior_attempt_artifact(node: TaskNode, run_dir: Path, ceiling_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS) -> str | None:
-    """A6-5: the failed attempt's artifact text (``out/<node>.md``), capped,
-    or None when there is nothing to inline (missing, or empty — an empty
-    file is an honest gate failure from the v0 runner's fallback, inlining
-    it would only invite a regenerate)."""
+    """PLAN-TOKEN-ACCOUNTING.md §L2 & §O5a: failed attempt's artifact text read via node_artifact_text.
+    Never inline a truncated artifact; return unit count and anchor instead."""
+    from ..v0.run_dir import node_artifact_text
     try:
-        text = (run_dir / node.artifact).read_text(encoding="utf-8")
+        text = node_artifact_text(run_dir, node)
     except OSError:
         return None
     if not text.strip():
         return None
-    return cap_artifact_text(text, ceiling_tokens)
+    if estimate_tokens(text) > ceiling_tokens:
+        _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
+        matches = list(_u_re.finditer(text))
+        units_found = len(matches)
+        resume_point = units_found + 1
+        anchor = text[matches[-1].start():].strip()[:300] if matches else text[-300:].strip()
+        return (
+            f"[ARTIFACT EXCEEDS INLINE CAP: {units_found} units currently on disk; "
+            f"resume at unit {resume_point}. Last unit anchor:\n{anchor}]"
+        )
+    return text
 
 
 def _non_unit_inputs(node: TaskNode, run_dir: Path) -> list[str]:

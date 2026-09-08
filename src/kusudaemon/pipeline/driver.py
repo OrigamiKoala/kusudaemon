@@ -159,9 +159,10 @@ _MIN_EPISODE_SECONDS = 300  # 5 minutes: a slow-but-correct node must not
 _MAX_EPISODE_SECONDS = 7_200  # 2 hours: past this the budget is pathological
 
 
-def _budget_seconds(node: TaskNode) -> int:
+def _budget_seconds(node: TaskNode, remaining_budget_s: float | None = None) -> int:
     """Wall-clock ceiling for one node's episode, proportional to
     ``node.budget.tokens`` with a floor and a ceiling (PLAN-zeromem.md §5.2c').
+    Clamped against remaining_budget_s if a wall-clock budget is active.
 
     ``NodeBudget.calls`` stays deliberately unwired: gptme has no lever that
     would enforce a tool-call limit, so inventing one here would be fake
@@ -170,7 +171,10 @@ def _budget_seconds(node: TaskNode) -> int:
     """
     tokens = node.budget.tokens or _REFERENCE_BUDGET_TOKENS
     seconds = round(tokens / _REFERENCE_BUDGET_TOKENS * _REFERENCE_DURATION_SECONDS)
-    return max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
+    bounded = max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
+    if remaining_budget_s is not None:
+        bounded = min(bounded, max(1, int(remaining_budget_s)))
+    return bounded
 
 
 @dataclass
@@ -259,6 +263,8 @@ class RunOptions:
     output_dir: str | Path | None = None
     direct_review: bool | None = None
     disable_node_review: bool = False
+    attended: bool = True
+    wall_clock_budget: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.research_plan, str):
@@ -306,6 +312,8 @@ class RunOptions:
             "capabilities": self.capabilities,
             "direct_review": self.direct_review,
             "disable_node_review": self.disable_node_review,
+            "attended": self.attended,
+            "wall_clock_budget": self.wall_clock_budget,
         }
         if ws_root:
             spec["workspace_root"] = ws_root
@@ -366,6 +374,8 @@ class RunOptions:
             output_dir=data.get("output_dir"),
             direct_review=data.get("direct_review"),
             disable_node_review=bool(data.get("disable_node_review", False)),
+            attended=bool(data.get("attended", True)),
+            wall_clock_budget=float(data["wall_clock_budget"]) if data.get("wall_clock_budget") is not None else None,
         )
 
 
@@ -429,7 +439,7 @@ def is_rate_limit_or_busy_error(exc: Exception | str) -> bool:
 # which stay exactly as they were: reported immediately, never
 # double-retried on top of the provider layer's own ladder — is reported on
 # the first occurrence.
-_PHASE_TRANSIENT_MAX_ATTEMPTS = 2
+_PHASE_TRANSIENT_MAX_ATTEMPTS = 4
 _PHASE_TRANSIENT_BASE_DELAY = 1.0
 _PHASE_TRANSIENT_MAX_DELAY = 30.0
 
@@ -546,6 +556,7 @@ class RecursiveDriver:
         # and liveness stops considering it active (phase.json is terminal
         # by then anyway).
         heartbeat = start_heartbeat_thread(self.run_dir)
+        self._start_time = time.time()
         try:
             report = await self._run_phase("classify", round_index=0)
             ran: set[str] = {"classify"}
@@ -786,6 +797,13 @@ class RecursiveDriver:
                 return True
         return False
 
+    def _remaining_budget_seconds(self) -> float | None:
+        """PLAN-BENCH-INTEGRITY.md §3.1: remaining wall-clock budget for this run."""
+        if self.options.wall_clock_budget is None:
+            return None
+        elapsed = time.time() - getattr(self, "_start_time", time.time())
+        return max(0.0, self.options.wall_clock_budget - elapsed)
+
     async def _run_phase(self, phase: str, *, round_index: int) -> RunReport:
         if self._phase_done(phase):
             return RunReport(status="done", phase=phase)
@@ -798,13 +816,21 @@ class RecursiveDriver:
             if self._check_cost_ceiling():
                 self._set_phase(phase, _HALTED, detail=f"halted on cost ceiling in {phase}")
                 return RunReport(status="halted", phase=phase, detail="halted on cost ceiling")
+            if self.options.wall_clock_budget is not None:
+                rem = self._remaining_budget_seconds()
+                if rem is not None and rem <= 0.0:
+                    self._set_phase(phase, _HALTED, detail=f"halted on wall clock budget in {phase}")
+                    halt_path(self.run_dir).write_text("wall clock budget exhausted", encoding="utf-8")
+                    return RunReport(status="halted", phase=phase, detail="wall clock budget exhausted")
             if self._halted():
                 self._set_phase(phase, _HALTED, detail=f"halted in {phase}")
                 return RunReport(status="halted", phase=phase, detail="halted by operator")
+            t_attempt_start = time.time()
             try:
                 outcome: Any = await getattr(self, f"_phase_{phase}")()
                 break
             except Exception as exc:  # noqa: BLE001 — the phase boundary is the reporter
+                call_duration = time.time() - t_attempt_start
                 # §E10: rate-limit/busy errors are never retried at this
                 # level — v1/provider.py's own ladder (§D11) already spent
                 # up to five hours on them before one could even reach here,
@@ -832,6 +858,7 @@ class RecursiveDriver:
                 # Transient (5xx / URLError / TimeoutError) with retry
                 # budget remaining — exponential backoff with jitter,
                 # capped at _PHASE_TRANSIENT_MAX_ATTEMPTS total attempts.
+                # PLAN-BENCH-INTEGRITY.md §3.4: backoff starts after observed call duration.
                 err_msg = str(exc)
                 self._set_phase(
                     phase,
@@ -849,8 +876,9 @@ class RecursiveDriver:
                         "error": err_msg,
                     }
                 )
+                base_delay = max(_PHASE_TRANSIENT_BASE_DELAY, min(call_duration, _PHASE_TRANSIENT_MAX_DELAY))
                 delay = min(
-                    _PHASE_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1)),
+                    base_delay * (2 ** (attempt - 1)),
                     _PHASE_TRANSIENT_MAX_DELAY,
                 )
                 await asyncio.sleep(delay * random.uniform(0.8, 1.2))
@@ -930,6 +958,7 @@ class RecursiveDriver:
         if not goal:
             raise ValueError("goal is required")
         signals = measure_signals(goal, work)
+        tier_degraded = False
         override = (self.options.tier_override or "").upper() or None
         intake_disabled = self.options.no_intake
         if override == "T3" or (override in ("T0", "T1") and intake_disabled) or (intake_disabled and signals.work_tokens >= 150_000):
@@ -956,7 +985,7 @@ class RecursiveDriver:
                         "role": "harness",
                         "round": 0,
                         "type": "scope_estimate_skipped",
-                        "reason": f"--tier {override} and --no-intake specified; scope estimate skipped",
+                        "reason": f"tier forced to {override} and --no-intake disables the intake trigger; the estimate call would buy nothing",
                     }
                 )
             elif intake_disabled and signals.work_tokens >= 150_000 and override != "T3":
@@ -985,8 +1014,10 @@ class RecursiveDriver:
                 )
             except Exception as exc:
                 # PLAN-WORKSPACE-MODE.md §K5, §R3: size-dependent fallback
+                # PLAN-BENCH-INTEGRITY.md §3.3: unattended runs degrade at every tier
                 is_small = _measured_small(signals, ScopeEstimate(files_touched="1", artifacts=1), goal=goal)
-                if is_small:
+                if is_small or not self.options.attended:
+                    tier_degraded = True
                     estimate = ScopeEstimate(
                         files_touched=_files_touched_from_signals(signals),
                         artifacts=1,
@@ -1000,6 +1031,7 @@ class RecursiveDriver:
                             "round": 0,
                             "type": "scope_estimate_degraded",
                             "reason": str(exc)[:200],
+                            "unattended": not self.options.attended,
                         }
                     )
                 else:
@@ -1097,6 +1129,7 @@ class RecursiveDriver:
             "needs_research": tier == "T3"
             and (bool(self.options.research_plan) or bool(self.options.auto_probe_plan)),
             "intake_round1": intake_round1 if question_set.questions or question_set.objections else None,
+            "tier_degraded": tier_degraded,
             "ts": time.time(),
         }
         write_text_atomic(
@@ -1349,7 +1382,33 @@ class RecursiveDriver:
             save_spine(self.run_dir, units)
             return
 
-        source = source_path(self.run_dir).read_text(encoding="utf-8").strip()
+        source = source_path(self.run_dir).read_text(encoding="utf-8").strip() if source_path(self.run_dir).is_file() else ""
+        if os.getenv("KUSUDAEMON_OUTPUT_SPINE", "0") == "1":
+            from ..v2.survey import synthesize_output_spine
+            from ..tokens import expected_units
+            goal_text = (self.options.goal or "").strip() or source
+            exp_u = expected_units(goal_text)
+            if exp_u and exp_u >= 8:
+                chunks, units = synthesize_output_spine(
+                    goal_text,
+                    token_budget=self.options.budget_tokens or 50_000,
+                )
+                if units:
+                    materialize_units(self.run_dir, chunks, units)
+                    build_chunk_index(self.run_dir, chunks, units)
+                    save_spine(self.run_dir, units)
+                    self._log(
+                        {
+                            "node_id": "-",
+                            "role": "harness",
+                            "round": 0,
+                            "type": "output_spine_synthesized",
+                            "phase": "survey",
+                            "detail": f"synthesized {len(units)} output units for declared target {exp_u}",
+                        }
+                    )
+                    return
+
         if not source:
             # PLAN.md §D4: this used to synthesize a single SpineUnit
             # labeled "The goal", which build_tree then turned into one
@@ -1806,7 +1865,7 @@ class RecursiveDriver:
                     self._prompt_for_node(node),
                     self.writer_adapter_factory(node),
                     self.env,
-                    EpisodeBudget(max_duration_seconds=_budget_seconds(node)),
+                    EpisodeBudget(max_duration_seconds=_budget_seconds(node, self._remaining_budget_seconds())),
                     self.log,
                 )
             else:
@@ -2068,8 +2127,11 @@ class RecursiveDriver:
         effective_max_parallel = self.options.max_parallel
         if effective_max_parallel == 1 and tier in ("T2", "T3"):
             loaded_tree = self._load_tree()
-            if loaded_tree.nodes and all(not node.depends_on for node in loaded_tree.nodes.values()):
-                derived_parallel = min(16, max(8, (os.cpu_count() or 1) * 2))
+            ready = loaded_tree.ready_nodes()
+            if len(ready) > 1:
+                from ..utils.system_resources import derive_memory_concurrency
+                mem_parallel = derive_memory_concurrency(hard_cap=16)
+                derived_parallel = min(16, len(ready), max(1, mem_parallel))
                 if derived_parallel > 1:
                     effective_max_parallel = derived_parallel
                     self._log(
@@ -2078,42 +2140,57 @@ class RecursiveDriver:
                             "role": "harness",
                             "round": 0,
                             "type": "max_parallel_derived",
-                            "detail": f"dependency-free tree derived max_parallel={effective_max_parallel}",
+                            "derived": effective_max_parallel,
+                            "detail": (
+                                f"ready-set width {len(ready)} derived max_parallel={effective_max_parallel} "
+                                f"(memory bounded)"
+                            ),
                         }
                     )
         reviewer_provider = self._role_provider("reviewer")
         triage_provider = self._role_provider("triage")
-        await run_round_loop(
-            self.run_dir,
-            tree_path(self.run_dir),
-            writer_adapter_factory=self.writer_adapter_factory,
-            env=self.env,
-            provider=self.provider,
-            reviewer_provider=reviewer_provider,
-            triage_provider=triage_provider,
-            review_sample_rate=self.options.review_sample_rate,
-            prompt_for_node=lambda node: self._prompt_for_node(
-                node, inline_spans=self.options.inline_spans
-            ),
-            writer_budget_for=lambda node: EpisodeBudget(
-                max_duration_seconds=_budget_seconds(node)
-            ),
-            max_rounds=self.options.max_rounds,
-            max_attempts=max_attempts,
-            dispatch_policy=self.options.dispatch_policy,
-            # PLAN.md §C2: a config, not a redesign — see RunOptions.
-            max_parallel=effective_max_parallel,
-            split_handler=handle_split_proposal if enable_split else None,
-            on_node_passed=maybe_derive_split_parent if enable_split else None,
-            # PLAN-AUDIT.md §E15: the exact same halt.flag check
-            # ``_run_phase``'s own phase-boundary halt already reads
-            # (``self._halted``) — not a second mechanism — so a halt
-            # requested mid-execute stops the round loop from starting new
-            # work instead of only taking effect at the next phase
-            # boundary.
-            should_halt=self._halted,
-            disable_review=self.options.disable_review or self.options.disable_node_review,
-        )
+        worktree_mgr = None
+        if effective_max_parallel > 1 and self.options.work_object and self.options.work_object.kind == "workspace":
+            from ..v1.worktree import WorktreeManager
+            worktree_mgr = WorktreeManager(self._writer_workspace_path(), runs_dir=self.run_dir)
+        admission_controller = getattr(self.provider, "admission_controller", None)
+        try:
+            await run_round_loop(
+                self.run_dir,
+                tree_path(self.run_dir),
+                writer_adapter_factory=self.writer_adapter_factory,
+                env=self.env,
+                provider=self.provider,
+                reviewer_provider=reviewer_provider,
+                triage_provider=triage_provider,
+                review_sample_rate=self.options.review_sample_rate,
+                prompt_for_node=lambda node: self._prompt_for_node(
+                    node, inline_spans=self.options.inline_spans
+                ),
+                writer_budget_for=lambda node: EpisodeBudget(
+                    max_duration_seconds=_budget_seconds(node, self._remaining_budget_seconds())
+                ),
+                max_rounds=self.options.max_rounds,
+                max_attempts=max_attempts,
+                dispatch_policy=self.options.dispatch_policy,
+                # PLAN.md §C2: a config, not a redesign — see RunOptions.
+                max_parallel=effective_max_parallel,
+                split_handler=handle_split_proposal if enable_split else None,
+                on_node_passed=maybe_derive_split_parent if enable_split else None,
+                # PLAN-AUDIT.md §E15: the exact same halt.flag check
+                # ``_run_phase``'s own phase-boundary halt already reads
+                # (``self._halted``) — not a second mechanism — so a halt
+                # requested mid-execute stops the round loop from starting new
+                # work instead of only taking effect at the next phase
+                # boundary.
+                should_halt=self._halted,
+                disable_review=self.options.disable_review or self.options.disable_node_review,
+                admission_controller=admission_controller,
+                worktree_manager=worktree_mgr,
+            )
+        finally:
+            if worktree_mgr is not None:
+                worktree_mgr.cleanup_all()
         tree = self._load_tree()
         if tier == "T1" and tree.is_blocked():
             node = tree.nodes.get(SINGLE_NODE_ID)

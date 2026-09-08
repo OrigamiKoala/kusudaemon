@@ -30,6 +30,14 @@ def extract_visible_output(raw: str | list[str] | tuple[str, ...]) -> str:
             content = event.get("message") or event.get("content")
             if isinstance(content, str) and content.strip():
                 last_assistant_text = content
+        elif event.get("type") == "text":
+            part = event.get("part") if isinstance(event.get("part"), dict) else {}
+            content = event.get("text") or event.get("content") or part.get("text")
+            if isinstance(content, str) and content.strip():
+                if last_assistant_text:
+                    last_assistant_text += "\n" + content
+                else:
+                    last_assistant_text = content
     return last_assistant_text
 
 

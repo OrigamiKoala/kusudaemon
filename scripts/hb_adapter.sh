@@ -35,6 +35,7 @@ SEED="${KUSU_BENCH_SEED:-1}"
 BUDGET_TOKENS="${KUSU_BENCH_BUDGET_TOKENS:-}"
 MAX_ROUNDS="${KUSU_BENCH_MAX_ROUNDS:-}"
 TIER="${KUSU_BENCH_TIER:-auto}"
+MAX_PARALLEL="${KUSU_BENCH_MAX_PARALLEL:-1}"
 BENCH_NAME="${KUSU_BENCH_NAME:-harness-bench}"
 SANDBOX="${HARNESSBENCH_SANDBOX:-$WORKSPACE/..}"
 
@@ -44,7 +45,7 @@ export KUSUDAEMON_PROVIDER_CONFIG="${KUSUDAEMON_PROVIDER_CONFIG:-$REPO_ROOT/prov
 export KUSUDAEMON_ENV_FILE="${KUSUDAEMON_ENV_FILE:-$REPO_ROOT/.env}"
 export KUSUDAEMON_NO_NOTIFY=1
 export KUSUDAEMON_OUTPUT_DIR="${KUSUDAEMON_OUTPUT_DIR:-$SANDBOX/kusudaemon-out}"
-export KUSUDAEMON_ROLE_TIMEOUT="${KUSUDAEMON_ROLE_TIMEOUT:-300}"
+export KUSUDAEMON_ROLE_TIMEOUT="${KUSUDAEMON_ROLE_TIMEOUT:-600}"
 export KUSUDAEMON_REVIEWER_TIMEOUT="${KUSUDAEMON_REVIEWER_TIMEOUT:-120}"
 
 # Optional: route role (orchestrator/planner/reviewer) traffic through
@@ -153,6 +154,9 @@ ARGS=(
 [ -n "$MODEL" ] && ARGS+=(--model "$MODEL")
 [ -n "$BUDGET_TOKENS" ] && ARGS+=(--budget-tokens "$BUDGET_TOKENS")
 [ -n "$MAX_ROUNDS" ] && ARGS+=(--max-rounds "$MAX_ROUNDS")
+if [ "$ARM" != "A" ] && [ -n "$MAX_PARALLEL" ] && [ "$MAX_PARALLEL" -gt 1 ]; then
+  ARGS+=(--max-parallel "$MAX_PARALLEL")
+fi
 
 # Run from the repo root so relative imports and defaults behave, but keep the
 # task workspace as the work root (passed explicitly above). PYTHONPATH beats a

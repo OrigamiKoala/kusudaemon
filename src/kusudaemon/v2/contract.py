@@ -31,7 +31,7 @@ from ..v0.run_dir import spec_path, write_text_atomic
 from ..v1.gates import estimate_tokens
 from .run_dir import contract_path
 
-DEFAULT_TOKEN_CEILING = 1500
+DEFAULT_TOKEN_CEILING = 2_500
 
 
 class ContractCeilingExceeded(RuntimeError):

@@ -17,18 +17,19 @@ from typing import Any
 
 from .gates import GateResult, estimate_tokens
 
-PROMOTION_TOKEN_CAP = 400
-
-
+PROMOTION_TOKEN_CAP = 660
+ 
+ 
 def cap_promotion(text: str, limit: int = PROMOTION_TOKEN_CAP) -> str:
     text = text.strip()
     if estimate_tokens(text) <= limit:
         return text
-    words = text.split()
-    # estimate_tokens uses words/0.75 tokens-per-word; invert it to size the
-    # truncation in words.
-    approx_word_limit = max(1, int(limit * 0.75))
-    return " ".join(words[:approx_word_limit]) + " …[truncated to fit promotion budget]"
+    # PLAN-TOKEN-ACCOUNTING.md §B: rewrite inverse against chars/4
+    char_limit = limit * 4
+    if len(text) > char_limit:
+        cut = text[:char_limit].rsplit(" ", 1)[0]
+        return cut + " …[truncated to fit promotion budget]"
+    return text + " …[truncated to fit promotion budget]"
 
 
 def append_manifest_line(

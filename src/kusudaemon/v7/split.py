@@ -209,6 +209,8 @@ def _measured_overrun(run_dir: Path, node: TaskNode) -> bool:
     split hint, so the two stay in agreement about what "overrun" means."""
     if is_size_defect(node.last_defect):
         return True
+    if node.budget.units_expected is not None and node.budget.units_expected >= 8:
+        return True
     joined = "\n".join(_resolved_text(run_dir, ref) for ref in node.inputs)
     return estimate_tokens(joined) > node.budget.tokens
 

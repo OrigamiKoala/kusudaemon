@@ -88,9 +88,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
+import sys
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
@@ -141,6 +144,7 @@ async def dispatch_node(
     log: EventLog,
     split_handler: SplitHandler | None = None,
     tree_lock: asyncio.Lock | None = None,
+    worktree_manager: Any | None = None,
 ) -> None:
     """One Writer episode + gate evaluation (hard + warn) + manifest line +
     status transition for a single node — ``run_round_loop``'s original
@@ -160,41 +164,75 @@ async def dispatch_node(
     ``list[str]`` evaluated alongside the first, recorded but never gating.
     """
     run_dir = Path(run_dir)
-    adapter = writer_adapter_factory(node)
-    result, promotion = await run_writer_node(
-        run_dir, node, prompt_for_node(node), adapter, env, budget
-    )
-    if split_handler is not None and split_handler(run_dir, node, tree, tree_path, log):
-        # A split.json existed and was fully evaluated (accepted-and-grafted
-        # or rejected-with-attempt-preserved) — module docstring. Either way
-        # this was not a "submit", so gates/manifest/the normal
-        # writer-failure transition never apply.
-        return
-    artifact_text = _read_artifact(run_dir, node.id)
-    gate_results = evaluate_gates(node.gates, artifact_text)
-    # §C1: warn-severity gates — evaluated alongside hard gates, recorded
-    # alongside them in the audit cache, but a failure does NOT block the
-    # node. ``all_passed`` (called below via ``_transition_after_writer``)
-    # looks at hard gates only; the warn results are recorded so the
-    # dashboard/manifest can surface them as a signal that the semantic
-    # bar `problems>=5` etc. is firing without flipping a passing run.
-    warn_results = evaluate_gates(list(node.warn_gates), artifact_text)
-    audit = ensure_audit_path(run_dir, node.id)
-    write_gate_cache(audit, [*gate_results, *warn_results])
-    append_manifest_line(
-        manifest,
-        node_id=node.id,
-        artifact_path=str(node_artifact_path(run_dir, node.id)),
-        artifact_text=artifact_text,
-        gate_results=gate_results,
-        promotion=promotion,
-        warn_results=warn_results,
-    )
-    await _transition_after_writer(
-        node, tree, tree_path, result.status == "done", gate_results, max_attempts, log,
-        tree_lock=tree_lock,
-        run_dir=run_dir,
-    )
+    wt_dir = None
+    if worktree_manager is not None:
+        try:
+            wt_dir = worktree_manager.create_worktree(node.id)
+        except Exception:
+            wt_dir = None
+    try:
+        adapter = writer_adapter_factory(node)
+        if wt_dir is not None and hasattr(adapter, "workspace_path"):
+            adapter.workspace_path = str(wt_dir)
+        result, promotion = await run_writer_node(
+            run_dir, node, prompt_for_node(node), adapter, env, budget
+        )
+        if split_handler is not None and split_handler(run_dir, node, tree, tree_path, log):
+            # A split.json existed and was fully evaluated (accepted-and-grafted
+            # or rejected-with-attempt-preserved) — module docstring. Either way
+            # this was not a "submit", so gates/manifest/the normal
+            # writer-failure transition never apply.
+            return
+
+        # PLAN-CONCURRENCY-AND-SHARED-STATE.md §B4: In worktree mode, compute patch and apply sequentially to trunk
+        if worktree_manager is not None and result.status == "done":
+            patch, modified_files = worktree_manager.compute_patch(node.id)
+            applied, conflict_err = worktree_manager.apply_patch_to_trunk(node.id, patch, modified_files)
+            if not applied:
+                conflict_cnt = worktree_manager.record_conflict(node.id)
+                node.last_defect = f"merge_conflict: {conflict_err}"
+                log.append(
+                    {
+                        "node_id": node.id,
+                        "role": "harness",
+                        "round": 0,
+                        "type": "merge_conflict",
+                        "conflict_count": conflict_cnt,
+                        "detail": conflict_err,
+                    }
+                )
+                node.status = "pending"
+                await _save_tree_locked(tree, tree_path, tree_lock)
+                return
+        artifact_text = _read_artifact(run_dir, node.id)
+        gate_results = evaluate_gates(node.gates, artifact_text)
+        # §C1: warn-severity gates — evaluated alongside hard gates, recorded
+        # alongside them in the audit cache, but a failure does NOT block the
+        # node. ``all_passed`` (called below via ``_transition_after_writer``)
+        # looks at hard gates only; the warn results are recorded so the
+        # dashboard/manifest can surface them as a signal that the semantic
+        # bar `problems>=5` etc. is firing without flipping a passing run.
+        warn_results = evaluate_gates(list(node.warn_gates), artifact_text)
+        audit = ensure_audit_path(run_dir, node.id)
+        write_gate_cache(audit, [*gate_results, *warn_results])
+        append_manifest_line(
+            manifest,
+            node_id=node.id,
+            artifact_path=str(node_artifact_path(run_dir, node.id)),
+            artifact_text=artifact_text,
+            gate_results=gate_results,
+            promotion=promotion,
+            warn_results=warn_results,
+        )
+        await _transition_after_writer(
+            node, tree, tree_path, result.status == "done", gate_results, max_attempts, log,
+            tree_lock=tree_lock,
+            run_dir=run_dir,
+            result_status=result.status,
+        )
+    finally:
+        if worktree_manager is not None and wt_dir is not None:
+            worktree_manager.remove_worktree(node.id)
 
 
 async def review_and_transition_node(
@@ -493,6 +531,8 @@ async def run_round_loop(
     review_sample_rate: float = 0.0,
     disable_review: bool = False,
     triage_provider: RoleProvider | None = None,
+    admission_controller: Any | None = None,
+    worktree_manager: Any | None = None,
 ) -> TaskTree:
     """Drive the Orchestrator/Writer/Reviewer round loop for ``tree.json``.
 
@@ -543,6 +583,12 @@ async def run_round_loop(
     log = EventLog(events_path(run_dir))
     manifest = manifest_path(run_dir)
     from ..pipeline.bypass import is_node_bypassed
+    from ..pipeline.admission import get_global_admission_controller
+    admission = (
+        admission_controller
+        if admission_controller is not None
+        else get_global_admission_controller(provider_concurrency or 4)
+    )
     default_budget = writer_budget or EpisodeBudget()
     tree_lock = asyncio.Lock()
     provider_sem = (
@@ -555,22 +601,34 @@ async def run_round_loop(
         return [nodes[i : i + max_parallel] for i in range(0, len(nodes), max_parallel)]
 
     async def dispatch(node: TaskNode) -> None:
-        budget = writer_budget_for(node) if writer_budget_for is not None else default_budget
-        await dispatch_node(
-            run_dir,
-            node,
-            tree,
-            tree_path,
-            writer_adapter_factory=writer_adapter_factory,
-            env=env,
-            prompt_for_node=prompt_for_node,
-            budget=budget,
-            manifest=manifest,
-            max_attempts=max_attempts,
-            log=log,
-            split_handler=split_handler,
-            tree_lock=tree_lock,
-        )
+        # §B7.4: Stagger wave starts with jitter to prevent thundering herd
+        raw_jitter = os.getenv("KUSUDAEMON_WAVE_JITTER")
+        jitter_ceiling = float(raw_jitter) if raw_jitter is not None else (0.0 if "unittest" in sys.modules else 1.5)
+        if max_parallel > 1 and jitter_ceiling > 0:
+            import random
+            await asyncio.sleep(random.uniform(0.0, jitter_ceiling))
+        # §B7.2: Acquire from shared admission controller
+        await admission.acquire_async()
+        try:
+            budget = writer_budget_for(node) if writer_budget_for is not None else default_budget
+            await dispatch_node(
+                run_dir,
+                node,
+                tree,
+                tree_path,
+                writer_adapter_factory=writer_adapter_factory,
+                env=env,
+                prompt_for_node=prompt_for_node,
+                budget=budget,
+                manifest=manifest,
+                max_attempts=max_attempts,
+                log=log,
+                split_handler=split_handler,
+                tree_lock=tree_lock,
+                worktree_manager=worktree_manager,
+            )
+        finally:
+            admission.release_async()
 
     rev_provider = reviewer_provider if reviewer_provider is not None else provider
 
@@ -616,12 +674,14 @@ async def run_round_loop(
     # numbers is free: this run's rounds are just pick up where the last
     # process left off.
     first_round = _next_round_index(run_dir)
+    max_ready_width = len(tree.ready_nodes())
     for offset in range(max_rounds):
         # §E15 (a): before the orchestrator's dispatch decision — a hit
         # here means no call is even made for a round that will never run.
         if should_halt is not None and should_halt():
             break
         _sync_tree_from_disk(tree, tree_path)
+        max_ready_width = max(max_ready_width, len(tree.ready_nodes()))
         round_index = first_round + offset
         decision = decide_next_action_with_policy(
             tree,
@@ -656,15 +716,24 @@ async def run_round_loop(
         # §C2 wave: the decided node first, then the next ready nodes in
         # tree order up to max_parallel — code-derived, zero extra model
         # calls, and stable under resume (the ready set is deterministic).
+        target_parallel = min(max_parallel, admission.current_wave_cap)
         wave = [tree.nodes[decision.node_id]]
-        if max_parallel > 1:
+        if target_parallel > 1:
             picked = {wave[0].id}
             for candidate_id in tree.ready_nodes():
                 if candidate_id in picked:
                     continue
+                # §B4: If candidate conflicted twice, it runs alone in its wave
+                if worktree_manager is not None and worktree_manager.conflict_count(candidate_id) >= 2:
+                    if len(wave) > 0:
+                        continue
+                # §B8.3: wave-fill hardware admission
+                from ..utils.system_resources import can_admit_episode
+                if not can_admit_episode():
+                    break
                 wave.append(tree.nodes[candidate_id])
                 picked.add(candidate_id)
-                if len(wave) >= max_parallel:
+                if len(wave) >= target_parallel:
                     break
             assert len({n.artifact for n in wave}) == len(wave), (
                 f"two in-flight nodes share an artifact path: "
@@ -692,6 +761,12 @@ async def run_round_loop(
             await asyncio.gather(*(dispatch(n) for n in chunk))
         for chunk in chunks([n for n in wave if n.status == "awaiting_review"]):
             await asyncio.gather(*(review(n) for n in chunk))
+
+        # §B7.3: AIMD adjustment on wave size
+        throttled_count = sum(1 for n in wave if "throttled" in (n.last_defect or ""))
+        admission.record_wave_outcome(throttled_count, max_parallel)
+        if throttled_count > 0:
+            await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
         # §11.10.5: a gate or review failure that still has attempts left is
         # a retry of the node the harness already knows it wants. Re-dispatch
         # in place instead of round-tripping the orchestrator for a call
@@ -719,12 +794,35 @@ async def run_round_loop(
                     if node.status == "awaiting_review":
                         await review(node)
 
+    if max_parallel > 1 and max_ready_width <= 1:
+        log.append(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "max_parallel_inert",
+                "phase": "execute",
+                "max_parallel": max_parallel,
+                "max_ready_width": max_ready_width,
+                "detail": (
+                    f"max_parallel={max_parallel} was configured, but ready set never exceeded width 1 "
+                    f"(max width observed: {max_ready_width})"
+                ),
+            }
+        )
+
     return tree
 
 
 def _read_artifact(run_dir: Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    """PLAN-SWEEP-REPAIR.md §B2: resolve via node_artifact_text so part files
+    under out/<node>/ and the single-file layout read identically. Gate
+    evaluation, the reviewer, and the shrink check all flow through here."""
+    from ..v0.run_dir import node_artifact_text
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 async def _transition_after_writer(
@@ -737,12 +835,80 @@ async def _transition_after_writer(
     log: EventLog,
     tree_lock: asyncio.Lock | None = None,
     run_dir: str | Path | None = None,
+    result_status: str | None = None,
 ) -> None:
     from ..pipeline.bypass import is_node_bypassed
 
     r_dir = run_dir or Path(tree_path).parent
     bypassed = is_node_bypassed(r_dir, node.id, "review") or is_node_bypassed(r_dir, node.id)
     gates_passed = all_passed(gate_results)
+
+    # PLAN-TOKEN-ACCOUNTING.md §O7 & §L4: artifact shrink check and accidental loss recovery
+    # PLAN-SWEEP-REPAIR.md §B2/B4 option (a): current text resolves via
+    # node_artifact_text (parts-aware); prior state comes from attempt_*
+    # snapshots (file or directory) — never a flattened write into the single
+    # file while a parts dir shadows it.
+    from ..v3.run_dir import list_attempt_snapshots, read_attempt_snapshot_text
+    from ..pipeline.corruption import is_artifact_corrupted
+    regressed_accidental = False
+    current_text = _read_artifact(r_dir, node.id)
+    current_bytes = len(current_text.encode("utf-8"))
+    _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
+    current_units = len(_u_re.findall(current_text))
+
+    snaps = list_attempt_snapshots(r_dir, node.id)
+    if snaps:
+        latest_snap = snaps[-1]
+        try:
+            prior_text = read_attempt_snapshot_text(latest_snap)
+            prior_bytes = len(prior_text.encode("utf-8"))
+            prior_units = len(_u_re.findall(prior_text))
+
+            if current_bytes < prior_bytes or (prior_units > 0 and current_units < prior_units):
+                corrupted, _ = is_artifact_corrupted(r_dir, node)
+                classification = "scoped"
+                if not current_text.strip() or corrupted:
+                    classification = "unscoped"
+                elif prior_units > 0 and current_units < prior_units:
+                    p_m = _u_re.search(prior_text)
+                    c_m = _u_re.search(current_text)
+                    if p_m and c_m and p_m.group(0).lower() != c_m.group(0).lower():
+                        classification = "unscoped"
+
+                log.append(
+                    {
+                        "node_id": node.id,
+                        "role": "harness",
+                        "round": 0,
+                        "type": "artifact_shrank",
+                        "classification": classification,
+                        "prior_bytes": prior_bytes,
+                        "current_bytes": current_bytes,
+                        "prior_units": prior_units,
+                        "current_units": current_units,
+                    }
+                )
+
+                # §L4: recover proven-accidental loss
+                # PLAN-SWEEP-REPAIR.md §B4 option (a): restore the snapshot
+                # at its own granularity (parts dir ↔ parts dir, file ↔
+                # file) so the restore is not shadowed into a no-op.
+                if classification == "unscoped" and not (episode_ok and (gates_passed or bypassed)):
+                    from ..v3.run_dir import restore_attempt_snapshot
+                    restore_attempt_snapshot(r_dir, node.id, latest_snap)
+                    log.append(
+                        {
+                            "node_id": node.id,
+                            "role": "harness",
+                            "round": 0,
+                            "type": "node_attempt_regressed",
+                            "reason": "accidental_loss_restored",
+                            "detail": f"restored from {latest_snap.name}",
+                        }
+                    )
+                    regressed_accidental = True
+        except Exception:
+            pass
 
     if episode_ok and (gates_passed or bypassed):
         node.status = "awaiting_review"
@@ -758,26 +924,77 @@ async def _transition_after_writer(
                     "unmet": [result.gate for result in gate_results if not result.passed],
                 }
             )
-    else:
-        node.attempts += 1
-        node.status = "blocked" if node.attempts >= max_attempts else "pending"
-        # PLAN-zeromem.md §9: carry the located failure forward so a retry's
-        # prompt differs from the first attempt's instead of resampling the
-        # same instructions blind.
-        node.last_defect = "; ".join(
-            f"{result.gate}: {result.detail}" for result in unmet(gate_results)
-        ) or "episode did not complete"
+    elif result_status == "throttled":
+        # PLAN-CONCURRENCY-AND-SHARED-STATE.md §B7.1: Throttling is classified as
+        # a non-attempt. Node returns to pending without incrementing attempts,
+        # recorded as a node_throttled event.
+        node.status = "pending"
+        node.last_defect = "throttled: rate limit / 429 from provider"
         log.append(
             {
                 "node_id": node.id,
                 "role": "harness",
                 "round": 0,
-                "type": "node_gate_failed",
+                "type": "node_throttled",
                 "attempts": node.attempts,
-                "episode_ok": episode_ok,
-                "unmet": [result.gate for result in gate_results if not result.passed],
+                "episode_ok": False,
+                "detail": "rate limit / 429 from provider",
             }
         )
+    elif regressed_accidental:
+        # §L4: Do not count proven-accidental loss against max_attempts
+        node.status = "pending"
+        node.last_defect = (
+            f"accidental loss restored: previous content ({prior_bytes}B) was lost; "
+            f"append to existing artifact (currently {prior_units} units) rather than restarting"
+        )
+    else:
+        node.attempts += 1
+        node.status = "blocked" if node.attempts >= max_attempts else "pending"
+        # PLAN-BENCH-INTEGRITY.md §2.4 & PLAN-TOKEN-ACCOUNTING.md §L3: artifact-relative timeout defect
+        if result_status == "timeout":
+            units_exp = node.budget.units_expected if node.budget else None
+            if units_exp and units_exp > 0:
+                node.last_defect = (
+                    f"episode_timeout: episode ended with {current_units} of {units_exp} units written; "
+                    f"resume at unit {current_units + 1}"
+                )
+            elif current_units > 0:
+                node.last_defect = (
+                    f"episode_timeout: episode ended with {current_units} units written; "
+                    f"resume at unit {current_units + 1}"
+                )
+            else:
+                node.last_defect = "episode_timeout: episode wall clock exceeded"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_episode_timeout",
+                    "attempts": node.attempts,
+                    "episode_ok": False,
+                    "detail": node.last_defect,
+                }
+            )
+        else:
+            # PLAN-zeromem.md §9: carry the located failure forward so a retry's
+            # prompt differs from the first attempt's instead of resampling the
+            # same instructions blind.
+            node.last_defect = "; ".join(
+                f"{result.gate}: {result.detail}" for result in unmet(gate_results)
+            ) or "episode did not complete"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_gate_failed",
+                    "attempts": node.attempts,
+                    "episode_ok": episode_ok,
+                    "unmet": [result.gate for result in gate_results if not result.passed],
+                }
+            )
     await _save_tree_locked(tree, tree_path, tree_lock)
 
 

@@ -83,7 +83,7 @@ _NUMERIC_WORDS = (
 _NUMERIC_TARGET_NOUNS = (
     "chapters?", "sections?", "parts?", "modules?", "files?", "words?",
     "pages?", "steps?", "items?", "tests?", "suites?", "benchmarks?",
-    "subtasks?", "components?", "deliverables?",
+    "subtasks?", "components?", "deliverables?", "entries?", "blocks?",
 )
 _NUMERIC_TARGET_RE = re.compile(
     r"\b(?:"
@@ -93,6 +93,32 @@ _NUMERIC_TARGET_RE = re.compile(
     + r")\b",
     re.IGNORECASE,
 )
+
+_TARGET_COUNT_RE = re.compile(
+    r"\b("
+    + "|".join(_NUMERIC_WORDS)
+    + r")\s+(?:per\s+\w+|"
+    + "|".join(_NUMERIC_TARGET_NOUNS)
+    + r")\b",
+    re.IGNORECASE,
+)
+
+_WORD_TO_NUM: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90, "hundred": 100, "thousand": 1000,
+}
+
+_PLAN_MIN_OUTPUT_UNITS = 8
+
+
+def _declared_target_count(goal: str) -> int:
+    """PLAN-BENCH-INTEGRITY.md §1.4 & PLAN-TOKEN-ACCOUNTING.md §I1: re-exported from tokens.expected_units."""
+    from ..tokens import expected_units
+    return expected_units(goal) or 0
 
 
 @dataclass(frozen=True)
@@ -386,7 +412,7 @@ def estimate_scope_full(
 # the writer never saw the corpus). A corpus that big falls through to T2,
 # where survey builds a spine and the planner partitions it.
 _T2_WORK_TOKENS_CEILING = 150_000
-_T1_WORK_TOKENS_CEILING = 2_000
+_T1_WORK_TOKENS_CEILING = 3_320
 _T1_WORK_FILES_CEILING = 8
 
 
@@ -416,8 +442,7 @@ def _files_touched_from_signals(signals: Signals) -> str:
     return "many"
 
 
-def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:
-    """PLAN.md §A4.3's table, first match wins."""
+def _classify_raw_inner(signals: Signals, estimate: ScopeEstimate) -> Tier:
     if (
         estimate.artifacts == 1
         and estimate.files_touched == "1"
@@ -436,6 +461,23 @@ def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:
     if estimate.artifacts <= 8 and signals.work_tokens < _T2_WORK_TOKENS_CEILING:
         return "T2"
     return "T3"
+
+
+def _classify_raw(signals: Signals, estimate: ScopeEstimate, goal: str = "") -> Tier:
+    """PLAN.md §A4.3's table, first match wins.
+
+    PLAN-BENCH-INTEGRITY.md §1.4a: A single output FILE is not a single unit of WORK.
+    When KUSUDAEMON_TIER_OUTPUT_SIGNALS is enabled, declared output targets >= 8
+    floor at T2 so recursive decomposition is exercised.
+    """
+    raw = _classify_raw_inner(signals, estimate)
+    if (
+        os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "0") == "1"
+        and signals.output_targets > 0
+        and _declared_target_count(goal) >= _PLAN_MIN_OUTPUT_UNITS
+    ):
+        return tier_max(raw, "T2")
+    return raw
 
 
 def classify(
@@ -471,7 +513,7 @@ def classify(
                 objections=estimate.objections,
                 work_kind=estimate.work_kind,
             )
-            tier = _classify_raw(signals, effective_estimate)
+            tier = _classify_raw(signals, effective_estimate, goal=goal)
             if on_event is not None:
                 on_event(
                     {
@@ -488,10 +530,10 @@ def classify(
                     }
                 )
             return _apply_work_kind_floor(tier, estimate, on_event)
-        tier = _classify_raw(signals, estimate)
+        tier = _classify_raw(signals, estimate, goal=goal)
         return _apply_work_kind_floor(tier_max(tier, "T2"), estimate, on_event)
 
-    return _apply_work_kind_floor(_classify_raw(signals, estimate), estimate, on_event)
+    return _apply_work_kind_floor(_classify_raw(signals, estimate, goal=goal), estimate, on_event)
 
 
 def _apply_work_kind_floor(

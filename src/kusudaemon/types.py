@@ -47,7 +47,7 @@ class EpisodeBudget:
 
 @dataclass
 class EpisodeResult:
-    status: Literal["done", "timeout", "error", "cancelled"]
+    status: Literal["done", "timeout", "error", "cancelled", "throttled"]
     actions_log: str = ""
     error: str | None = None
     duration_ms: int = 0

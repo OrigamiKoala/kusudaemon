@@ -144,6 +144,19 @@ def _read_resolved(run_dir: Path, ref: str) -> str:
         return ""
 
 
+def _should_offer_split(run_dir: Path, node: TaskNode) -> bool:
+    """PLAN-BENCH-INTEGRITY.md §1.4c: offer split.json when either inputs exceed
+    budget or output overrun / size defect holds."""
+    if _inputs_exceed_budget(run_dir, node):
+        return True
+    from ..v6.direct import is_size_defect
+    if is_size_defect(node.last_defect):
+        return True
+    if node.budget.units_expected is not None and node.budget.units_expected >= 8:
+        return True
+    return False
+
+
 async def run_writer_node(
     run_dir: str | Path,
     node: TaskNode,
@@ -163,7 +176,7 @@ async def run_writer_node(
     if promotion_path.exists():
         promotion_path.unlink()
 
-    split_hint_path = scratch_dir / "split.json" if _inputs_exceed_budget(run_dir, node) else None
+    split_hint_path = scratch_dir / "split.json" if _should_offer_split(run_dir, node) else None
     suppress_artifact_instruction = False
     if os.getenv("KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT") == "1" and node.id in ("single", "direct"):
         try:
