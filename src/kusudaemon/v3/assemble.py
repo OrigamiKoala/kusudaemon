@@ -20,6 +20,7 @@ compile gate is likewise opt-in, not assumed.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -94,6 +95,42 @@ def _read_artifact(run_dir: Path, node_id: str) -> str:
     return node_artifact_text(run_dir, node_id)
 
 
+# A leaf is handed the whole run goal, so when that goal asks for an
+# end-of-document marker ("when the design of all 100 floors is complete, use
+# '*** finished' to indicate the end of the document") a middle leaf can obey
+# it literally and end its own slice with one. Concatenated in order, that
+# marker then sits in the middle of the assembled document, where any consumer
+# that treats it as EOF silently drops everything after it. Measured on
+# ``100-floor_armC_seed1`` (2026-09-09): a complete 100-floor artifact scored
+# 75% because unit-03's sentinel hid unit-04.
+#
+# ``prompts.py::_leaf_scope_block`` tells writers not to emit these; this is
+# the harness-owned backstop for when one does anyway. Deliberately
+# conservative: it only fires on the FINAL line of a NON-FINAL part, and only
+# when that line is decoration plus a terminator word and nothing else, so it
+# cannot eat a sentence.
+_TERMINATOR_WORDS = r"finished|fin|the\s+end|end\s+of\s+(?:the\s+)?document|end|done|complete|completed"
+_INTERIOR_TERMINATOR_RE = re.compile(
+    r"(?:\n|\A)"                      # start of the final line
+    r"[\s*_\-=<>!\[\](){}#/]*"         # decoration: *** --- <!-- [ ( # …
+    r"(?:" + _TERMINATOR_WORDS + r")"
+    r"[\s*_\-=<>!\[\](){}#/.]*"        # trailing decoration, optional period
+    r"\Z",
+    re.IGNORECASE,
+)
+
+
+def strip_interior_terminator(text: str) -> str:
+    """Drop a document-end marker from the tail of a non-final slice.
+
+    Returns ``text`` unchanged when the tail is not a bare terminator line."""
+    stripped = text.rstrip()
+    match = _INTERIOR_TERMINATOR_RE.search(stripped)
+    if match is None:
+        return text
+    return stripped[: match.start()].rstrip() + "\n"
+
+
 def _default_render(node: TaskNode, text: str) -> str:
     return f"{DEFAULT_HEADING_LEVEL} {node.id}\n\n{text.strip()}\n"
 
@@ -113,7 +150,11 @@ def concatenate_artifacts(
     duplicating this join/render logic a second time."""
     run_dir = Path(run_dir)
     ids = node_ids if node_ids is not None else ordered_node_ids(tree)
-    parts = [render(tree.nodes[node_id], _read_artifact(run_dir, node_id)) for node_id in ids]
+    texts = [_read_artifact(run_dir, node_id) for node_id in ids]
+    # Every slice but the last: a terminator there is interior, and interior
+    # terminators truncate the document for whoever reads it next.
+    texts = [strip_interior_terminator(t) for t in texts[:-1]] + texts[-1:]
+    parts = [render(tree.nodes[node_id], text) for node_id, text in zip(ids, texts)]
     return "\n\n".join(part.rstrip() for part in parts).rstrip() + "\n"
 
 

@@ -298,15 +298,37 @@ function snapshotFingerprint(snap) {
 // recently dispatched one. Pure snapshot data — no trace fetch at all
 // (the old loadMainAgentThinking() re-parsed a multi-MB trace per tick
 // just to render this one id).
+function isPhaseAgent(s) {
+  if (!s) return false;
+  return s.kind === "phase" || String(s.id || "").startsWith("phase-");
+}
+
+// The MAIN FEED's target. Phase/harness agents only: a writer leaf's
+// prompt, reasoning and tool calls belong in that node's own Chat pane,
+// never in the run stream. The old writer fallbacks (`anyLiveSub` /
+// `anySub`) are what pulled a whole `unit-NN` episode into the main feed
+// during `execute`, where there is usually no `phase-execute` trace.
 function mainAgentId() {
   const snap = state.snapshot;
   if (!snap) return "";
   const subs = snap.subagents || [];
-  const livePhase = subs.find((s) => (s.kind === "phase" || String(s.id).startsWith("phase-")) && s.live);
+  const livePhase = subs.find((s) => isPhaseAgent(s) && s.live);
   if (livePhase) return livePhase.id;
-  const anyPhase = subs.find((s) => s.kind === "phase" || String(s.id).startsWith("phase-"));
+  const anyPhase = subs.find(isPhaseAgent);
   if (anyPhase) return anyPhase.id;
   if (snap.phase && snap.phase !== "execute") return `phase-${snap.phase}`;
+  return "";
+}
+
+// The header pill's target, which DOES want the live writer so the user can
+// see which leaf is running. Cosmetic only -- it renders an id, not a trace,
+// so it cannot leak subagent content into the feed.
+function headerPillAgentId() {
+  const snap = state.snapshot;
+  if (!snap) return "";
+  const fromFeed = mainAgentId();
+  if (fromFeed) return fromFeed;
+  const subs = snap.subagents || [];
   const anyLiveSub = subs.find((s) => s.live);
   if (anyLiveSub) return anyLiveSub.id;
   const anySub = subs[subs.length - 1];
@@ -330,8 +352,11 @@ function loadMainThinking() {
   const activeId = mainAgentId();
   const candidateIds = new Set();
   if (activeId) candidateIds.add(activeId);
+  // Phase/harness pseudo-agents only. `snap.subagents` also carries every
+  // writer/research/repair leaf (`_kind_of` in state.py), and adding those
+  // unconditionally is what put subagent reasoning in the main feed.
   for (const s of (snap.subagents || [])) {
-    if (s.id) candidateIds.add(s.id);
+    if (s.id && isPhaseAgent(s)) candidateIds.add(s.id);
   }
   if (snap.phase && snap.phase !== "execute") {
     candidateIds.add(`phase-${snap.phase}`);
@@ -347,9 +372,16 @@ function loadMainThinking() {
       agentId === activeId;
     if (!isLiveAgent && ag.loaded) continue;
 
+    // One request per agent at a time. `ag.next` only advances in .then(),
+    // so without this an overlapping poll (the /thinking route can exceed
+    // the 1.5s snapshot tick) issues a second fetch with the SAME `since`
+    // and appends the identical delta twice.
+    if (ag.inFlight) continue;
+    ag.inFlight = true;
     const since = ag.next || 0;
     apiGet(`/api/node/${encodeURIComponent(agentId)}/thinking?since=${since}`)
       .then((d) => {
+        ag.inFlight = false;
         ag.loaded = true;
         const fresh = d.entries || [];
         if (fresh.length) {
@@ -386,7 +418,9 @@ function loadMainThinking() {
           ag.next = d.next;
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        ag.inFlight = false;
+      });
   }
 }
 
@@ -710,7 +744,7 @@ function subagentLabel(e, defaultName = "Agent") {
   const name = e && (e.subagent_name || e.node_id || e.agent_id);
   if (name) return String(name);
   if (state.agentTab === "chat" && state.selectedNode) return String(state.selectedNode);
-  const active = mainAgentId();
+  const active = headerPillAgentId();
   if (active) return String(active);
   return defaultName;
 }
@@ -812,7 +846,13 @@ function renderThinkingChatEntry(e, key) {
   const userOpen = (key && state.thinkingOpen && state.thinkingOpen[key] !== undefined)
     ? state.thinkingOpen[key]
     : null;
-  const isOpen = userOpen !== null ? userOpen : !isLong;
+  // Reasoning is expanded by default; the reader collapses what they do
+  // not want. The old `!isLong` default collapsed anything over 250
+  // chars -- i.e. every substantive thought -- while leaving one-liners
+  // open, which is why the pane looked inconsistent. A user collapse is
+  // recorded in `state.thinkingOpen[key]` (see `ontoggle` below) and
+  // pinned across morphs by MORPH_OPTS.onBeforeElUpdated, so it sticks.
+  const isOpen = userOpen !== null ? userOpen : true;
   const cueText = isLong ? (isOpen ? "▾ collapse thought" : "▸ expand thought") : (isOpen ? "▾ thought" : "▸ thought");
   return el("div", { class: "stream-msg agent-chat-entry role-thinking thinking-card", ...(key ? { "data-key": key } : {}) }, [
     el("details", {
@@ -1677,7 +1717,7 @@ function renderCenterStream() {
     snap.has_contract ? el("span", { class: "hdr-pill" }, "📜 contract ✓") : null,
     snap.has_spec ? el("span", { class: "hdr-pill" }, "spec ✓") : null,
     snap.has_assembly ? el("span", { class: "hdr-pill" }, "assembly ✓") : null,
-    snap.phase_status === "in_progress" && mainAgentId() ? el("span", { class: "hdr-pill", style: "color:var(--accent-purple);" }, `🤖 ${mainAgentId()}…`) : null,
+    snap.phase_status === "in_progress" && headerPillAgentId() ? el("span", { class: "hdr-pill", style: "color:var(--accent-purple);" }, `🤖 ${headerPillAgentId()}…`) : null,
     (snap.total_tokens !== undefined && snap.total_tokens !== null) ? el("span", { class: "hdr-pill", style: "color:var(--accent-amber);", title: `Running token count: ${(snap.total_tokens || 0).toLocaleString()} tokens` }, `🪙 ${fmtTokens(snap.total_tokens)}`) : null,
     el("span", { class: "hdr-pill dim" }, `${snap.events_count || 0} events`),
   ]);

@@ -34,6 +34,8 @@ from typing import Any
 # prompts, '*** finished' in the others), so match the common prefix.
 BLOCK_SEP = "#*#"
 FINISHED_RE = re.compile(r"\*\*\*\s*finished\b.*", re.IGNORECASE | re.DOTALL)
+# Same sentinel without the DOTALL tail, so every occurrence is findable.
+FINISHED_ANCHOR_RE = re.compile(r"\*\*\*\s*finished\b", re.IGNORECASE)
 STARTED_RE = re.compile(r"^.*?\*\*\*\s*started\s*\*\*\*", re.DOTALL)
 
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -87,7 +89,31 @@ def to_output_blocks(raw_text: str, item: dict[str, Any]) -> list[str]:
         text = text[started.end():].lstrip()
 
     # The trailing sentinel is a stop marker, never part of a block.
-    text = FINISHED_RE.sub("", text).strip()
+    #
+    # Deviation from ``Evalution/eval.py``, applied identically to every arm
+    # (like the ``prefix`` deviation documented above): cut at the LAST
+    # sentinel, not the first. ``FINISHED_RE`` is ``.*`` under DOTALL, so the
+    # original ``sub`` deleted everything from the first match to EOF.
+    #
+    # For a single-pass generation there is exactly one sentinel and the two
+    # readings are identical. They diverge on a decomposed run: each leaf is
+    # handed the whole goal, including "when the design of all 100 floors is
+    # complete, use '*** finished'", so a middle leaf can obey it literally.
+    # Measured on ``100-floor_armC_seed1`` (2026-09-09): the assembled
+    # artifact holds all 100 floors, unit-03 ended its own slice with
+    # ``*** finished`` at line 157, and the first-match cut discarded
+    # unit-04 -- floors 76-100 -- scoring a complete document 75%.
+    #
+    # Content generated *after* a non-final sentinel is still generated
+    # content, so the last match is the more faithful answer to the question
+    # the metric asks. Harness-side fixes (a leaf-scope clause in the writer
+    # prompt, and an assembly-time strip of interior terminators) stop the
+    # stray sentinel being emitted at all; this keeps artifacts that already
+    # carry one scoreable.
+    anchors = list(FINISHED_ANCHOR_RE.finditer(text))
+    if anchors:
+        text = text[: anchors[-1].start()]
+    text = text.strip()
 
     blocks = text.split(BLOCK_SEP)
     type_ = str(item.get("type") or "")

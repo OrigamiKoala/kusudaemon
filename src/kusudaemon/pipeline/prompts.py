@@ -156,6 +156,47 @@ def _goal_and_rubric_block(run_dir: Path) -> str:
     return "\n\n".join(lines)
 
 
+def _leaf_scope_block(node: TaskNode) -> str:
+    """The sentence that says "you are one slice of a decomposed document".
+
+    Without it, a leaf is handed the *whole* run goal ("Ensure that the
+    document consists of 100 entries... When the design of all 100 floors is
+    complete, use '*** finished' to indicate the end of the document") and
+    then a brief naming 25 of them, with nothing reconciling the two. Two
+    measured consequences on the 2026-09-09 arm-C run:
+
+    1. The writer spent its entire first turn resolving the contradiction —
+       "So it seems like I need to produce a full 100-floor document, but the
+       assigned range is 51-75" — and later applied an out-of-range global
+       constraint inside its own slice.
+    2. Two leaves obeyed the end-of-document rule literally and ended their
+       own files with ``*** finished``. Assembly concatenates leaves in
+       order, so the *third* leaf's sentinel sat in the middle of the final
+       document, and LongGenBench's evaluator (which treats the first
+       sentinel as EOF) discarded the fourth leaf entirely: a complete
+       100/100-floor artifact scored 75%.
+
+    Document-level totals and terminators are the assembler's obligation, not
+    any single leaf's. Say so.
+    """
+    from ..v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID
+
+    if node.id in (SINGLE_NODE_ID, DIRECT_NODE_ID):
+        return ""
+    return (
+        "Scope of your leaf: the run goal above describes the WHOLE document, "
+        "which is being produced by several agents working on separate slices. "
+        "You own only the slice named in your brief. Other agents own the rest, "
+        "and you must not write their slices or leave placeholders for them.\n"
+        "Consequently, document-level instructions in the goal — a total number "
+        "of entries, an overall introduction or conclusion, and any "
+        "end-of-document marker or terminator the goal asks for — are the "
+        "harness's job when it assembles the slices. Do not emit them. Produce "
+        "your slice's content and stop; anything you add to mark the end of the "
+        "whole document will land in the middle of it."
+    )
+
+
 def _artifact_instruction(
     node: TaskNode,
     run_dir: Path,
@@ -194,12 +235,26 @@ def _artifact_instruction(
     else:
         parts_dir = run_dir / "out" / node.id
         instruction = (
-            f"Write your artifact to `{absolute_path}` using your file tools "
-            "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
-            "else you write or say is. When producing a long or multi-part document, you may "
-            f"write part files under `{parts_dir}` (e.g. `part-01.md`, `units-001-020.md`, etc.), "
-            "which will be concatenated in order, or write the single artifact directly. "
-            "You may freely edit, revise, or delete sections as the work requires.\n"
+            f"Write your artifact to `{absolute_path}` using your file tools. "
+            "That file is the deliverable; nothing else you write or say is.\n"
+            # PLAN-SWEEP-REPAIR.md §E1/§E2: every "do not rewrite" sentence in
+            # this harness used to live on a retry-only path (`_PATCH_RETRY_
+            # INSTRUCTION`, `runner.py`'s continuation framing), so a first
+            # attempt — the one that writes the whole 34 KB — was told nothing.
+            # Observed consequence: a writer fixed one duplicated heading by
+            # re-emitting the entire file ("Let me fix this by rewriting the
+            # file properly"), and fixed one stray brace in its handoff note by
+            # rewriting the note. State the rule on the first pass instead.
+            "Build the artifact incrementally: create it once, then extend it by "
+            "appending, and change what is already written with targeted edits. "
+            "Do not re-emit the whole file to change part of it — a whole-file "
+            "write over existing content risks losing finished work, and is a "
+            "defect rather than a fix. If an edit fails to match, re-read the "
+            "exact bytes on disk and retry a smaller, more distinctive edit.\n"
+            "For a long or multi-part document, prefer part files under "
+            f"`{parts_dir}` (e.g. `part-01.md`, `units-001-020.md`), which are "
+            "concatenated in order — each part is written once and never "
+            "rewritten, so no single write can carry more than one part.\n"
             "Use plain ASCII punctuation throughout — straight quotes (' and \"), "
             "hyphens, and \"...\" rather than curly quotes, en/em dashes or a single-"
             "character ellipsis. Your edit tool matches text exactly, and a "
@@ -368,6 +423,8 @@ def segments(
     goal_block = _goal_and_rubric_block(run_dir)
     if goal_block:
         add("goal_and_rubric", goal_block)
+        # Must follow the goal immediately: it exists to qualify it.
+        add("leaf_scope", _leaf_scope_block(node))
     contract = _load_contract_cached(run_dir).strip()
     if contract:
         add(

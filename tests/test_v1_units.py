@@ -23,6 +23,7 @@ from kusudaemon.v1.provider import (  # noqa: E402
     _consume_sse_lines,
 )
 from kusudaemon.v1.reviewer import (  # noqa: E402
+    ARTIFACT_LABEL,
     DEFAULT_ARTIFACT_CAP_TOKENS,
     cap_artifact_text,
     review_node,
@@ -1024,7 +1025,7 @@ class ReviewerInputCapTest(unittest.TestCase):
         self.assertTrue(verdict.truncated)
         user_content = provider.calls[0][0][1]["content"]
         self.assertIn("ARTIFACT TRUNCATED", user_content)
-        sent_artifact = user_content.split("Artifact:\n", 1)[1]
+        sent_artifact = user_content.split(f"{ARTIFACT_LABEL}:\n", 1)[1]
         self.assertLessEqual(estimate_tokens(sent_artifact), DEFAULT_ARTIFACT_CAP_TOKENS + 50)
 
     def test_small_artifact_passes_through_unmodified(self) -> None:

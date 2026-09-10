@@ -8,6 +8,7 @@ honor a capability.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -194,13 +195,69 @@ def translate_tools_to_claude_disallowed(
     return sorted(disallowed)
 
 
+# Read-only shell patterns granted to a role whose allowlist has no "shell".
+#
+# Why this exists. A `prose-dominant` leaf gets `tools=("read", "save")` from
+# `_PROSE`, which maps to OpenCode `read/glob/grep/edit/write` and a hard
+# `bash: deny`. On the 2026-09-09 arm-C run that cost a full episode: the
+# writer's `edit` calls kept failing to match because the file contained a
+# typographic apostrophe (U+2019) it could not reproduce, it reasoned "let me
+# use bash to inspect the exact bytes", the call came back as OpenCode's
+# synthetic `invalid` tool, and it then spent several turns counting braces by
+# eye before giving up and rewriting the whole file. Inspecting bytes is a
+# read-only act; denying it does not make the run safer, it makes the writer
+# reach for the destructive tool instead.
+#
+# LIMITATION, stated plainly: OpenCode matches these as globs against the
+# command string, and a glob cannot express "and no shell metacharacters
+# follow". `cat x && rm -rf y` matches `cat *`. This raises a writer from
+# "can write files" to "can run commands", which is a real escalation even
+# though `write`/`edit` already let it damage the workspace. It is a
+# usability/latency fix, not a sandbox. Set KUSUDAEMON_WRITER_READONLY_BASH=0
+# to restore the hard deny.
+READONLY_BASH_PATTERNS: tuple[str, ...] = (
+    "cat *",
+    "head *",
+    "tail *",
+    "wc *",
+    "ls *",
+    "file *",
+    "stat *",
+    "grep *",
+    "rg *",
+    "diff *",
+    "od *",
+    "xxd *",
+    "hexdump *",
+    "sed -n *",
+    "jq *",
+    "python3 -m json.tool *",
+    "python -m json.tool *",
+)
+
+
+def readonly_bash_permission() -> dict[str, str]:
+    """`{pattern: action}` allowing inspection commands and denying the rest.
+
+    `*` is listed last as the catch-all deny."""
+    perms = {pattern: "allow" for pattern in READONLY_BASH_PATTERNS}
+    perms["*"] = "deny"
+    return perms
+
+
 def translate_tools_to_opencode_permissions(
     allowed_tools: tuple[str, ...],
     *,
     include_web_search: bool = False,
     hidden_paths: tuple[str, ...] = (),
+    readonly_bash: bool = False,
 ) -> dict[str, Any]:
-    """Translate canonical allowlist into OpenCode permissions configuration."""
+    """Translate canonical allowlist into OpenCode permissions configuration.
+
+    ``readonly_bash`` softens a `bash` denial into READONLY_BASH_PATTERNS.
+    Opt-in per call site, and currently only the writer opts in: a research
+    probe summarises what it reads and has no reason to run commands, so
+    widening it there would be scope it never asked for."""
     allowed_opencode: set[str] = set()
     for tool in allowed_tools:
         mapped = CANONICAL_TO_OPENCODE.get(tool)
@@ -209,7 +266,7 @@ def translate_tools_to_opencode_permissions(
     if include_web_search:
         allowed_opencode.update({"web_search", "websearch", "webfetch"})
 
-    perms: dict[str, str] = {}
+    perms: dict[str, Any] = {}
     all_known = (
         "read",
         "edit",
@@ -223,9 +280,14 @@ def translate_tools_to_opencode_permissions(
         "grep",
         "question",
     )
+    allow_readonly_bash = readonly_bash and os.getenv("KUSUDAEMON_WRITER_READONLY_BASH", "1") != "0"
     for k in all_known:
         if k in allowed_opencode:
             perms[k] = "allow"
+        elif k == "bash" and allow_readonly_bash:
+            # Not a blanket grant: inspection commands only, everything else
+            # denied. See READONLY_BASH_PATTERNS for the rationale and limits.
+            perms[k] = readonly_bash_permission()
         else:
             perms[k] = "deny"
     if not allowed_tools and not include_web_search:

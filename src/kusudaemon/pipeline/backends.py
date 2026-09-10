@@ -328,7 +328,14 @@ def build_writer_adapter(
                 "OpenCode does not support context window restriction",
             )
         resolved_mcp = mcp_config or (str(settings.extra.get("mcp_config")) if settings.extra.get("mcp_config") else None)
-        perms = translate_tools_to_opencode_permissions(all_writer_tools, include_web_search=True, hidden_paths=hidden)
+        perms = translate_tools_to_opencode_permissions(
+            all_writer_tools,
+            include_web_search=True,
+            hidden_paths=hidden,
+            # A writer that cannot inspect bytes reaches for the
+            # destructive tool instead -- see READONLY_BASH_PATTERNS.
+            readonly_bash=True,
+        )
         if isinstance(settings.extra.get("permissions"), dict):
             perms.update(settings.extra["permissions"])  # type: ignore[arg-type]
         return OpenCodeAdapter(
