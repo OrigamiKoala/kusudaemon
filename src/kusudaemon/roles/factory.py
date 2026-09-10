@@ -177,9 +177,11 @@ def make_role_provider(
     backend: str | None = None,
     on_backoff: Callable[[int, float], None] | None = None,
     timeout: float | None = None,
+    http_timeout: float | None = None,
     lazy: bool = False,
     provider_cls: Any = None,
     role: str | None = None,
+    phase: str | None = None,
 ) -> RoleProvider:
     """Build a RoleProvider instance for reasoning/role calls.
 
@@ -187,7 +189,26 @@ def make_role_provider(
     directly, and the backend path threads it into BackendRoleProvider's
     episode budget (PLAN-REVIEW-LATENCY.md T0-6 — driver._role_provider's
     45 s reviewer/triage budget previously died here). None preserves each
-    path's own default (300 s HTTP; env/defaults backend-side)."""
+    path's own default (300 s HTTP; env/defaults backend-side).
+
+    PLAN-SWEEP-REPAIR.md §F: ``timeout`` and ``http_timeout`` are *different
+    quantities wearing the same name*, which is how §F's halt happened.
+    ``timeout`` is an episode budget — "a reviewer subprocess still running
+    at 45 s has already failed at something" (docs/PLAN-REVIEW-LATENCY.md
+    T0-6). On the HTTP branch the same number lands on ``urllib`` as the
+    socket read timeout for one entire non-streaming completion, where 45 s
+    is not a fail-fast threshold but a guillotine: reviewer prompts carry the
+    full artifact, so their latency grows with the document and every
+    100-floor arm-C seed crossed it mid-run. ``http_timeout`` lets a caller
+    say what *that* transport should use while leaving the episode budget
+    alone; it is ignored on the backend path, and ``timeout`` still applies
+    to both when it is not given.
+
+    ``role`` and ``phase`` are forwarded to the HTTP provider as well as the
+    backend one (§F2's ``[phase role node ...]`` context was reaching the
+    raise site as ``phase=unknown role=unknown`` because this branch dropped
+    them; the same fields drive the ``calls_by_role``/``tokens_by_role``
+    split in benchmark records, so both were blind together)."""
     run_backend = backend or (options.backend if options is not None and hasattr(options, "backend") else None) or "gptme"
     resolved_model = model or (options.model if options is not None and hasattr(options, "model") else None)
     resolved_provider = provider or (options.provider if options is not None and hasattr(options, "provider") else None)
@@ -199,11 +220,14 @@ def make_role_provider(
 
         if transport == "http" or effective_backend == "gptme":
             cls = provider_cls or OpenAICompatibleProvider
+            effective_timeout = http_timeout if http_timeout is not None else timeout
             return cls(
                 model=resolved_model,
                 provider=resolved_provider,
                 on_backoff=on_backoff,
-                timeout=300.0 if timeout is None else timeout,
+                timeout=300.0 if effective_timeout is None else effective_timeout,
+                role=role or "unknown",
+                phase=phase or "unknown",
             )
 
         target_dir = Path(run_dir) if run_dir is not None else Path.cwd()

@@ -411,6 +411,10 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # below the operator-specified schedule), capped at the ladder's own
         # ceiling; on the 5xx branch it stays capped at 60s as before.
         attempt = 0
+        # PLAN-SWEEP-REPAIR.md §F: transport failures get their own counter so
+        # a 429 ladder that ran earlier in this call cannot silently consume
+        # the socket-timeout budget (and vice versa).
+        transport_attempt = 0
         switches = 0
         tried_models: set[str] = {self.model}
         while True:
@@ -488,6 +492,43 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     delay = self._base_retry_delay * (2 ** attempt)
                 self._sleep(delay * random.uniform(0.8, 1.2))
                 attempt += 1
+            except ProviderError as exc:
+                # PLAN-SWEEP-REPAIR.md §F: a socket read timeout, connection
+                # reset or DNS failure surfaces from ``_http_transport`` as a
+                # bare ``ProviderError``, not a ``ProviderHTTPError``. Before
+                # this branch existed it matched none of the ladders above,
+                # propagated through ``complete_json`` (which swallows only
+                # 400s) and out of the phase — so one slow reviewer call
+                # ended the whole run with ``error in execute: The read
+                # operation timed out``. docs/PLAN-REVIEW-LATENCY.md T0-6 set
+                # the reviewer's short budget expecting a slow call to "fail
+                # fast into the retry rather than hold the wave"; this is that
+                # retry, and it is what makes T0-6's premise true. Same short
+                # exponential shape as the 5xx branch: transient network
+                # trouble is a server/link problem, not a rate limit, so it
+                # never enters the hours-long §D11 ladder.
+                if transport_attempt >= self._max_http_retries:
+                    raise
+                delay = (
+                    self._base_retry_delay * (2 ** transport_attempt) * random.uniform(0.8, 1.2)
+                )
+                if self._on_backoff is not None:
+                    self._on_backoff(transport_attempt + 1, delay)
+                # §E16: sliced interruptible sleep, so a halt signal is not
+                # held for the length of the backoff.
+                if self._should_abort is not None:
+                    slept = 0.0
+                    while slept < delay:
+                        if self._should_abort():
+                            raise ProviderError(
+                                f"transport retry aborted by halt signal: {exc}"
+                            ) from exc
+                        step = min(5.0, delay - slept)
+                        self._sleep(step)
+                        slept += step
+                else:
+                    self._sleep(delay)
+                transport_attempt += 1
 
     def _http_transport(
         self, url: str, payload: dict[str, Any], headers: dict[str, str]

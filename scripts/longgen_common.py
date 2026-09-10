@@ -11,6 +11,15 @@ the originals unrunnable without a GPU.
 Keeping them in one module matters for experimental validity: arms A and C
 must be turned into blocks by *identical* code, or a difference in parsing
 shows up as a difference in completion rate.
+
+
+NOTE ON THE NAME: two unrelated papers are called "LongGenBench". This
+implements Wu et al., arXiv 2409.02076 (repo mozhu621/LongGenBench) -- the
+block-structured diary/menu/skyscraper tasks scored by completion rate plus a
+model-verified instruction-following accuracy. It is NOT Liu et al., arXiv
+2410.04199 (repo Dominic789654/LongGenBench), which synthesises GSM8K/MMLU/CSQA
+and scores deterministically against gold labels with no verifier model. The
+judge here is upstream's, not ours. See BENCHMARKING.md 4.1 and 4.1.4.
 """
 
 from __future__ import annotations

@@ -971,6 +971,30 @@ touches, and they are the cheapest external signal available.
 
 ### 4.1 LongGenBench
 
+> **Disambiguation — there are two unrelated papers named "LongGenBench."**
+> This section, and every script under `scripts/longgen_*`, implements **Wu et
+> al., _LongGenBench: Benchmarking Long-Form Generation in Long Context LLMs_**
+> ([arXiv 2409.02076](https://arxiv.org/html/2409.02076v6), repo
+> [`mozhu621/LongGenBench`](https://github.com/mozhu621/LongGenBench)) — the
+> synthetic diary / menu / skyscraper / urban-planning tasks with `#*#`-delimited
+> `Week N` / `Floor N` / `Menu Week N` / `Block N` sections and
+> `checks_once` / `checks_range` / `checks_periodic` constraints.
+>
+> It is **not** Liu et al., _LongGenBench: Long-context Generation Benchmark_
+> ([arXiv 2410.04199](https://arxiv.org/abs/2410.04199), repo
+> [`Dominic789654/LongGenBench`](https://github.com/Dominic789654/LongGenBench)),
+> which is a different construction entirely: it synthesises GSM8K / MMLU / CSQA
+> into K questions per query over T iterations, forces the answer format
+> `Answer_N: … The answer is X`, and scores by **deterministic comparison against
+> the gold label** — no model-based verifier at any point.
+>
+> **Why this matters:** the LLM verifier in `scripts/eval_longgen_free.py` looks
+> like an unfaithful addition if you check it against Liu et al. It is not. Wu et
+> al.'s `Evalution/eval.py` scores instruction-following accuracy by loading
+> `meta-llama/Llama-3.3-70B-Instruct` under vLLM and asking it a yes/no question
+> per constraint. Our judge is a port of that, off vLLM — see §4.1.4 for the
+> exact deviations. Completion rate remains fully deterministic regex in both.
+
 Long-form generation under explicit structural constraints — "write 52 weekly
 diary entries, each satisfying these rules" — which maps directly onto
 kusudaemon's text work object (`v6/work_object.py`).
@@ -1074,6 +1098,55 @@ def query_judge(prompt: str) -> str:
 
 Run this free evaluator across predictions and ground-truth constraint prompts, holding
 the judge model strictly fixed across arms A and C.
+
+#### 4.1.4 Fidelity to upstream `Evalution/eval.py`
+
+Audited 2026-09-09 against `mozhu621/LongGenBench@main`. What is a verbatim port
+and what deviates, so a reader can tell a bug from a deliberate choice.
+
+**Faithful — do not "fix" these:**
+
+| Element | Status |
+| --- | --- |
+| `parse_blocks` (regex `f"{type} (\d+)"`, first match wins) | verbatim (`longgen_common.py`) |
+| `calculate_completion_rate` (`(expected − missing) / expected × 100`) | verbatim (`longgen_common.py`) |
+| `create_prompts` — the three few-shot examples and the instruction wording | verbatim string-for-string (`eval_longgen_free.py::_EXAMPLES`) |
+| Verdict rule: `"yes" in response.lower()` → correct, else incorrect | verbatim |
+| Per-category accuracy = yes / total prompts in that category | verbatim |
+| **Missing blocks are skipped, not counted wrong** | verbatim — and load-bearing: accuracy is *conditional on the block existing*, so a run emitting 3 of 52 blocks can post a high accuracy. Never report accuracy without completion rate beside it. |
+
+**Deliberate deviations, and why:**
+
+1. **Judge model.** Upstream hardcodes `meta-llama/Llama-3.3-70B-Instruct` under
+   vLLM with `--gpu` tensor parallelism. We take any OpenAI-compatible endpoint
+   via `LONGGEN_JUDGE_MODEL` / `LONGGEN_JUDGE_BASE_URL`, because the upstream
+   path needs multi-GPU hardware we do not have. Consequence: our accuracy
+   numbers are **not** comparable to published LongGenBench figures, only across
+   our own arms — which is all we claim (§0.3). Hold the judge fixed across arms.
+2. **Sampling params.** Upstream: `temperature=0.95, top_p=0.95, max_tokens=50,
+   seed=42`. Ours: `temperature=0.0, max_tokens=8`. Temperature 0 makes a
+   yes/no verdict reproducible across reruns, which upstream's 0.95 does not.
+   This is a considered improvement, not an oversight.
+3. **`prefix` prepending.** Upstream `inference.py` unconditionally prepends
+   `item['prefix']` because its prompts end mid-document and a base model
+   *continues* them; a chat/agent backend restates the heading instead. We
+   prepend only when block 1 is absent, applied identically to every arm
+   (`longgen_common.py::to_output_blocks`).
+
+**Known defects in our port — not yet fixed:**
+
+- `max_tokens=8` (vs upstream's 50) truncates any judge that emits a preamble
+  before its verdict. Since the verdict rule is substring `"yes"`, a truncated
+  `"Let me check the context care…"` scores as **no**. Safe for a
+  strictly-instruction-following judge, silently lossy otherwise. Verify your
+  chosen judge answers bare `yes`/`no` before trusting a sweep.
+- `score_file` computes `average = sum(accuracies.values()) / 3` with a hard 3
+  in the denominator, and assigns `0.0` to any category that produced **zero
+  prompts**. A category can produce zero prompts legitimately — every block
+  carrying its checks was missing — so on a low-completion run (the 5 / 11 / 2 %
+  sweep) the average is dragged toward zero by categories that were never
+  actually evaluated. Read `checks_evaluated` alongside `accuracy.average`, or
+  the per-category numbers instead of the average.
 
 ---
 
@@ -1698,7 +1771,8 @@ the baseline JSON — the same rule as the LLM judges in §4.
 
 - HarnessBench: <https://github.com/Qihoo360/harness-bench> · <https://arxiv.org/abs/2605.27922>
 - Harbor / Terminal-Bench: <https://www.harborframework.com/docs/tutorials/running-terminal-bench> · <https://www.harborframework.com/docs/agents> · <https://www.tbench.ai/docs/run-terminal-bench-2-0>
-- LongGenBench: <https://github.com/mozhu621/LongGenBench> · <https://arxiv.org/html/2409.02076v6>
+- LongGenBench (Wu et al. — **this is the one we implement**, §4.1): <https://github.com/mozhu621/LongGenBench> · <https://arxiv.org/html/2409.02076v6>
+- LongGenBench (Liu et al. — *different paper, same name, NOT implemented here*; GSM8K/MMLU/CSQA, deterministic gold-label scoring): <https://github.com/Dominic789654/LongGenBench> · <https://arxiv.org/abs/2410.04199>
 - WritingBench: <https://github.com/X-PLUG/WritingBench> · <https://arxiv.org/html/2503.05244v2>
 - HelloBench: <https://github.com/Quehry/HelloBench> · <https://arxiv.org/html/2409.16191v1>
 - GAIA: <https://huggingface.co/datasets/gaia-benchmark/GAIA> · <https://arxiv.org/abs/2311.12983>

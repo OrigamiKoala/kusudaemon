@@ -41,12 +41,14 @@ def set_node_bypass(
     if process in ("review", "", "*", "all") and node_id not in ("*", "all"):
         try:
             from .corruption import check_artifact_text_corruption
-            from ..v1.run_dir import node_artifact_path
-            art_path = node_artifact_path(run_dir, node_id)
-            if not art_path.exists():
+            from ..v0.run_dir import node_artifact_text
+            try:
+                text = node_artifact_text(run_dir, node_id)
+            except (FileNotFoundError, OSError):
+                text = ""
+            if not text.strip():
                 warning = "artifact is missing or empty"
             else:
-                text = art_path.read_text(encoding="utf-8")
                 corrupted, warn_reason = check_artifact_text_corruption(text)
                 if corrupted:
                     warning = warn_reason

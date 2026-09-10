@@ -143,6 +143,71 @@ CROSS_LEAF_JUDGMENTS: frozenset[str] = frozenset({
     "terminology_drift",
 })
 
+# PLAN-SWEEP-REPAIR.md §F5: judgments that ask "where did this come from?"
+# and therefore have no determinate answer when there is nowhere for it to
+# have come from. `claims_supported`'s rubric text is "Every factual claim
+# traces to a declared input, to the contract, or is explicitly marked as an
+# assumption" — on a greenfield generative leaf whose contract declares no
+# rules and whose only declared input is the harness's own restatement of the
+# task, nothing satisfies that, and the writer's only escape is to annotate
+# every sentence as an assumption (which then fails `on_topic`).
+#
+# Observed 2026-09-09 on `longgen_100-floor_armC_seed1`: unit-01 and unit-02
+# hold the same class of invented prose under the same `_PROSE` template, and
+# the reviewer passed one and failed the other three minutes apart — a coin
+# flip on an unanswerable question. `claims_supported` is not a gate, so it
+# never blocks `all_passed`, but a failed verdict costs an attempt, and three
+# of those lose the leaf. An unevaluatable rubric item must not fail: it is
+# recorded as a vacuous pass, the same way `v1/gates._gate_headers_std`
+# records "vacuous pass: non-markdown delimiter present".
+GROUNDING_JUDGMENTS: frozenset[str] = frozenset({
+    "claims_supported",
+    "claims_traced",
+})
+
+# Lines a rendered contract carries even when it declares nothing (see
+# `v2/contract.py::_T2_CONTRACT_SECTIONS`). A contract made only of these
+# has no rule for a claim to trace to.
+_CONTRACT_BOILERPLATE = re.compile(
+    r"^\s*(?:#.*|\(none\)|-?\s*Intake was skipped:.*|)\s*$"
+)
+
+# `declared_inputs` is assembled in `v1/round_loop.py` from three kinds of
+# part. A "Spine unit:" line is the harness restating this leaf's slice of
+# the goal — it is the assignment, not a source — so it does not make a
+# grounding judgment answerable. A dependency handoff or a research finding
+# does.
+_TRACEABLE_INPUT_PREFIXES = ("Handoff from ", "Research finding")
+
+
+def contract_declares_rules(contract_text: str) -> bool:
+    """True when the contract carries at least one substantive line."""
+    return any(
+        not _CONTRACT_BOILERPLATE.match(line)
+        for line in (contract_text or "").splitlines()
+    )
+
+
+def has_traceable_source(declared_inputs: str) -> bool:
+    """True when some declared input is upstream *content* rather than the
+    harness's restatement of this leaf's own assignment."""
+    return any(
+        line.lstrip().startswith(_TRACEABLE_INPUT_PREFIXES)
+        for line in (declared_inputs or "").splitlines()
+    )
+
+
+def ungroundable_judgments(
+    judgment: list[str], contract_text: str, declared_inputs: str
+) -> list[str]:
+    """The grounding judgments in ``judgment`` that cannot be evaluated,
+    because this leaf has nothing for a claim to be traced to. Empty when
+    the contract declares rules or a real source is declared — in that case
+    the judgment is answerable and is judged as before."""
+    if contract_declares_rules(contract_text) or has_traceable_source(declared_inputs):
+        return []
+    return [j for j in judgment if j in GROUNDING_JUDGMENTS]
+
 
 def compute_verdict_digest(
     artifact_text: str,
@@ -164,24 +229,45 @@ def compute_verdict_digest(
 
 
 def cap_artifact_text(text: str, ceiling_tokens: int) -> str:
-    """§11.10.13: bound the artifact a Reviewer ever gets, using the
-    harness's own whitespace heuristic (the inverse of ``estimate_tokens``
-    — cutting at ``ceiling_tokens * 0.75`` words keeps the measured token
-    count at or under the ceiling). A truncated artifact is marked
-    explicitly rather than silently short: a verdict reached over a partial
-    artifact must at least say so."""
+    """§11.10.13: bound the artifact a Reviewer ever gets. A truncated
+    artifact is marked explicitly rather than silently short: a verdict
+    reached over a partial artifact must at least say so.
+
+    PLAN-SWEEP-REPAIR.md §F3: this used to cut at ``ceiling_tokens * 0.75``
+    words, documented as "the inverse of ``estimate_tokens``". That inverse
+    was true of the old whitespace heuristic and is **not** true of the
+    recalibrated ``tokens.count_tokens`` that ``estimate_tokens`` now
+    delegates to (PLAN-TOKEN-ACCOUNTING.md §A2/§A3) — 50k ceiling → 37,500
+    words → ~65.6k *measured* tokens, so the cap silently overshot by ~31%
+    on exactly the path (an artifact with no split points) that most needs
+    it. Measure instead of assuming a ratio: binary-search the largest word
+    prefix that fits, counting the truncation notice against the budget.
+    Costs O(log n) tokenizer calls, only ever on an artifact already over
+    cap. The search measures the *assembled* string rather than budgeting
+    the notice separately: tokenization is not additive across a
+    concatenation boundary, and the separate-budget form overshot by a
+    token."""
     if ceiling_tokens <= 0:
         return ""
-    word_limit = int(ceiling_tokens * 0.75)
-    words = text.split()
-    if len(words) <= word_limit:
+    if estimate_tokens(text) <= ceiling_tokens:
         return text
-    truncated = " ".join(words[:word_limit])
-    return (
-        f"{truncated}\n\n"
-        f"[ARTIFACT TRUNCATED at the ~{ceiling_tokens}-token reviewer ceiling; "
+    notice = (
+        f"\n\n[ARTIFACT TRUNCATED at the ~{ceiling_tokens}-token reviewer ceiling; "
         f"judge only what is shown above]"
     )
+    if estimate_tokens(notice) > ceiling_tokens:
+        # Degenerate ceiling: the marker alone does not fit. Say so rather
+        # than returning a prefix that silently exceeds the caller's bound.
+        return notice.lstrip("\n")
+    words = text.split()
+    lo, hi = 0, len(words)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_tokens(" ".join(words[:mid]) + notice) <= ceiling_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return " ".join(words[:lo]) + notice
 
 
 def _shallowest_heading_starts(text: str) -> list[int]:
@@ -196,6 +282,67 @@ def _shallowest_heading_starts(text: str) -> list[int]:
         return []
     shallowest = min(len(m.group(1)) for m in matches)
     return [m.start() for m in matches if len(m.group(1)) == shallowest]
+
+
+def _unit_delimiter_from_gates(node: TaskNode) -> str:
+    """PLAN-SWEEP-REPAIR.md §F3: recover the artifact's unit delimiter from
+    the node's own ``units_min:N@<delim>`` gate (PLAN-TOKEN-ACCOUNTING.md
+    §I3's syntax, parsed identically by ``v1/gates._gate_units_min``).
+
+    The delimiter is already resolved once per run by
+    ``tokens.extract_unit_delimiter`` and baked into the gate string, so
+    reading it back off the node needs no new plumbing and cannot disagree
+    with what the gate counts. Returns ``""`` when no such gate is present.
+    """
+    for gate in list(node.gates) + list(node.warn_gates):
+        name, _, arg = gate.partition(":")
+        if name != "units_min" or "@" not in arg:
+            continue
+        _, _, delim = arg.partition("@")
+        if delim:
+            return delim
+    return ""
+
+
+def _sections_by_delimiter(text: str, delim: str) -> list[str]:
+    """Slice ``text`` at each line-leading occurrence of ``delim``, with the
+    same contract as ``_sections_by_heading``: document order, preamble kept
+    as its own leading section, every byte in exactly one section, ``[]``
+    when there is nothing to split on.
+
+    Matching mirrors ``_gate_units_min``'s ``(?m)^\\s*<delim>`` so the
+    reviewer and the gate agree about where a unit begins. Without this,
+    an artifact delimited by anything that is not an ATX heading — the
+    LongGenBench ``#*#`` marker is the case in hand, since ``#*#`` has no
+    whitespace after its hashes — yields zero sections, fan-out silently
+    never engages, and the whole document goes into one call.
+    """
+    if not delim:
+        return []
+    starts = [m.start() for m in re.finditer(r"(?m)^[ \t]*" + re.escape(delim), text)]
+    if not starts:
+        return []
+    sections = []
+    if starts[0] > 0:
+        sections.append(text[: starts[0]])
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        sections.append(text[start:end])
+    return sections
+
+
+def _split_sections(text: str, delim: str = "") -> list[str]:
+    """Fan-out split points: an explicit unit delimiter when the node
+    declares one, ATX headings otherwise. Delimiter first because it is the
+    artifact's *declared* unit boundary — the same one the ``units_min``
+    gate counts — while headings are an inference. Falls through to headings
+    when the delimiter yields nothing, so a node whose gate names a
+    delimiter its writer did not use still fans out on structure."""
+    if delim:
+        sections = _sections_by_delimiter(text, delim)
+        if sections:
+            return sections
+    return _sections_by_heading(text)
 
 
 def _sections_by_heading(text: str) -> list[str]:
@@ -324,7 +471,28 @@ def _call_triage(
     )
 
 
-def review_node(
+def effective_judgment_for(
+    node: TaskNode, judgment_classification: dict[str, str] | None = None
+) -> list[str]:
+    """The judgment items a per-node review actually evaluates.
+
+    T1-4 strips cross-leaf items (the windowed document review owns those);
+    T2-2 strips items classified ``open`` (open-world truth is not this
+    reviewer's job). Extracted so ``review_node`` and its §F5 vacuous-pass
+    wrapper derive the list from one place instead of two.
+    """
+    items = [j for j in node.judgment if j not in CROSS_LEAF_JUDGMENTS]
+    jc = (
+        judgment_classification
+        if judgment_classification is not None
+        else getattr(node, "judgment_classification", None)
+    )
+    if jc:
+        items = [j for j in items if jc.get(j, "closed") != "open"]
+    return items
+
+
+def _review_node_judged(
     node: TaskNode,
     artifact_text: str,
     provider: RoleProvider,
@@ -341,24 +509,32 @@ def review_node(
     gate_results: dict[str, Any] | None = None,
     judgment_classification: dict[str, str] | None = None,
     parallel: bool = True,
+    unit_delimiter: str | None = None,
 ) -> ReviewVerdict:
     """PLAN-REVIEW-LATENCY.md: Grounded, delta-cached, parallel review."""
     brief_text = brief
     if not node.judgment:
         return ReviewVerdict(node_id=node.id, items=[], verdict="pass", skip_reason="empty_judgment")
 
-    # T1-4: De-duplicate review layers: strip cross-leaf judgments
-    effective_judgment = [j for j in node.judgment if j not in CROSS_LEAF_JUDGMENTS]
-
-    # T2-2: Closed rubric items only
-    jc = judgment_classification if judgment_classification is not None else getattr(node, "judgment_classification", None)
-    if jc:
-        effective_judgment = [
-            j for j in effective_judgment if jc.get(j, "closed") != "open"
-        ]
+    # T1-4 (cross-leaf) + T2-2 (open items) — see effective_judgment_for.
+    effective_judgment = effective_judgment_for(node, judgment_classification)
 
     if not effective_judgment:
         return ReviewVerdict(node_id=node.id, items=[], verdict="pass", skip_reason="all_filtered")
+
+    # PLAN-SWEEP-REPAIR.md §F5: a grounding judgment this leaf cannot answer is
+    # not judged at all. ``review_node`` (the wrapper below) records each one as
+    # a vacuous pass in the returned items; here they are simply removed from
+    # what the model is asked about.
+    ungroundable = set(
+        ungroundable_judgments(effective_judgment, contract_text, declared_inputs)
+    )
+    if ungroundable:
+        effective_judgment = [j for j in effective_judgment if j not in ungroundable]
+    if not effective_judgment:
+        return ReviewVerdict(
+            node_id=node.id, items=[], verdict="pass", skip_reason="ungroundable_filtered"
+        )
 
     # T1-1: Deterministic pre-filter: skip model call if all gates pass and all judgments are gate-covered
     gates_passed = all_gates_passed
@@ -442,7 +618,8 @@ def review_node(
             section_verdicts=[{"digest": digest, "items": items, "verdict": verdict_str}],
         )
 
-    sections = _group_sections(_sections_by_heading(artifact_text), MAX_FANOUT_SECTIONS)
+    effective_delim = unit_delimiter if unit_delimiter is not None else _unit_delimiter_from_gates(node)
+    sections = _group_sections(_split_sections(artifact_text, effective_delim), MAX_FANOUT_SECTIONS)
     if not sections:
         digest = compute_verdict_digest(capped_artifact, node.rubric, effective_judgment, contract_text, brief=brief_text)
         if digest in cached_map and cached_map[digest].get("verdict") == "pass":
@@ -565,3 +742,80 @@ def review_node(
         truncated=truncated,
         section_verdicts=final_sections,
     )
+
+
+def review_node(
+    node: TaskNode,
+    artifact_text: str,
+    provider: RoleProvider,
+    *,
+    artifact_cap_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS,
+    contract_text: str = "",
+    declared_inputs: str = "",
+    brief: str = "",
+    on_reasoning: Callable[[str], None] | None = None,
+    temperature: float = 0.0,
+    triage_provider: RoleProvider | None = None,
+    cached_sections: list[dict[str, Any]] | None = None,
+    all_gates_passed: bool | None = None,
+    gate_results: dict[str, Any] | None = None,
+    judgment_classification: dict[str, str] | None = None,
+    parallel: bool = True,
+    unit_delimiter: str | None = None,
+) -> ReviewVerdict:
+    """Per-node review (PLAN-REVIEW-LATENCY.md), with PLAN-SWEEP-REPAIR.md §F5's
+    vacuous-pass rule applied to grounding judgments.
+
+    A judgment that cannot be evaluated must not fail. ``_review_node_judged``
+    removes such items from what the model is asked about; this wrapper puts
+    them back into the returned ``items`` as explicit vacuous passes, so
+    ``audit/<node>.json`` records that the item existed, that it passed, and
+    why it was not judged — rather than the item silently vanishing (which
+    would read as "never in the rubric") or failing (which costs the leaf an
+    attempt for an unanswerable question).
+
+    The verdict itself is untouched: a vacuous pass can never turn a fail into
+    a pass, because the items it adds are only ever the ones the inner call was
+    not asked to judge.
+    """
+    verdict = _review_node_judged(
+        node,
+        artifact_text,
+        provider,
+        artifact_cap_tokens=artifact_cap_tokens,
+        contract_text=contract_text,
+        declared_inputs=declared_inputs,
+        brief=brief,
+        on_reasoning=on_reasoning,
+        temperature=temperature,
+        triage_provider=triage_provider,
+        cached_sections=cached_sections,
+        all_gates_passed=all_gates_passed,
+        gate_results=gate_results,
+        judgment_classification=judgment_classification,
+        parallel=parallel,
+        unit_delimiter=unit_delimiter,
+    )
+    vacuous = ungroundable_judgments(
+        effective_judgment_for(node, judgment_classification),
+        contract_text,
+        declared_inputs,
+    )
+    if not vacuous:
+        return verdict
+    already = {i.get("id") for i in verdict.items if isinstance(i, dict)}
+    verdict.items = list(verdict.items) + [
+        {
+            "id": j,
+            "pass": True,
+            "defect": "none",
+            "detail": (
+                "vacuous pass: nothing to trace to — the contract declares no "
+                "rules and no source is declared for this leaf, so there is no "
+                "determinate answer to where a claim came from"
+            ),
+        }
+        for j in vacuous
+        if j not in already
+    ]
+    return verdict
