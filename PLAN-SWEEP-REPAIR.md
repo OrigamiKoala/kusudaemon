@@ -31,6 +31,7 @@ Five workstreams, in dependency order:
 - **§E — write granularity.** The only workstream whose central assumption is
   unverified, and the only one that depends on model compliance.
 - **§F — the halt.** Nothing in §B–§E explains why all three runs stopped.
+  *Closed 2026-09-09: a 45 s reviewer/triage socket timeout, unretried. See §F.*
 
 §G is the order. §H is acceptance. §I lists the corrections this document makes
 to other documents.
@@ -99,8 +100,11 @@ four call sites; that `versions_dir` creates its directory on every call, so
 - **That a writer obeys a mandatory part-file instruction.** Observed base rate
   is 0/3 against the current optional phrasing. §E depends on this entirely.
 - That five leaves complete. Five leaves is also five chances to hit §F.
-- Anything about the transport failures. §F is a hypothesis with a test, not a
-  diagnosis.
+- ~~Anything about the transport failures. §F is a hypothesis with a test, not a
+  diagnosis.~~ **Superseded 2026-09-09:** §F is now diagnosed from the rerun's
+  own `elapsed=45.1s timeout=45.0s` and fixed. What remains unverified is
+  whether the fix is *sufficient* — review latency still grows with the
+  document, so a wider timeout is the same trap further out.
 - §O11's open item stands: that `edit` works reliably at artifact scale is
   still unconfirmed.
 
@@ -292,7 +296,9 @@ Run it as `--flags KUSUDAEMON_OUTPUT_SPINE=1` so §A5 records the flag on the
 cell; the sweep above recorded `flags: {}` and that is how we know it was off.
 
 **Confidence: high on the tree shape (executed). Unknown on whether five leaves
-finish** — see §F.
+finish** — see §F. The 2026-09-09 rerun with the flag reached 26 floors / 26%
+in 1355 s across 6 writer calls before the §F timeout, so the path executes
+online; it has still never been allowed to run to completion.
 
 ---
 
@@ -337,32 +343,243 @@ behind it.**
 
 ---
 
-## §F. The halt nobody has diagnosed
+## §F. The halt — diagnosed and closed (2026-09-09)
 
-All three runs ended on `error in execute: The read operation timed out` or an
-escalation with no detail. **Nothing in §B–§E touches this.** §0–§E explain what
-the runs *measured*; none of them explain why the runs *stopped*.
+All three 2026-09-08 runs, and the 2026-09-09 `KUSUDAEMON_OUTPUT_SPINE=1`
+rerun, ended on `error in execute: The read operation timed out`. **§F2's own
+instrumentation is what closed this**: the rerun's record reads
 
-The phrasing is a `urllib` socket read timeout. Writers execute as an OpenCode
-subprocess, not through `urllib`, so this is a **role** call dying inside the
-execute phase — reviewer or triage — against `v1/provider.py:124`'s
-`KUSUDAEMON_HTTP_TIMEOUT`, default 300s. That is a hypothesis, not a finding.
+```
+error in execute: provider request failed
+[phase=unknown role=unknown node=- elapsed=45.1s timeout=45.0s]:
+The read operation timed out
+```
 
-**Cheapest test, in order:**
+`elapsed≈timeout` at **45.0 s, not the 300 s this section assumed.** The
+hypothesis above ("a role call dying inside the execute phase") was right; the
+number was wrong, and the number is the whole story.
 
-1. **Keep the run directory.** §O11 already records that the previous ground
-   truth (`~/.kusudaemon/runs/longgen_100-floor_armC_seed1`) was deleted and its
-   analysis can no longer be re-derived. Do not repeat that. One seed, run dir
-   preserved, before any interpretation.
-2. Widen the error to name the phase, role and elapsed time at the raise site in
-   `v1/provider.py`, so the next occurrence is self-diagnosing rather than
-   requiring a preserved run dir at all.
-3. Only then consider whether 300s is the wrong number. Raising a timeout before
-   knowing which call is hitting it is how a 300s hang becomes a 900s hang.
+### F.1 Where 45 s came from
 
-**Confidence: none. This is the largest open risk in the plan** — five leaves is
-five more chances to hit whatever this is, and §D's improvement is invisible if
-every run still dies mid-flight.
+`pipeline/driver.py::_role_provider` set `timeout = 45.0` for `reviewer` and
+`triage`, threaded through `roles/factory.make_role_provider` into
+`OpenAICompatibleProvider.timeout` — which is `urllib`'s **socket read timeout
+for one entire non-streaming completion** (`complete_json` defaults
+`streaming=False`).
+
+The value's origin is `docs/PLAN-REVIEW-LATENCY.md` T0-6, which specified it
+for `KUSUDAEMON_ROLE_TIMEOUT`: a **CLI subprocess episode budget**, on the
+reasoning that "a reviewer episode still running at 60 s has already failed at
+something and should fail fast into the retry rather than hold the wave." Two
+things broke in the port to the HTTP transport:
+
+1. **The semantics changed.** An episode budget bounds a subprocess that should
+   have finished; a socket read timeout bounds one HTTP response that is
+   legitimately still streaming. `v1/reviewer.py::_call_review` puts the
+   **entire artifact** in the user message, so review latency grows with the
+   document — on a 100-floor task, crossing 45 s is a matter of when, not if.
+   This is why the halt always arrived mid-run rather than at the start.
+2. **The retry T0-6 assumed did not exist.** `_http_transport` raises
+   `ProviderError` (not `ProviderHTTPError`) for `URLError`/`TimeoutError`/
+   `OSError`. `_call`'s ladders caught only `ProviderHTTPError`, so a socket
+   timeout took **zero** of the three configured HTTP retries;
+   `complete_json` catches only `ProviderHTTPError` (400 → drop
+   `response_format`); and `v1/reviewer.py:279`'s `except ProviderError`
+   re-raises unless the message contains `maxLength`. Three layers, none of
+   which held it, and it surfaced at the phase boundary as a dead run.
+
+### F.2 What landed
+
+- **`v1/provider.py::_call`** — a transport-error branch retrying on the same
+  short exponential shape as 5xx (never the hours-long §D11 ladder: a socket
+  timeout is a link problem, not a rate limit), with its own
+  `transport_attempt` counter so a 429 ladder earlier in the same call cannot
+  silently spend the transport budget. Fires `on_backoff` and honors
+  `should_abort` on §E16's sliced sleep.
+- **`roles/factory.make_role_provider`** — new `http_timeout` parameter,
+  applied on the HTTP branch only. T0-6's 45 s survives unchanged as the
+  *episode* budget on the backend branch, where its premise still holds.
+- **`pipeline/driver.py`** — `_role_provider` passes
+  `http_timeout=_role_http_timeout()` (default **180 s**, override
+  `KUSUDAEMON_ROLE_HTTP_TIMEOUT`) for reviewer/triage. §F3's warning stands and
+  is the reason ordering matters: widening the fuse *without* the retry above
+  would only convert a fast death into a slow one.
+- **§F2 completed.** `make_role_provider`'s HTTP branch was dropping `role=`
+  (it forwarded it only to `BackendRoleProvider`) and nothing ever set `phase`,
+  which is why the message that solved this still said
+  `phase=unknown role=unknown`. Both are now forwarded, and `_run_phase`
+  stamps `phase` on the shared provider at each phase boundary. The same
+  fields drive `calls_by_role`/`tokens_by_role` in bench records — the run that
+  produced the evidence above reported `calls_by_role: {"unknown": 2, ...}`
+  for exactly this reason.
+- **Tests:** `tests/test_provider_transport_retry.py`, 14 hermetic tests, no
+  network — the regression itself, bounded retries, counter independence,
+  halt-signal abort, backoff observability, non-429 4xx still surfacing
+  immediately, and the factory/driver timeout plumbing.
+
+### F.3 What this does *not* claim
+
+It does not claim the next run finishes. It claims a slow reviewer call is no
+longer fatal on the first occurrence. The durable latency fixes remain
+`docs/PLAN-REVIEW-LATENCY.md` T1-1 (deterministic pre-filter — zero-call review
+when all gates pass and every judgment is gate-covered) and T1-2 (two-stage
+triage), plus optionally streaming role calls so the timeout bounds a chunk
+rather than a whole response. Those are follow-ups, not blockers.
+
+**Do not attribute the 45 s halt to prompt size.** Seed 1's artifact was 26,239
+characters — roughly 6.5k tokens. A 6.5k-token review prompt does not take 45
+seconds; endpoint latency did, which is what F.2's retry and wider timeout
+address. The two reviewer-chunking defects recorded in §F.4 are real and were
+found while chasing this, but they are **not** the cause of the halt, and
+saying otherwise would repeat §0's mistake of reading a number as a
+measurement of something it does not measure.
+
+**Residual risk for §D:** five leaves is five reviewer calls where there was
+one. That multiplies exposure to endpoint latency even though it divides writer
+blast radius.
+
+### F.4 Two reviewer-chunking defects found while diagnosing §F
+
+Both live on `review_node`'s over-cap path, and both are **latent**: the path
+only runs when `estimate_tokens(artifact) > artifact_cap_tokens` (50k). No
+LongGenBench artifact produced so far reaches it — `100-floor` at ~6.5k tokens
+and `300-block` at ~28.5k both take the single-call under-cap branch. These
+are prerequisites for a *successful* long-document run, not repairs to a
+failed one. A completed 300-block artifact would be the first thing to cross
+the cap, and it would cross it into both defects at once.
+
+1. **Fan-out never engaged on a delimiter-structured artifact.**
+   `_sections_by_heading` matched ATX headings only (`^#{1,6}[ \t]+\S`).
+   LongGenBench delimits units with `#*#`, which has no whitespace after its
+   hashes, so the splitter found **zero** sections, `_group_sections` passed
+   the empty list through, and `review_node` fell to the no-headings
+   whole-artifact truncation branch. PLAN.md §A9's "fan-out replaces
+   truncation" has therefore never applied to this benchmark. The delimiter
+   was not missing — `tokens.extract_unit_delimiter` resolves it per run and
+   it is baked into the node's `units_min:N@<delim>` gate; the reviewer simply
+   never read it back. Fixed by `_unit_delimiter_from_gates` +
+   `_sections_by_delimiter` + a `_split_sections` dispatcher (delimiter first,
+   ATX headings as fallback, `[]` when neither), matching
+   `_gate_units_min`'s own `(?m)^\s*<delim>` so splitter and gate agree about
+   where a unit begins. `review_node` takes an optional `unit_delimiter`
+   override for callers that know it independently.
+
+2. **The artifact cap overshot its own ceiling by ~31%.**
+   `cap_artifact_text` cut at `ceiling_tokens * 0.75` words, documented as
+   "the inverse of `estimate_tokens`". That was true of the old whitespace
+   heuristic and false once `estimate_tokens` began delegating to
+   `tokens.count_tokens` (PLAN-TOKEN-ACCOUNTING.md §A2/§A3): 50k ceiling →
+   37,500 words → **65,655** measured tokens. Fixed by binary-searching the
+   largest word prefix that fits, measuring the assembled string (prefix plus
+   truncation notice) rather than budgeting the notice separately —
+   tokenization is not additive across a concatenation boundary and the
+   separate-budget form overshot by one token. O(log n) tokenizer calls, only
+   ever on an artifact already over cap.
+
+**Why not model-chosen reads instead.** Roles have no tool loop —
+`RoleProvider` is one method, `complete_json` — and §A9 rejects the
+neighbouring shape ("unbounded reviewer recursion"). The decisive objection is
+soundness rather than mechanism: for a role whose output *is* the gate,
+"I did not look there" and "no defect there" become indistinguishable, and a
+`pass` silently degrades to "pass on the part I sampled". Deterministic
+splitting gives coverage accounting for free — every byte lands in exactly one
+group, which is why the preamble before the first unit is kept as its own
+section rather than dropped. T1-2's two-stage triage is the sanctioned way to
+get model-chosen *selection* without a tool loop: one cheap call picks from
+structure plus gate results, one bounded call per pick.
+
+**Tests:** `tests/test_reviewer_chunking.py` (21 hermetic tests). The
+integration cases lower `artifact_cap_tokens` rather than building 50k-token
+fixtures. Fixing (2) also resolved
+`test_v1_reviewer_fanout.PathologicalMegaSectionTest`, which had been failing
+at HEAD — it asserted the ceiling the cap was overshooting.
+`test_v1_units.ReviewerInputCapTest.test_cap_artifact_text_marks_rather_than_silently_cuts`
+was rewritten: it asserted the `0.75` ratio itself (`"x x x x x x x"`), which
+was the defect, and now asserts the contract its own name states — mark the
+cut, stay inside the ceiling.
+
+
+### F.5 An unevaluatable rubric item must not fail
+
+`_PROSE` and `_DIRECT` (`v6/templates.py`) attach `claims_supported` as a
+**closed** judgment: *"Every factual claim traces to a declared input, to the
+contract, or is explicitly marked as an assumption."* On a greenfield
+generative leaf that item has no determinate answer. The 2026-09-09
+`longgen_100-floor_armC_seed1` run is the demonstration: `contract.md` renders
+`## Global rubric` / `(none)`, the leaf's only declared input is
+`Spine unit: {...}` — the harness restating the assignment, which itself says
+*"Document each floor independently with detailed descriptions of the intended
+facilities, architectural features, and unique design elements"* — and the
+writer's only route to satisfying the item is to annotate every sentence as an
+assumption, which then fails `on_topic`.
+
+The verdicts prove it is a coin flip rather than a finding: **unit-01 passed
+`claims_supported` at 23:41:54 and unit-02 failed it at 23:44:02**, same
+template, same reviewer model, same class of invented prose. Note also that
+`review_sample_rate: 0.05` is not "review 5% of nodes" — reading
+`round_loop.py:470` it is a *second-opinion sampler on passing verdicts*
+(temperature 0.7), so unit-01's pass had a 95% chance of never being checked.
+
+`claims_supported` is not a gate, so it never enters `all_passed` — but a failed
+verdict fires `node_review_failed` → redispatch, and `max_attempts: 3` means
+three bad flips lose the leaf and 25 of 100 floors. That is a false-zero
+generator of exactly the class PLAN-BENCH-INTEGRITY.md exists to remove.
+
+**Rule:** a grounding judgment is not judged when there is nothing to trace to
+— the contract declares no rules **and** no declared input is upstream content.
+It is recorded as a **vacuous pass**, the same shape `v1/gates._gate_headers_std`
+already uses (`"vacuous pass: non-markdown delimiter present"` appears in the
+same audit file). Never a silent omission (which would read as "never in the
+rubric") and never a failure.
+
+Implementation in `v1/reviewer.py`: `contract_declares_rules` (any line that is
+not a section header, `(none)`, or the intake-skipped note),
+`has_traceable_source` (a `Handoff from `/`Research finding` line — a
+`Spine unit:` line is the assignment, not a source), `ungroundable_judgments`
+over `GROUNDING_JUDGMENTS`, and `effective_judgment_for` extracted so the T1-4 /
+T2-2 filters are derived in one place. `review_node` is now a thin wrapper:
+`_review_node_judged` never asks the model about an ungroundable item, and the
+wrapper adds the vacuous-pass records back to `items`. A vacuous pass can never
+turn a fail into a pass, because it only ever adds items the inner call was not
+asked to judge. Where a source or a contract rule *does* exist, the item is
+judged exactly as before and can still fail.
+
+### F.6 Typographic punctuation defeats the writer's exact-match edit tool
+
+From `scratch/unit-02/trace.jsonl`, in the writer's own words:
+
+> I see - the file has `skyscraper’s` with a right single quotation mark
+> (Unicode), and when I try to match with a regular apostrophe it doesn't work
+
+and, two thoughts later:
+
+> let me just use the write tool to write the entire file
+
+**That is the §O whole-file clobber, and this is the mechanism that drives the
+model into it.** An `edit` whose `oldString` the model cannot reproduce
+byte-for-byte fails repeatedly, and rewriting becomes the only apparent way
+forward. The model typed the curly apostrophe itself on the first pass; it
+cannot reliably type it again. The edit tool belongs to the backend CLI
+(OpenCode) and cannot be patched here, so the characters it trips over are
+removed instead.
+
+- `v0/run_dir.py`: `normalize_typographic_punctuation` (pure) maps smart
+  quotes, en/em dashes, ellipsis and exotic spaces to ASCII —
+  **punctuation only**, so accented and non-Latin text is untouched;
+  `normalize_artifact_punctuation` rewrites the artifact in place, handling the
+  single file *and* `out/<node>/*.md` part files separately so the parts layout
+  §B depends on is preserved.
+- `v0/runner.py`: called on the redispatch branch — the one moment the harness
+  owns the file and the writer does not — before `_continuation_prompt`, logging
+  `artifact_punctuation_normalized` when it changes anything, and never raising.
+- Prompts: `pipeline/prompts.py::_artifact_instruction` now asks for ASCII
+  punctuation on the *first* pass (the preventative half), and the continuation
+  framing adds "if an edit fails to match, re-read the exact bytes and retry a
+  smaller edit — do not fall back to rewriting the whole file."
+
+**Tests:** `tests/test_grounding_and_punctuation.py` (23 hermetic tests),
+including the exact character from the live trace and a parts-layout case that
+would fail a concatenate-then-write implementation.
 
 ---
 
@@ -426,7 +643,10 @@ writer picks the parts branch during Wave 1 with today's readers, the run scores
   `flags: {"KUSUDAEMON_OUTPUT_SPINE": "1"}`.
 - **§E (if reached):** every part file is under ~1.5x its declared unit share,
   and the union of parts covers 1–100 with no gap.
-- **§F:** a halt in the execute phase names the phase, role and elapsed seconds.
+- **§F:** a halt in the execute phase names the phase, role and elapsed seconds
+  — and a single socket read timeout no longer *is* a halt: it costs a bounded
+  backoff and the run continues. A record whose `halt_reason` is a transport
+  error now means the endpoint failed four times in a row, not once.
 
 None of these is `completion_pct`. **`completion_pct` is not an acceptance
 criterion for any step in this plan** — it is the thing that becomes meaningful

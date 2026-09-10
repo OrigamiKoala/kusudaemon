@@ -136,8 +136,14 @@ def classify_verdict(verdict: ReviewVerdict) -> Classification:
 
 
 def _read_artifact(run_dir: Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    """PLAN-SWEEP-REPAIR.md §B: resolve via node_artifact_text so
+    re-validation reviews the same concatenation the gates passed."""
+    from ..v0.run_dir import node_artifact_text
+
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 def _review_against_contract(

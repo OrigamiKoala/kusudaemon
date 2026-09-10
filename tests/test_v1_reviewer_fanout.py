@@ -25,7 +25,6 @@ from kusudaemon.v1.reviewer import (  # noqa: E402
     DEFAULT_ARTIFACT_CAP_TOKENS,
     MAX_FANOUT_SECTIONS,
     RELAXED_DEFECT_MAXLENGTH,
-    cap_artifact_text,
     review_node,
 )
 from kusudaemon.v1.tree import TaskNode  # noqa: E402
@@ -107,12 +106,18 @@ class FanOutByHeadingTest(unittest.TestCase):
 
     def test_defects_from_every_section_survive_the_merge_no_dedup(self) -> None:
         artifact = self._over_cap_artifact(3, 15_000)
+        # PLAN-SWEEP-REPAIR.md §F.4 / PLAN-TOKEN-ACCOUNTING.md §A2-§A4: exact
+        # token counting puts 45k words at ~45k tokens — under the default
+        # 50k cap, so fan-out would never engage. Pin a lower cap: each ~15k
+        # section still fits whole inside it, while the ~45k total exceeds it.
+        cap = 20_000
+        self.assertGreater(estimate_tokens(artifact), cap)
         responses = [
             {"items": [{"id": "clarity", "pass": False, "defect": f"defect {i}"}], "verdict": "fail"}
             for i in range(3)
         ]
         provider = FakeProvider(responses)
-        verdict = review_node(_node(), artifact, provider)
+        verdict = review_node(_node(), artifact, provider, artifact_cap_tokens=cap)
         self.assertEqual(verdict.verdict, "fail")
         # Union, not dedup: three sections independently flagging a defect
         # yields three items, even though they share the same rubric id.
@@ -239,13 +244,17 @@ class ShipGateTailDefectTest(unittest.TestCase):
         tail = _section("## Section 5", 50, extra=marker)
         artifact = "".join(sections) + tail
 
-        # Prove the premise: plain cap_artifact_text truncation at the
-        # reviewer's cap would have cut before ever reaching the marker.
-        old_style_cut = cap_artifact_text(artifact, DEFAULT_ARTIFACT_CAP_TOKENS)
+        # Prove the premise: the OLD whole-artifact truncation (cut at
+        # ceiling * 0.75 words, the pre-§F.4 cap_artifact_text) would have cut
+        # before ever reaching the marker. Computed inline at the old ratio
+        # rather than via cap_artifact_text, which since §F.4 measures exact
+        # tokens and no longer truncates this ~40k-token artifact at all.
+        words = artifact.split()
+        word_limit = int(DEFAULT_ARTIFACT_CAP_TOKENS * 0.75)
+        old_style_cut = " ".join(words[:word_limit])
         self.assertNotIn(marker, old_style_cut)
         marker_offset = artifact.index(marker)
         words_before_marker = len(artifact[:marker_offset].split())
-        word_limit = int(DEFAULT_ARTIFACT_CAP_TOKENS * 0.75)
         self.assertGreater(
             words_before_marker, word_limit,
             msg="test setup must place the marker past the old truncation cut",
@@ -265,7 +274,11 @@ class ShipGateTailDefectTest(unittest.TestCase):
             }
         ]
         provider = FakeProvider(responses)
-        verdict = review_node(_node(), artifact, provider)
+        # Same §F.4 scale note as above: ~40k exact tokens sits under the
+        # default 50k cap, so pin a lower one each ~10k section fits inside.
+        cap = 20_000
+        self.assertGreater(estimate_tokens(artifact), cap)
+        verdict = review_node(_node(), artifact, provider, artifact_cap_tokens=cap)
 
         self.assertEqual(len(provider.calls), 5)
         self.assertEqual(verdict.verdict, "fail")

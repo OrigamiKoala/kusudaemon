@@ -199,7 +199,12 @@ def _artifact_instruction(
             "else you write or say is. When producing a long or multi-part document, you may "
             f"write part files under `{parts_dir}` (e.g. `part-01.md`, `units-001-020.md`, etc.), "
             "which will be concatenated in order, or write the single artifact directly. "
-            "You may freely edit, revise, or delete sections as the work requires."
+            "You may freely edit, revise, or delete sections as the work requires.\n"
+            "Use plain ASCII punctuation throughout — straight quotes (' and \"), "
+            "hyphens, and \"...\" rather than curly quotes, en/em dashes or a single-"
+            "character ellipsis. Your edit tool matches text exactly, and a "
+            "typographic character you cannot reproduce byte-for-byte later makes "
+            "every edit that targets that line fail (PLAN-SWEEP-REPAIR.md \u00a7F6)."
         )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
         claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")

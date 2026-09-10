@@ -1450,6 +1450,18 @@ class RunState:
         if not _safe_node_id(node_id):
             return False
         text = str(text or "")
+        # PLAN-SWEEP-REPAIR.md §B4 option (a) principle: the operator's saved
+        # full text is canonical — clear a stale parts dir so the next
+        # resolved read lands on it instead of shadowing it into a no-op.
+        from ..v0.run_dir import node_parts_dir
+
+        _parts_d = node_parts_dir(run_dir, node_id)
+        if _parts_d.is_dir():
+            import contextlib
+
+            for _existing in list(_parts_d.glob("*.md")):
+                with contextlib.suppress(OSError):
+                    _existing.unlink()
         node_artifact_path(run_dir, node_id).write_text(text, encoding="utf-8")
         resolved = record.resolve(action="save", user_input=text)
         approval_store.append(run_dir, resolved)
@@ -1543,7 +1555,7 @@ class RunState:
                 "split_proposal": None,
                 "pilot_original": None,
             }
-        artifact = _read_text(node_artifact_path(run_dir, node_id)) or ""
+        artifact = _resolved_artifact_text(run_dir, node_id) or ""
         from ..v1.gates import evaluate_gates, read_gate_cache
 
         # §11.10.11: gates were evaluated once, at dispatch, and cached in
@@ -1604,9 +1616,21 @@ class RunState:
 
     def artifact(self, node_id: str) -> str | None:
         run_dir = self._attached_dir()
-        if run_dir is None:
+        if run_dir is None or not _safe_node_id(node_id):
             return None
-        return _read_text(node_artifact_path(run_dir, node_id)) if _safe_node_id(node_id) else None
+        text = _resolved_artifact_text(run_dir, node_id)
+        if text:
+            return text
+        # Preserve the missing-vs-empty distinction (§11.10.14): None when
+        # nothing exists under either layout, "" when a file exists but is
+        # empty.
+        from ..v0.run_dir import node_parts_dir
+
+        if node_artifact_path(run_dir, node_id).exists():
+            return text
+        if node_parts_dir(run_dir, node_id).is_dir():
+            return text
+        return None
 
     def list_versions(self, node_id: str) -> list[str]:
         run_dir = self._attached_dir()
@@ -2301,7 +2325,7 @@ def _tree_summary(run_dir: Path, tree: TaskTree, *, cached_read: Callable[[Path,
         audit_file = run_dir / "audit" / f"{node.id}.json"
         gate_results = read(audit_file, lambda p=audit_file: _read_gate_cache_any(p))
         artifact_file = node_artifact_path(run_dir, node.id)
-        artifact_text = read(artifact_file, lambda p=artifact_file: _read_text(p) or "")
+        artifact_text = read(artifact_file, lambda p=artifact_file, nid=node.id: _resolved_artifact_text(run_dir, nid) or "")
         artifact_tokens = estimate_tokens(artifact_text)
         versions_directory = versions_dir(run_dir, node.id)
         version_names = read(versions_directory, lambda p=run_dir, nid=node.id: _list_versions(p, nid))
@@ -2373,6 +2397,20 @@ def _parse_plan_payload(raw: Any) -> dict[str, Any]:
 
 def _safe_node_id(value: str) -> bool:
     return bool(value) and "/" not in value and "\\" not in value and value not in {".", ".."}
+
+
+def _resolved_artifact_text(run_dir: Path, node_id: str) -> str:
+    """Live artifact text under either layout (single file or parts dir).
+
+    PLAN-SWEEP-REPAIR.md §B: the dashboard must show the same concatenation
+    the gates evaluated — a single-file read reports "" for a
+    parts-compliant writer."""
+    try:
+        from ..v0.run_dir import node_artifact_text
+
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 def _input_tokens(run_dir: Path, ref: str) -> int:

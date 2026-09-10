@@ -144,6 +144,27 @@ _TIER_SCOPED_PHASES = {"execute", "review", "research", "assemble", "verify"}
 _HALTED = "halted"
 _IN_PROGRESS = "in_progress"
 
+# PLAN-SWEEP-REPAIR.md §F: the reviewer/triage socket read timeout on the HTTP
+# role transport, distinct from the 45 s *episode* budget that
+# docs/PLAN-REVIEW-LATENCY.md T0-6 specified for the backend transport. See
+# ``RecursiveDriver._role_provider`` for why the two cannot share a number.
+# 180 s matches the pre-T0-6 ``KUSUDAEMON_ROLE_TIMEOUT`` default; override with
+# ``KUSUDAEMON_ROLE_HTTP_TIMEOUT`` when an endpoint or artifact size warrants
+# it. Raising this alone would only convert a fast death into a slow one —
+# ``v1/provider.py::_call``'s transport retry branch is the other half.
+_DEFAULT_ROLE_HTTP_TIMEOUT = 180.0
+
+
+def _role_http_timeout() -> float:
+    raw = os.getenv("KUSUDAEMON_ROLE_HTTP_TIMEOUT")
+    if not raw:
+        return _DEFAULT_ROLE_HTTP_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_ROLE_HTTP_TIMEOUT
+    return value if value > 0 else _DEFAULT_ROLE_HTTP_TIMEOUT
+
 # PLAN-zeromem.md §5.2c': per-node episode durations scale with the node's
 # token budget instead of every node getting the same flat 30 minutes.
 # NodeBudget.tokens defaults to 50_000 and v2/planner.py sets it per leaf
@@ -807,6 +828,15 @@ class RecursiveDriver:
     async def _run_phase(self, phase: str, *, round_index: int) -> RunReport:
         if self._phase_done(phase):
             return RunReport(status="done", phase=phase)
+        # PLAN-SWEEP-REPAIR.md §F2: the shared provider is constructed once,
+        # before any phase exists, so its `phase` stayed "unknown" for the
+        # whole run — both in the provider-error context string and in the
+        # `calls_by_role`/`tokens_by_role` split of benchmark records. It is
+        # the one field the driver always knows; stamp it at the boundary.
+        try:
+            self.provider.phase = phase
+        except Exception:  # noqa: BLE001 — observability only, never fatal
+            pass
         self._set_phase(phase, _IN_PROGRESS)
         self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "phase_started", "phase": phase})
         
@@ -1391,7 +1421,7 @@ class RecursiveDriver:
             if exp_u and exp_u >= 8:
                 chunks, units = synthesize_output_spine(
                     goal_text,
-                    token_budget=self.options.budget_tokens or 50_000,
+                    token_budget=self.options.max_total_tokens or 50_000,
                 )
                 if units:
                     materialize_units(self.run_dir, chunks, units)
@@ -2795,7 +2825,24 @@ class RecursiveDriver:
     def _role_provider(self, role: str) -> RoleProvider:
         from ..roles.factory import make_role_provider
         role_model = self._model_for_role(role)
+        # docs/PLAN-REVIEW-LATENCY.md T0-6: 45 s is an *episode* budget for a
+        # reviewer/triage CLI subprocess — "still running at 45 s means it has
+        # already failed at something, fail fast into the retry rather than
+        # hold the wave". That premise holds for a subprocess and is kept here
+        # for the backend path.
+        #
+        # PLAN-SWEEP-REPAIR.md §F: it does not hold for the HTTP path, where
+        # the same number became urllib's socket read timeout for one whole
+        # non-streaming completion. The reviewer prompt carries the entire
+        # artifact (`v1/reviewer.py::_call_review`), so its latency grows with
+        # the document and crossing 45 s is a matter of when, not if — which
+        # is exactly how every 100-floor arm-C seed died with `error in
+        # execute: The read operation timed out` at `elapsed≈45.1s`. Pass the
+        # HTTP transport its own, wider value; `provider._call` now retries
+        # transport failures, which is what makes a wider fuse safe rather
+        # than merely slower to fail (§F3).
         timeout = 45.0 if role in ("reviewer", "triage") else 300.0
+        http_timeout = _role_http_timeout() if role in ("reviewer", "triage") else 300.0
         if not role_model or role_model == getattr(self.provider, "model", None):
             return self.provider
         return make_role_provider(
@@ -2804,7 +2851,9 @@ class RecursiveDriver:
             run_dir=self.run_dir,
             env=self.env,
             timeout=timeout,
+            http_timeout=http_timeout,
             role=role,
+            phase=_read_phase(self.run_dir).get("phase", "unknown"),
         )
 
     def _generate_resumption_brief(self) -> None:
@@ -3110,8 +3159,14 @@ def _local_env(run_dir: Path) -> Environment:
 
 
 def _read_artifact(run_dir: Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    """PLAN-SWEEP-REPAIR.md §B: resolve via node_artifact_text so the pilot
+    phase sees a parts-compliant writer's artifact, not ""."""
+    from ..v0.run_dir import node_artifact_text
+
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 def _read_phase(run_dir: Path) -> dict[str, Any]:

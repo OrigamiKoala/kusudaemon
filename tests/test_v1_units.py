@@ -1037,12 +1037,30 @@ class ReviewerInputCapTest(unittest.TestCase):
         self.assertNotIn("ARTIFACT TRUNCATED", user_content)
 
     def test_cap_artifact_text_marks_rather_than_silently_cuts(self) -> None:
-        capped = cap_artifact_text(" ".join(["x"] * 100), ceiling_tokens=10)
+        # PLAN-SWEEP-REPAIR.md §F3: this case used to assert the *ratio*
+        # (``ceiling * 0.75`` words kept, spelled out as "x x x x x x x"),
+        # which was the defect — the 0.75 inverse stopped holding when
+        # ``estimate_tokens`` began delegating to the recalibrated
+        # ``tokens.count_tokens``, and a 50k ceiling started yielding ~65.6k
+        # measured tokens. The contract worth pinning is the one the test's
+        # own name states: mark the cut, and stay inside the ceiling.
+        text = " ".join(["x"] * 4_000)
+        capped = cap_artifact_text(text, ceiling_tokens=500)
         self.assertIn("ARTIFACT TRUNCATED", capped)
-        self.assertIn("x x x x x x x", capped)  # ceiling*0.75 words kept
-        self.assertNotIn("x x x x x x x x", capped)
+        self.assertLessEqual(estimate_tokens(capped), 500)
+        self.assertTrue(capped.startswith("x x x"))
         self.assertEqual(cap_artifact_text("short", ceiling_tokens=10), "short")
         self.assertEqual(cap_artifact_text("anything", ceiling_tokens=0), "")
+
+    def test_cap_artifact_text_ceiling_too_small_for_the_marker(self) -> None:
+        # Degenerate ceiling (unreachable in production — every caller
+        # passes DEFAULT_ARTIFACT_CAP_TOKENS): the marker alone does not
+        # fit. Return the marker rather than a prefix that silently exceeds
+        # the caller's bound; "marks rather than silently cuts" is the
+        # invariant that survives, not the byte count.
+        capped = cap_artifact_text(" ".join(["x"] * 100), ceiling_tokens=10)
+        self.assertIn("ARTIFACT TRUNCATED", capped)
+        self.assertNotIn("x x", capped)
 
 
 class TypeHintsIntegrityTest(unittest.TestCase):

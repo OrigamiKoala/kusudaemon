@@ -172,7 +172,13 @@ def _continuation_prompt(
             "but preserve the finished sections you are not deliberately "
             "changing: if your file tools replace whole-file content on "
             "write, read the current content first and carry it forward, "
-            "rather than restarting the document from scratch."
+            "rather than restarting the document from scratch.\n"
+            "The existing text uses plain ASCII punctuation (straight quotes, "
+            "hyphens) and so should anything you add: your edit tool matches "
+            "text exactly, so a curly quote or en dash you cannot reproduce "
+            "byte-for-byte will make its edit fail. If an edit does fail to "
+            "match, re-read the exact bytes and retry a smaller edit — do not "
+            "fall back to rewriting the whole file."
         )
     else:
         state_line = (
@@ -293,6 +299,34 @@ async def run_node(
         )
 
     if dispatch_reason != "dispatched":
+        # PLAN-SWEEP-REPAIR.md §F6: before the writer tries to edit what a
+        # previous attempt left behind, strip typographic punctuation from it.
+        # An exact-match `edit` whose `oldString` the model cannot reproduce
+        # byte-for-byte (a curly apostrophe it typed itself) fails repeatedly,
+        # and the model's way out is a whole-file `write` — the §O clobber.
+        # This is the one moment the harness owns the file and the writer does
+        # not, so it is the only safe place to do it.
+        try:
+            from .run_dir import normalize_artifact_punctuation
+
+            normalized_files = normalize_artifact_punctuation(run_dir, node_id)
+        except Exception:  # noqa: BLE001 — never block an episode on this
+            normalized_files = 0
+        if normalized_files:
+            log.append(
+                {
+                    "node_id": node_id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "artifact_punctuation_normalized",
+                    "files": normalized_files,
+                    "detail": (
+                        "replaced typographic quotes/dashes with ASCII so the "
+                        "writer's exact-match edits can find their targets"
+                    ),
+                }
+            )
+
         # Every redispatch — resumed session or fresh — gets
         # continue-where-you-left-off framing. Without it the model reads
         # the byte-identical prompt as "do it again" and rewrites the

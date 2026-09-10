@@ -128,6 +128,18 @@ def approve_pilot(
     snapshot_path = _pilot_original_path(run_dir, node.id)
     original = snapshot_path.read_text(encoding="utf-8") if snapshot_path.exists() else _read_artifact(run_dir, node.id)
     diff_text = _unified_diff(original, edited_text)
+    # PLAN-SWEEP-REPAIR.md §B4 option (a) principle: the operator's edited
+    # full text becomes canonical, so a stale parts dir must not shadow it
+    # on the next resolved read — clear it before writing the single file.
+    from ..v0.run_dir import node_parts_dir
+
+    _parts_d = node_parts_dir(run_dir, node.id)
+    if _parts_d.is_dir():
+        import contextlib
+
+        for _existing in list(_parts_d.glob("*.md")):
+            with contextlib.suppress(OSError):
+                _existing.unlink()
     node_artifact_path(run_dir, node.id).write_text(edited_text, encoding="utf-8")
 
     rule_texts = _derive_contract_rules(diff_text, original, provider) if diff_text.strip() else []
@@ -144,8 +156,14 @@ def approve_pilot(
 
 
 def _read_artifact(run_dir: str | Path, node_id: str) -> str:
-    path = node_artifact_path(run_dir, node_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    """PLAN-SWEEP-REPAIR.md §B: resolve via node_artifact_text so a
+    parts-compliant pilot writer is never mistaken for an empty one."""
+    from ..v0.run_dir import node_artifact_text
+
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 def _unified_diff(original: str, edited: str) -> str:

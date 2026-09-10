@@ -87,13 +87,43 @@ def build_repair_prompt(node: TaskNode, defect: str, current_text: str, mode: Re
     )
 
 
+def _clear_parts_dir(run_dir: str | Path, node_id: str) -> None:
+    """Remove part files so a single-file write becomes the resolved artifact.
+
+    PLAN-SWEEP-REPAIR.md §B4 option (a) principle: ``node_artifact_text``
+    resolves parts-win, so any full-text write (repair promotion, failed
+    repair restore) must clear ``out/<node>/*.md`` first or be shadowed
+    into a silent no-op."""
+    import contextlib
+
+    from ..v0.run_dir import node_parts_dir
+
+    parts_d = node_parts_dir(run_dir, node_id)
+    if parts_d.is_dir():
+        for existing in list(parts_d.glob("*.md")):
+            with contextlib.suppress(OSError):
+                existing.unlink()
+
+
+def _resolved_text(run_dir: str | Path, node_id: str) -> str:
+    """Current artifact text under either layout (single file or parts)."""
+    from ..v0.run_dir import node_artifact_text
+
+    try:
+        return node_artifact_text(run_dir, node_id)
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 def snapshot_artifact(run_dir: str | Path, node_id: str, tag: str) -> Path | None:
     run_dir = Path(run_dir)
-    current = node_artifact_path(run_dir, node_id)
-    if not current.exists() or not current.read_text(encoding="utf-8").strip():
+    # PLAN-SWEEP-REPAIR.md §B: resolve via node_artifact_text — a snapshot
+    # of the single file alone is empty the moment parts exist.
+    current = _resolved_text(run_dir, node_id)
+    if not current.strip():
         return None
     snapshot_path = version_snapshot_path(run_dir, node_id, tag)
-    shutil.copy2(current, snapshot_path)
+    snapshot_path.write_text(current, encoding="utf-8")
     return snapshot_path
 
 
@@ -137,7 +167,7 @@ async def run_repair(
     repair_id = repair_node_id(node.id, attempt)
 
     snapshot_path = snapshot_artifact(run_dir, node.id, repair_id)
-    current_text = node_artifact_path(run_dir, node.id).read_text(encoding="utf-8") if snapshot_path else ""
+    current_text = _resolved_text(run_dir, node.id) if snapshot_path else ""
 
     repair_node = TaskNode(
         id=repair_id,
@@ -221,6 +251,7 @@ async def run_repair(
     )
 
     if passed:
+        _clear_parts_dir(run_dir, node.id)
         node_artifact_path(run_dir, node.id).write_text(candidate_text, encoding="utf-8")
         node.status = "passed"
         artifact_text = candidate_text
@@ -229,7 +260,8 @@ async def run_repair(
         node.status = "blocked" if node.attempts >= max_attempts else "stale"
         if snapshot_path is not None:
             shutil.copy2(snapshot_path, node_artifact_path(run_dir, node.id))
-        artifact_text = node_artifact_path(run_dir, node.id).read_text(encoding="utf-8")
+            _clear_parts_dir(run_dir, node.id)
+        artifact_text = _resolved_text(run_dir, node.id)
 
     append_manifest_line(
         manifest_path,

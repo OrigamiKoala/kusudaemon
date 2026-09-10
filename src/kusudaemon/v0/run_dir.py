@@ -127,6 +127,76 @@ def ensure_node_parts_dir(run_dir: str | Path, node_id: str) -> Path:
     return d
 
 
+# PLAN-SWEEP-REPAIR.md §F6: typographic punctuation an agent's own writing
+# introduces but its edit tool cannot then match.
+#
+# Observed live 2026-09-09 in `scratch/unit-02/trace.jsonl`, in the writer's own
+# words: "the file has `skyscraper\u2019s` with a right single quotation mark
+# (Unicode), and when I try to match with a regular apostrophe it doesn't work"
+# — followed by "let me just use the write tool to write the entire file". That
+# is the §O whole-file clobber, and this is what drives the model to it: an
+# exact-match `edit` whose `oldString` cannot be reproduced byte-for-byte
+# leaves rewriting as the only apparent way forward. The edit tool belongs to
+# the backend CLI (OpenCode) and cannot be patched here, so remove the
+# characters it trips over instead.
+#
+# Mapping is punctuation-only and meaning-preserving: quotes, dashes, ellipsis
+# and exotic spaces. Nothing here touches letters, accents, or any non-Latin
+# script — an artifact that is *supposed* to contain such text keeps it.
+_TYPOGRAPHIC_PUNCTUATION = {
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u2032": "'", "\u02bc": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u2033": '"', "\u00ab": '"', "\u00bb": '"',
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+    "\u2014": "--", "\u2015": "--", "\u2212": "-",
+    "\u2026": "...",
+    "\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u200a": " ", "\u202f": " ",
+    "\u200b": "", "\ufeff": "",
+}
+_TYPOGRAPHIC_TABLE = str.maketrans(_TYPOGRAPHIC_PUNCTUATION)
+
+
+def normalize_typographic_punctuation(text: str) -> str:
+    """Replace smart quotes, en/em dashes, ellipses and exotic spaces with
+    their ASCII equivalents. Pure; safe to call on already-ASCII text."""
+    return text.translate(_TYPOGRAPHIC_TABLE)
+
+
+def normalize_artifact_punctuation(run_dir: str | Path, node_id: str) -> int:
+    """Rewrite this node's artifact in place with ASCII punctuation.
+
+    Handles both artifact layouts — the single ``out/<node>.md`` and any
+    ``out/<node>/*.md`` part files — normalizing each file separately so the
+    parts layout is preserved (a concatenate-then-write would collapse it).
+    Returns the number of files actually changed; 0 when there was nothing to
+    do, which is the common case. Never raises: a normalization failure must
+    not prevent the episode from running.
+    """
+    changed = 0
+    targets: list[Path] = []
+    single = node_artifact_path(run_dir, node_id)
+    if single.is_file():
+        targets.append(single)
+    parts = node_parts_dir(run_dir, node_id)
+    if parts.is_dir():
+        targets.extend(sorted(parts.glob("*.md")))
+    for path in targets:
+        try:
+            original = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        normalized = normalize_typographic_punctuation(original)
+        if normalized == original:
+            continue
+        try:
+            path.write_text(normalized, encoding="utf-8")
+            changed += 1
+        except OSError:
+            continue
+    return changed
+
+
 def node_artifact_text(run_dir: str | Path, node_or_id: str | Any) -> str:
     """Read a node's artifact text, resolving part files or single-file layout (PLAN-TOKEN-ACCOUNTING.md §O5a)."""
     node_id = getattr(node_or_id, "id", node_or_id)
