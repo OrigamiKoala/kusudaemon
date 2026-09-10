@@ -35,6 +35,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -171,6 +172,20 @@ def _now() -> float:
     return time.time()
 
 
+def _entry_identity(entry: TraceEntry) -> tuple[str, str, str]:
+    """Content identity for cross-source dedupe.
+
+    Deliberately excludes the timestamp: the same event carries a slightly
+    different stamp in each source (the worker stamps on emit, opencode
+    stamps on persist), so a timestamp-bearing key would never match and
+    the dedupe would be a no-op."""
+    return (
+        entry.role or "",
+        entry.tool_name or "",
+        (entry.text or "").strip(),
+    )
+
+
 def _merge_by_timestamp(
     file_entries: list[TraceEntry], extra_entries: list[TraceEntry]
 ) -> list[TraceEntry]:
@@ -179,7 +194,34 @@ def _merge_by_timestamp(
     Entries without a timestamp keep their relative file order at the head
     (the trace's bootstrap ``logdir`` line has none); timestamped entries
     follow in ascending order. Stable, so equal timestamps preserve the
-    file-then-store order."""
+    file-then-store order.
+
+    **Cross-source dedupe.** The store merge exists because CLI-backend
+    episodes used to stream nothing to stdout, so the file trace was empty
+    and opencode's sqlite store was the only source of thinking. Since
+    ``_agent_worker.py`` began writing ``thinking``/``message``/``usage``
+    rows itself, both sources carry the *same* events, and a plain
+    concatenate rendered every reasoning block, assistant message and tool
+    call twice (measured: 9 file + 9 store reasoning blocks on one node,
+    all nine byte-identical, zero unique to either side).
+
+    The dedupe is multiplicity-aware rather than set-based, because a
+    writer stuck in a retry loop genuinely emits the same short thought
+    several times ("Let me try a shorter match." x4 in one observed
+    episode). Collapsing those to one would hide a real failure signal.
+    So: a store entry is dropped only while the file side still has an
+    unconsumed copy of that exact content. Store entries the file lacks —
+    the case the merge was built for — are kept."""
+    seen: Counter[tuple[str, str, str]] = Counter(
+        _entry_identity(entry) for entry in file_entries
+    )
+    deduped: list[TraceEntry] = []
+    for entry in extra_entries:
+        key = _entry_identity(entry)
+        if seen.get(key, 0) > 0:
+            seen[key] -= 1
+            continue
+        deduped.append(entry)
 
     def _sort_key(entry: TraceEntry) -> tuple[int, float]:
         stamp = entry.timestamp
@@ -187,7 +229,7 @@ def _merge_by_timestamp(
             return (0, 0.0)
         return (1, float(stamp))
 
-    return sorted([*file_entries, *extra_entries], key=_sort_key)
+    return sorted([*file_entries, *deduped], key=_sort_key)
 
 
 class RunState:

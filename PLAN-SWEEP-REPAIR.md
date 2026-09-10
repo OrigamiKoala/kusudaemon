@@ -672,3 +672,230 @@ once they all pass.
    projected output rather than input text.
 4. **`README.md` §5** omits `PLAN-TOKEN-ACCOUNTING.md` from the ownership table
    even though it owns §H–§O. Add it, and add this document.
+
+---
+
+## §J. Wave 1 readout and repairs (2026-09-09)
+
+Run: `~/.kusudaemon/runs/longgen_100-floor_armC_seed1`, arm C, seed 1,
+`flags: {"KUSUDAEMON_OUTPUT_SPINE": "1"}`, `nvidia/nemotron-3.5-lightning-30b-a3b`.
+Started 09-08 22:00, halted 22:23, resumed 09-09 16:34, completed 17:10.
+
+### §J1. The three §G questions, answered
+
+**1. Did it finish?** Yes — `run_completed`, `assembly/main.md` exported,
+`returncode: 0`. With two asterisks:
+
+- The 09-08 segment died at `phase_failed` in `execute` round 4 with
+  `elapsed=45.1s timeout=45.0s ... phase=unknown role=unknown` — the §F halt
+  exactly as diagnosed, *before* the §F fix existed. The 09-09 resume ran the
+  fixed code and saw no transport error. §F is closed by this run, but note
+  the halt was survived by an operator `resume`, not by the retry ladder.
+- `unit-02` reached `passed` only via an operator bypass
+  (`node_bypass_requested`, 16:54:05) after two review failures. The run is
+  therefore **not** an autonomous completion. See §J3.
+
+**2. How many leaves?** **Four**, not the five §D predicted. `spine.json` shows
+`units_expected: 25` on each of `unit-01..04` with `unit_delimiter: "#*#"`;
+gates `['nonempty', 'max_tokens:50000', 'units_min:25@#*#']`, `headers:std` in
+`warn_gates`. §D's `21/21/21/21/16` was computed against a different token
+budget. The *shape* claim §D makes — forced tiling, `units_expected` reaching a
+planner leaf, non-vacuous gates — is confirmed. Update §D's arithmetic; do not
+treat 4-vs-5 as a defect.
+
+**3. Did any leaf's artifact shrink?** No. `out/.versions/unit-02/` holds two
+attempt snapshots at 26,296 and 26,883 bytes against a 31,777-byte final — the
+artifact grew monotonically. All four leaves are intact and non-overlapping:
+unit-01 floors 1–25, unit-02 26–50, unit-03 51–75, unit-04 76–100, 25 `#*#`
+units each. **§D's blast-radius bound held**: `unit-03` performed a whole-file
+overwrite mid-episode and it cost nothing outside its own leaf.
+
+Contrast §0's table, where no artifact contained floor 1 and each held one
+contiguous chunk. That signature is gone.
+
+### §J2. The artifact was complete and the score was wrong
+
+`assembly/main.md` contains **100 of 100 floors**, 100 `#*#` delimiters,
+124,016 chars. The bench record says `blocks_found: 75`,
+`completion_rate: 75.0`.
+
+**Cause.** `scripts/longgen_common.py`'s `FINISHED_RE` is
+`r"\*\*\*\s*finished\b.*"` under `re.DOTALL`, and `to_output_blocks` applied
+it as `FINISHED_RE.sub("", text)` — deleting everything from the **first**
+sentinel to EOF. Every leaf is handed the whole goal, including *"When the
+design of all 100 floors is complete, use '\*\*\* finished' to indicate the end
+of the document"*. `unit-03` obeyed it and ended its slice with `*** finished`
+(raw line 157); `unit-04` ended with `*** finished ***` (line 211). The
+first-match cut discarded floors 76–100.
+
+This is the same class of defect as §C1/§C2 — the harness generated the work
+and the measurement threw it away — and it is **more** dangerous than either,
+because it produces a plausible number rather than a crash.
+
+**Verified fix:** re-scoring the untouched artifact with the last-sentinel cut
+yields `found=100/100, rate=100.0, missing=[]`. Re-scoring all thirteen raw
+artifacts changes **only** this one; every other cell is byte-identical.
+
+**Wave 1's real completion is 100%, not 75%.**
+
+### §J3. What actually cost this run its time and tokens
+
+2,662,453 writer tokens across 11 writer calls for a ~31k-token artifact — an
+~85x amplification. Per-episode wall clock: `unit-04` 259 s clean;
+`unit-03` **705 s**; `unit-02` three episodes plus a bypass. The difference is
+not model verbosity. Three mechanisms, all harness-side:
+
+**(a) The exact-match edit tool versus typographic punctuation (§F.6).**
+`unit-02`'s reviewer demanded `claims_supported` citations on eight floors. The
+writer's `edit` calls failed repeatedly against `skyscraper’s` (U+2019) and it
+walked its own reasoning down to *"Let me try a shorter match."* — four
+verbatim repeats — before concluding *"I'll use the write tool to write the
+entire file."* §F.6's `normalize_typographic_punctuation` was authored at
+17:00, twenty-six minutes **after** the driver process started at 16:34. Python
+had already imported the old modules. **§F.5 and §F.6 did not execute in any
+part of this run** and remain unverified online.
+
+**(b) `bash` denied to the writer.** `_PROSE` sets `tools=("read", "save")`,
+which `translate_tools_to_opencode_permissions` renders as `bash: deny`. When
+`unit-03` wanted to validate a JSON file it reasoned *"let me use bash to
+inspect the exact bytes"*, the call came back as OpenCode's synthetic `invalid`
+tool, and it then spent several turns counting braces by eye before rewriting
+the file. Denying inspection did not make the run safer; it routed the writer
+to the destructive tool.
+
+**(c) The first-attempt prompt said nothing about not rewriting.** §E1 already
+records that the carry-forward clause became optional. Worse: every remaining
+"do not rewrite / append / minimal change" sentence lives on a **retry-only**
+path (`_PATCH_RETRY_INSTRUCTION`, `prompts.py:447 if node.last_defect:`,
+`runner.py`'s continuation framing). `unit-03` was on `attempts: 0`. The
+attempt that writes 34 KB was the one told nothing. Measured compliance with
+the optional phrasing stays 0/4.
+
+### §J4. Prompt-induced repetition
+
+The writer's reasoning is repetitive because the prompt contradicts itself, not
+because the model rambles. Segment 1 renders the entire run goal
+(*"Ensure that the document consists of 100 entries"*); segment 5 says
+*"Produce the artifact for Floors 51 to 75"*; nothing reconciles them. The
+writer's first thinking block is a direct read-out:
+
+> *"So it seems like I need to produce a full 100-floor document, but the
+> assigned range is 51-75."*
+
+~640 completion tokens on turn 1 resolving an ambiguity the harness created,
+and the same confusion resurfaces later (*"Floor 74 incorrectly designated as
+photography studio (the requirement is Floor 99, outside this range)"*) — a
+global constraint applied inside a local slice.
+
+The goal is also rendered **three times** in one context: `spec.md`'s `## Goal`
+via `_goal_and_rubric_block`, a byte-identical copy inside `spine/unit-03.md`
+under `## Complete Task Specification & Global Rules (Reference)`, and a
+third filtered restatement as `## Specific Constraints for Floors 51 to 75`
+(whose `- -` double bullets and leaked `2)`/`3)` numbering show the slicer
+doing string surgery). Segment 2 additionally announces *"Global contract —
+every artifact you produce must satisfy it:"* over a contract whose body is
+`(none)`.
+
+Prompt size is not the problem: turn 1 is 10,374 prompt tokens of which 8,704
+are OpenCode's own cached system prompt. The harness's share is ~1.0–1.1 k. The
+defect is duplication and contradiction inside that 1 k.
+
+### §J5. Landed in this pass
+
+Hermetic, no provider calls. Suite: **1341 tests, OK**, zero pytest imports,
+reachability floor intact.
+
+| # | Change | File |
+|---|---|---|
+| J5-1 | `to_output_blocks` cuts at the **last** sentinel, not the first; new `FINISHED_ANCHOR_RE` (the DOTALL `FINISHED_RE` can only ever match once). Documented as a deviation applied identically to every arm. | `scripts/longgen_common.py` |
+| J5-2 | `_leaf_scope_block` — a decomposed leaf is told it owns one slice and that document-level totals and end-markers are the assembler's job. Rendered immediately after the goal it qualifies; empty for single-node trees. | `pipeline/prompts.py` |
+| J5-3 | `strip_interior_terminator` — assembly drops a terminator line from the tail of every slice but the last. Conservative: final line only, decoration + terminator word only. | `v3/assemble.py` |
+| J5-4 | `_artifact_instruction` states the incremental/edit-first rule on the **first** attempt: build incrementally, targeted edits, "do not re-emit the whole file", retry a smaller edit on a failed match, prefer part files. `"freely edit"` removed. | `pipeline/prompts.py` |
+| J5-5 | `READONLY_BASH_PATTERNS` — a denied `bash` becomes an inspection-only pattern map (`cat`/`head`/`wc`/`xxd`/`sed -n`/`json.tool`/…) with `"*": "deny"`. Opt-in per call site; **writer only** — probes stay hard-denied. Off via `KUSUDAEMON_WRITER_READONLY_BASH=0`. | `adapters/capabilities.py`, `pipeline/backends.py` |
+| J5-6 | Reviewer told the artifact was written by a different AI agent, in system + triage prompts and again at the artifact label (`ARTIFACT_LABEL`). | `v1/reviewer.py` |
+| J5-7 | Dashboard: `_merge_by_timestamp` dedupes file-trace against opencode-store entries by `(role, tool_name, text)`, **multiplicity-aware** so a genuine 4x repeat still shows 4x. | `dashboard/state.py` |
+| J5-8 | Dashboard: main feed follows phase agents only (`isPhaseAgent`); `headerPillAgentId` keeps the writer fallback for the cosmetic pill. | `dashboard/static/app.js` |
+| J5-9 | Dashboard: reasoning expanded by default; a user collapse persists via `state.thinkingOpen` + `onBeforeElUpdated`. | `dashboard/static/app.js` |
+| J5-10 | Dashboard: in-flight guard on the per-agent `?since=` poll. | `dashboard/static/app.js` |
+
+Tests: `tests/test_wave1_repairs.py` (22 hermetic tests), plus two rewritten in
+`tests/test_trace_history.py`. **`test_artifact_instruction_allows_edits_preserves_finished_work`
+asserted the §E1 defect as a contract** — that the first-pass instruction says
+"freely edit" and carries no rewrite prohibition — and has been replaced with
+its inverse.
+
+### §J6. Known-unverified after this pass
+
+1. **§F.5 (vacuous grounding passes) and §F.6 (punctuation normalisation) have
+   never run online.** They were authored mid-run. Both have hermetic tests;
+   neither has a live episode.
+2. **Whether a writer obeys J5-2 or J5-4.** Same compliance assumption §E2
+   flags. Prior base rate against the optional phrasing: 0/4.
+3. **Whether read-only `bash` prevents the rewrite loop** or merely relocates
+   it. OpenCode matches the patterns as globs; `cat x && rm y` matches `cat *`.
+   J5-5 is a usability fix, not a sandbox — see the comment at
+   `READONLY_BASH_PATTERNS`.
+4. **`calls_by_role: {"unknown": 3}`** — §F2's phase/role stamping still misses
+   the reviewer and triage calls. Three role calls in this run are
+   unattributed, so `tokens_by_role` cannot separate review cost from writer
+   cost.
+5. **Two of four explore probes lost their findings.** `out/explore~research~unit-0[1-4].md`
+   are all 0 bytes; only `unit-01` and `unit-04` left a `research/*.raw.json`.
+   The phase cost 603 s. `needs_research` was already false; consider whether
+   the probes should have run at all.
+6. **`max_parallel: 1` recorded against `max_parallel_derived: 3`.**
+   `run_longgen_bench.py` only passes `--max-parallel` when `>1`, so §K's
+   measurement needs it set explicitly.
+
+### §J7. Wave 2 — the branch, resolved
+
+§G's rule reads: *died on transport → §F is the whole job; finished, leaves
+clobbered → §E1/§E2 then re-run one seed; finished, leaves intact → skip §E,
+go to Wave 3.*
+
+The literal reading is **"finished, leaves intact → skip §E, go to Wave 3."**
+Taking it literally would be a mistake, for three reasons the branch was
+written before anyone could see:
+
+- The finish was not autonomous (`unit-02` bypassed by an operator).
+- The measurement was wrong in the *optimistic-looking* direction — 75% for a
+  100% artifact. A three-seed sweep run through the old evaluator would have
+  produced six plausible, wrong numbers.
+- The two fixes most likely to change leaf behaviour (§F.5, §F.6) were never
+  loaded by the process being measured.
+
+So: **Wave 1.5 before Wave 3.** One seed, same cell
+(`--tasks 100 --arms C --seeds 1 --flags KUSUDAEMON_OUTPUT_SPINE=1`), against
+the code in §J5, with the driver started *after* the last source edit. It costs
+one seed and answers what Wave 1 could not:
+
+1. Does it complete with **no operator bypass**? (§J1 asterisk 2)
+2. Does `completion_rate` now read 100 for a 100-floor artifact? (J5-1)
+3. Do writers stop whole-file rewriting — is there a `write` over a non-empty
+   artifact in any trace? (J5-4)
+4. Does any leaf still emit an interior `*** finished`? (J5-2, with J5-3 as the
+   backstop — check the leaf's own `out/unit-NN.md`, not the assembly)
+5. Do `artifact_punctuation_normalized` events appear, and does the
+   "shorter match" loop disappear? (§F.6, first online exposure)
+6. Does writer token count fall from 2.66 M? A clean run should be nearer
+   4 x 259 s than 705 s + three episodes.
+
+**Then Wave 3** as §G7/§G8 specify: both arms, seeds 1–3, flags recorded,
+`--max-parallel` set explicitly, and the 2026-09-08 arm-C `100-floor` rows
+marked invalid in `BENCHMARKING.md` §9. Add the 2026-09-09 seed-1 row to that
+invalidation list too — not because the artifact is bad (it is the best one
+this harness has produced) but because it was scored by the pre-J5-1 evaluator
+and was operator-assisted.
+
+### §J8. Deferred, with reasons
+
+- **§E2's pre-created part files.** Still unverified, still low-confidence, and
+  §J1 shows §D's bound already holds without it. J5-4 makes the instruction
+  mandatory, which is §E2's cheaper half. Re-evaluate after Wave 1.5 question 3.
+- **Reviewer latency (§F "not fixed").** `_call_review` still ships the whole
+  document every round. Untouched here; T1-1/T1-2 remain the durable fix.
+- **The `(none)` contract announcement and the triply-rendered goal (§J4).**
+  Suppressing the contract segment when its body is `(none)`, and trimming
+  `## Complete Task Specification & Global Rules (Reference)` out of synthesized
+  spine units, are both straightforward. Held back from this pass so Wave 1.5
+  measures J5-2/J5-4 against one changed variable rather than four.

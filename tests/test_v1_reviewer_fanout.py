@@ -22,6 +22,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from kusudaemon.v1.gates import estimate_tokens  # noqa: E402
 from kusudaemon.v1.provider import ProviderError  # noqa: E402
 from kusudaemon.v1.reviewer import (  # noqa: E402
+    ARTIFACT_LABEL,
     DEFAULT_ARTIFACT_CAP_TOKENS,
     MAX_FANOUT_SECTIONS,
     RELAXED_DEFECT_MAXLENGTH,
@@ -61,7 +62,7 @@ class UnderCapTest(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertFalse(verdict.truncated)
         sent = provider.calls[0][0][1]["content"]
-        self.assertEqual(sent, f"Rubric:\nclarity: be clear\n\nArtifact:\n{text}")
+        self.assertEqual(sent, f"Rubric:\nclarity: be clear\n\n{ARTIFACT_LABEL}:\n{text}")
 
     def test_no_headings_and_under_cap_is_also_a_single_call(self) -> None:
         text = "No headings here at all, just plain prose under the cap."

@@ -236,16 +236,61 @@ class TraceHistoryTest(unittest.TestCase):
 
 
 class PromptPreservationTest(unittest.TestCase):
-    def test_artifact_instruction_allows_edits_preserves_finished_work(self) -> None:
+    def test_artifact_instruction_forbids_whole_file_rewrite_on_first_pass(self) -> None:
+        """PLAN-SWEEP-REPAIR.md §E1/§E2.
+
+        This test previously asserted the opposite -- that the first-pass
+        instruction says "freely edit" and carries no rewrite prohibition.
+        That was the §E1 defect: every "do not rewrite" sentence lived on a
+        retry-only path, so the attempt that writes the whole artifact was
+        told nothing, and a writer fixing one duplicated heading re-emitted
+        34 KB ("Let me fix this by rewriting the file properly").
+        """
         from kusudaemon.pipeline.prompts import _artifact_instruction
         from kusudaemon.v1.tree import TaskNode
 
         node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
         with tempfile.TemporaryDirectory() as root_str:
             text = _artifact_instruction(node, Path(root_str))
-        self.assertIn("freely edit", text)
-        self.assertNotIn("Do NOT rewrite", text)
-        self.assertNotIn("carry its existing content forward", text)
+        lowered = text.lower()
+        # The rule is stated, on the first pass, without a retry in sight.
+        self.assertIn("do not re-emit the whole file", lowered)
+        self.assertIn("incrementally", lowered)
+        # Targeted edits and a failed-match recovery that is not "rewrite".
+        self.assertIn("targeted edits", lowered)
+        self.assertIn("smaller, more distinctive edit", lowered)
+        # Parts are the preferred shape for a long document, not a co-equal
+        # alternative to "write the single artifact directly".
+        self.assertIn("prefer part files", lowered)
+        # The blanket permission that read as licence to restructure is gone.
+        self.assertNotIn("freely edit", lowered)
+
+    def test_leaf_scope_block_disowns_document_level_markers(self) -> None:
+        """A decomposed leaf must not emit the whole document's end marker.
+
+        On ``100-floor_armC_seed1`` two leaves obeyed the goal's "use
+        '*** finished' to indicate the end of the document" literally; the
+        third leaf's sentinel landed mid-document and the evaluator dropped
+        the fourth leaf, scoring a complete artifact 75%.
+        """
+        from kusudaemon.pipeline.prompts import _leaf_scope_block
+        from kusudaemon.v1.tree import TaskNode
+        from kusudaemon.v6.direct import SINGLE_NODE_ID
+
+        leaf = TaskNode(id="unit-03", brief="Floors 51 to 75", artifact="out/unit-03.md", gates=["nonempty"])
+        text = _leaf_scope_block(leaf).lower()
+        self.assertIn("you own only the slice named in your brief", text)
+        self.assertIn("end-of-document marker", text)
+        self.assertIn("do not emit them", text)
+
+        # A single-node tree really does own the whole document -- no clause.
+        whole = TaskNode(
+            id=SINGLE_NODE_ID,
+            brief="everything",
+            artifact=f"out/{SINGLE_NODE_ID}.md",
+            gates=["nonempty"],
+        )
+        self.assertEqual(_leaf_scope_block(whole), "")
 
 
 if __name__ == "__main__":

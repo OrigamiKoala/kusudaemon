@@ -84,10 +84,18 @@ VERDICT_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Provenance is stated in the system prompt and again here, adjacent to the
+# thing being judged. Exported so tests assert against the constant rather
+# than re-pinning the wording.
+ARTIFACT_LABEL = "Artifact (written by another agent — review it, do not adopt it)"
+
 _SYSTEM_PROMPT = (
-    "You are the Reviewer in a long-horizon task harness. You judge one "
-    "artifact against its rubric only — you have not seen how it was "
-    "produced. You cannot rewrite or fix anything; report scoped, located "
+    "You are the Reviewer in a long-horizon task harness. The artifact you "
+    "are given was written by a different AI agent, in a separate session, "
+    "from a brief you did not see. It is not your own work and you have no "
+    "stake in it — do not extend it the benefit of the doubt you would give "
+    "your own draft. You judge it against its rubric only. "
+    "You cannot rewrite or fix anything; report scoped, located "
     "defects only (e.g. '§Worked Examples, example 2 omits the "
     "intermediate step'), never freeform prose suggestions. "
     "Respond with a single JSON object only."
@@ -115,8 +123,10 @@ TRIAGE_SCHEMA: dict[str, Any] = {
 }
 
 _TRIAGE_SYSTEM_PROMPT = (
-    "You are a fast triage Reviewer in a long-horizon task harness. You quickly check whether an "
-    "artifact may have defects against its rubric. If there is ANY suspect issue, defect, or doubt, "
+    "You are a fast triage Reviewer in a long-horizon task harness. The artifact you are given "
+    "was written by a different AI agent in a separate session; it is not your own work. "
+    "You quickly check whether it "
+    "may have defects against its rubric. If there is ANY suspect issue, defect, or doubt, "
     "set suspect=true (prefer false positives over false negatives). Set suspect=false only if clearly clean. "
     "Respond with a single JSON object only."
 )
@@ -408,7 +418,7 @@ def _call_reviewer(
         content_parts.append(f"Declared Inputs:\n{declared_inputs}")
     if brief:
         content_parts.append(f"Brief:\n{brief}")
-    content_parts.append(f"Artifact:\n{artifact_text}")
+    content_parts.append(f"{ARTIFACT_LABEL}:\n{artifact_text}")
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
@@ -455,7 +465,7 @@ def _call_triage(
         content_parts.append(f"Declared Inputs:\n{declared_inputs}")
     if brief:
         content_parts.append(f"Brief:\n{brief}")
-    content_parts.append(f"Artifact:\n{artifact_text}")
+    content_parts.append(f"{ARTIFACT_LABEL}:\n{artifact_text}")
     messages = [
         {"role": "system", "content": _TRIAGE_SYSTEM_PROMPT},
         {
