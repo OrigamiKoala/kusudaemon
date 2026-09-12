@@ -88,7 +88,7 @@ const state = {
   approvalDrafts: {},
   approvalAnswerDrafts: {},
   pilotDrafts: {},
-  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", backend: "gptme", dispatch_policy: "deterministic", survey_mode: "auto", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: true, auto_probe_plan: true, disable_review: false },
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", backend: "gptme", dispatch_policy: "orchestrator", survey_mode: "auto", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: true, auto_probe_plan: true, disable_review: false },
   // §3/§6/§7/§10 additions
   // B1-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): honest sseLive — true only
   // while the EventSource is actually delivering; lastSnapshotAt feeds the
@@ -3124,11 +3124,11 @@ function renderNewRunModal() {
       el("select", { onchange: (e) => set("tier", e.target.value) },
         [["", "auto"], ["T0", "T0"], ["T1", "T1"], ["T2", "T2"], ["T3", "T3"]].map(([v, label]) =>
           el("option", { value: v, selected: state.newRun.tier === v ? "selected" : null }, label)))),
-    // §E5: the orchestrator only accepts "model" / "document_order" —
-    // "deterministic" was never a real value here.
+    // §E5 / PLAN-SWEEP-REPAIR.md §L: "orchestrator" is the event-driven
+    // default; "model" is the legacy per-round call.
     f("dispatch", "dispatch policy",
       el("select", { onchange: (e) => set("dispatch_policy", e.target.value) },
-        [["model", "model"], ["document_order", "document order (0 tokens)"]].map(([v, label]) =>
+        [["orchestrator", "orchestrator (called on every completion)"], ["model", "model (legacy per-round)"], ["document_order", "document order (0 tokens)"]].map(([v, label]) =>
           el("option", { value: v, selected: state.newRun.dispatch_policy === v ? "selected" : null }, label)))),
     f("survey", "survey mode",
       el("select", { onchange: (e) => set("survey_mode", e.target.value) },

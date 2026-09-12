@@ -899,3 +899,351 @@ and was operator-assisted.
   `## Complete Task Specification & Global Rules (Reference)` out of synthesized
   spine units, are both straightforward. Held back from this pass so Wave 1.5
   measures J5-2/J5-4 against one changed variable rather than four.
+
+## §K. Parallel-wave repairs from `longgen_000-week_armC_seed1` (2026-09-11, hermetic)
+
+The first arm-C cell on a non-floor task, and the first to run concurrent
+OpenCode writers (the driver derived `max_parallel=3` from a width-3 ready set;
+admission slow-start capped the first wave at 2). Diagnosis in project memory
+`longgen_000week_parallel_wave_stall.md`. Three of its five defects are
+repaired here; §K4 lists the two that are not.
+
+### §K1. Continuous wave refill
+
+`run_round_loop` gathered the whole wave, then ran each node's in-place retries
+serially. unit-01 died after 0.7 s (`database is locked`) and unit-03 was never
+admitted; both waited on unit-02's entire 1800 s episode, and would then have
+waited on each other's retries.
+
+`max_parallel > 1` now runs through `refill_loop`: each node is one job
+(dispatch → review → the §11.10.5 retry loop, unchanged), the loop wakes on the
+first job to finish and refills the free slots immediately. Consequences:
+
+- The orchestrator is consulted once per fill, on a view where every node a job
+  owns reads `dispatched` (`_claimed_read_as_dispatched`). A job in retry
+  backoff is `pending`; unmasked, document order hands it to a second job.
+- `_sync_tree_from_disk(skip=...)` leaves job-owned nodes alone, so a stale
+  on-disk `attempts` cannot overwrite a count a job has not saved yet.
+- AIMD (§B7.3) is recorded per finished attempt instead of per wave; a
+  throttled attempt still sleeps before its retry.
+- A job exception stops new work (fills and in-job retries), lets siblings
+  finish the attempt they are in, then re-raises. `gather` raised at once and
+  orphaned them.
+- The crash-resume scan becomes queued jobs admitted through the same slots.
+- `max_parallel == 1` keeps the old loop verbatim (its dead wave-fill branch
+  removed), so the byte-identity tests are untouched.
+
+### §K2. `units_expected` from the spine, not the brief
+
+Leaves were budgeted 1/21/41 for 20/20/12 entries. `v2/planner.py`'s range
+pattern listed `floor|block|unit|item|problem|section|chapter|part`, while the
+survey keys spines on a list that also has `entry/day/week/scene/step`. The
+brief "Entrys 21 to 40" missed, fell through to `expected_units_info`, whose
+named-ordinal rule read "Entrys 21" as a count of 21, and the resulting gate was
+demoted to a warning: no hard units gate on any leaf, false warnings on correct
+leaves, and a §L1 retry that would tell unit-03 to "append units 13–41".
+
+`planner.leaf_units_expected` now takes the sum of the slice's spine counts when
+every unit carries one (a candidate tiles whole spine units, so the sum is
+exact), then an explicit range, then the old inference. `UNIT_RANGE_RE` is built
+from `survey.OUTPUT_UNIT_NOUNS` in singular and plural, and the survey labels
+through `pluralize_unit_noun` ("Entries", not "Entrys"). 000-week leaves now
+carry hard `units_min:20@#*#` / `20` / `12` gates.
+
+Not changed: `survey._extract_constraints_for_range` still spells its noun
+alternation as `{noun}s?`, which cannot match "entries" in a constraint line.
+
+### §K3. Arm-A workspaces outside any git work tree
+
+Arm A runs the bare CLI with `cwd` in `bench_results/longgen/workspaces/<cell>`,
+inside this repo. OpenCode resolved its project upward to the checkout: every
+000-week arm-A run logged `creating instance` for the workspace and then for the
+repo root, and seed 3 wrote `<repo>/diary_2018.md` and then removed it. The
+workspaces are empty; the 1.9 / 3.8 / 1.9 % rows scored stdout. **Those three
+rows are invalid** and belong on the `BENCHMARKING.md` §9 list.
+
+`run_longgen_bench.py` now defaults `--workspaces-root` to
+`~/.kusudaemon/bench_workspaces/longgen` and refuses (in `main` and per cell)
+any root with a `.git` directory or file at or above it. `--score-only` and
+`--list-tasks` skip the check; `--dry-run` checks but creates nothing. Arm-A
+harvest is still stdout-only — a bare agent that writes its answer to a file is
+still scored on its chat output.
+
+### §K4. Not done in this pass
+
+- **Concurrent OpenCode boots share one SQLite store.** Two `opencode run`
+  processes starting 0.27 s apart produced `database is locked`; the harness
+  counted it as attempt 1 of 3 with `last_defect: "nonempty: artifact is
+  empty"`. Needs a per-episode data dir or serialized boot, plus classifying the
+  error as a non-attempt like `throttled`. §K1 makes the retry immediate but
+  does not stop the collision.
+- **`--max-parallel 1` cannot force serial.** The driver treats 1 as unset and
+  derives its own width for T2/T3.
+- Latent: `_agent_worker._watch_opencode_log` tails the global `opencode.log`
+  with no run/session filter, so one parallel episode's `stream error` line
+  kills its siblings.
+
+Tests: `tests/test_refill_units_workspace.py` (16). Full suite 1383 tests, one
+failure — the pre-existing `CodexAdapterTest.test_mcp_server_overrides`.
+
+## §L. The event-driven orchestrator (2026-09-11, hermetic)
+
+**Why.** Asked "is there an orchestrator overseeing execution?", the honest
+answer was no. `longgen_000-week_armC_seed1` ran `dispatch_policy:
+"deterministic"` (the driver and `pipeline/run.py` default), so every dispatch
+was `ready[0]`. Even `"model"` rarely called a model (§E18 single-ready and §L5
+wave-consumes-ready shortcuts; wave fill by code), was never told a node had
+finished, never saw retries (§11.10.5 retried in place), could not wait
+(`dispatch | halt | escalate`, with halt/escalate coerced to dispatch whenever
+anything was ready, §11.5), and saw no outcomes or in-flight work.
+
+**Decisions (operator, 2026-09-11).** Call on every completion; retries go
+through the orchestrator; `wait` must name running nodes; the orchestrator may
+hold nodes back for undeclared (soft) dependencies.
+
+**What landed.**
+- `dispatch_policy="orchestrator"`, now the default in `RunOptions`,
+  `pipeline/run.py`, `pipeline/cli.py` and the dashboard new-run modal.
+  `"deterministic"`/`"document_order"` (zero calls) and `"model"` (legacy
+  per-round) are unchanged and still selectable.
+- `v1/round_loop.py::orchestrated_loop` (any `max_parallel`). A job is one
+  attempt: dispatch → review. The orchestrator is called at the start and after
+  every completion, with the batch of events since its last call. It answers
+  `{"action":"dispatch","node_ids":[...]}` (≤ free slots) or
+  `{"action":"wait","wait_on":[...]}`. Slots it leaves free stay free until the
+  next completion. A failed node returns to the pool as dispatchable, showing
+  its defect and attempt count; a redispatch keeps the old transient-failure
+  spacing (`2^(attempts-1)` s, max 5).
+- `v1/orchestrator.py`: `ORCHESTRATOR_SCHEMA`, `ORCHESTRATOR_SYSTEM_PROMPT`,
+  `build_orchestrator_messages` (events, running with elapsed time,
+  dispatchable with `last_defect`, nodes held by declared deps, status counts,
+  manifest tail — bounded by those sets, not tree size),
+  `parse_orchestrator_decision` (code-side correction, every correction logged).
+- Code still decides, without a call: terminal states (all passed → halt;
+  nothing ready and nothing running → `run_escalated`); the attempt cap; and
+  calls whose only possible answer is `wait` (nothing dispatchable, or no free
+  slot) — those events are carried into the next real call.
+- Corrections: dispatch names are filtered to dispatchable and trimmed to free
+  slots; a dispatch of nothing valid becomes wait-on-all-running; a wait naming
+  no running node becomes wait-on-all-running; a wait with nothing running
+  becomes a dispatch of the first dispatchable node (it would never wake).
+- The provider call runs in a thread (`asyncio.to_thread`) so running episodes'
+  streams and heartbeats are not blocked; the decision is re-validated against
+  the state after the call returns. A `ProviderError` logs
+  `orchestrator_call_failed` and falls back to document order for that decision.
+- Events: `orchestrator_decision` (action, node_ids, wait_on, reason,
+  corrections, events told, ready, in_flight); `node_dispatch_decided` gains
+  `redispatch`. `orchestrator/round-NNN.jsonl` is still written per decision.
+- `max_rounds` counts decisions that start never-attempted work, so redispatches
+  and waits don't use it up (they were free under the in-place retry).
+
+**Known limits.**
+- A soft-dependency wait only orders execution. A leaf's inputs are still its
+  own spine unit, so a later leaf cannot read an earlier leaf's artifact;
+  holding weeks 21–40 for weeks 1–20 costs wall-clock and buys no continuity
+  unless inputs are extended.
+- Cost: one small call per completion (≈ nodes × attempts). Arm-C records
+  should carry the policy; benchmark cells run before this date were
+  `deterministic`.
+- `kusudaemon bench` builds `RunOptions` without `max_parallel`, so the bench
+  `--max-parallel` flag never reaches the driver (it derives its own; §K4).
+
+Tests: `tests/test_event_driven_orchestrator.py` (11). Full suite 1394 tests,
+one pre-existing failure (`CodexAdapterTest.test_mcp_server_overrides`).
+
+### §L.1 Regressions found in the §L implementation (self-audit, same day)
+
+1. `provider._default_max_tokens` gives 4096 to any schema with a non-scalar
+   property; the legacy dispatch schema got 1024. On nvidia/nemotron the
+   000-week classify calls took 50 s and 128 s and both hit their 2048 cap, so
+   a freed slot could sit idle for minutes per decision.
+2. The request sends `response_format` with `strict: true`; strict endpoints
+   require every property in `required`, and `node_ids`/`wait_on` were optional.
+3. Every dispatchable node was listed on every call — PLAN-zeromem.md §1.8's
+   O(N²) input, now once per completion.
+4. Only `ProviderError` was caught; any other exception left the loop, whose
+   `finally` cancelled in-flight writer jobs (§E15: never interrupt mid-turn).
+5. Stateless per call with no record of its own last decision.
+6. Nothing required free slots to be used; a partial dispatch idled silently.
+7. Orchestrator calls cost-stamped `role: unknown`; the round trace's `node_id`
+   became a comma-joined list; bench records did not say which policy ran.
+
+### §L.2 Bounded call latency and a strict-valid schema
+
+- `v1/provider.py::call_scope(role=, max_tokens=)` — a thread-local override
+  read by `OpenAICompatibleProvider` (`max_tokens` when the caller passed none;
+  the recorded and error-context role). Thread-local because the orchestrator
+  shares the run's provider object; its call runs on its own
+  `asyncio.to_thread` worker, so no other caller sees the scope.
+- The orchestrator call runs under `call_scope(role="orchestrator",
+  max_tokens=KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS)` (default 1024).
+- `KUSUDAEMON_ORCHESTRATOR_DEADLINE_S` (default 90; `<= 0` disables): past it
+  the decision falls back to document order (`orchestrator_call_failed`,
+  `detail: "no answer within …"`). The worker thread can't be killed, so the
+  call is kept as `abandoned` and no new call starts until it returns; those
+  decisions fall back too ("still running past its deadline").
+- `ORCHESTRATOR_SCHEMA`: all four properties required, no `maxLength`
+  (reason is truncated to 600 chars in code). The prompt shows both arrays in
+  both examples.
+
+### §L.3 Constant-size prompt
+
+`build_orchestrator_messages(max_listed=KUSUDAEMON_ORCHESTRATOR_MAX_LISTED,
+default 20)` caps every list — events (most recent, older ones tallied by
+outcome), running, dispatchable (retry candidates first, then document order),
+held-by-dependency — and states the overflow as a count. Section headers still
+carry the true totals. Input per call is bounded by a constant, so a run's
+orchestrator input is O(completions).
+
+### §L.4 Errors never cancel writers
+
+- Any exception from the call (not only `ProviderError`), or a non-object
+  answer, falls back to document order for that decision.
+- `orchestrated_loop` and `refill_loop` separate cancellation from failure:
+  `CancelledError` still cancels jobs; any other exception logs
+  `round_loop_error_draining` (with `in_flight`), awaits the in-flight attempts
+  to completion, then re-raises.
+
+### §L.5 The orchestrator sees its previous decision
+
+The prompt gains "your previous decision": round, age, action, node ids, wait
+targets, reason, harness corrections. On a resumed run it is recovered from the
+last `orchestrator_decision` in the tail of `events.jsonl`
+(`round_loop._last_orchestrator_decision`).
+
+### §L.6 Idle slots need a reason
+
+`parse_orchestrator_decision`: a dispatch that leaves slots free while other
+nodes are dispatchable must name what it waits for in `wait_on` (a running node
+or one it just dispatched). With `wait_on` empty, code fills the remaining slots
+in document order and records the correction — consistent with the operator's
+rule that waiting must name in-flight work.
+
+### §L.7 Attribution and records
+
+- Orchestrator calls are cost-stamped `role: orchestrator` via §L.2's scope.
+- `orchestrator/round-NNN.jsonl`: `decision.node_id` is a single id again (the
+  first); `node_ids`, `wait_on`, `corrections`, `fallback` are separate fields.
+  `orchestrator_decision` events gain `fallback`.
+- Bench records carry `dispatch_policy` (`null` for arm A), passed through to
+  LongGenBench records.
+
+Still true: no live provider has answered `ORCHESTRATOR_SCHEMA`; whether 1024
+tokens suffices for nemotron's reasoning is unmeasured (a truncated answer falls
+back and is logged, so the first live run will show it). Soft-dependency waits
+still add no continuity.
+
+Tests: `tests/test_event_driven_orchestrator.py` now 22; reverting §L.4, §L.5,
+§L.6 or the deadline each fails at least one. Full suite 1405 tests, one
+pre-existing failure.
+
+## §P. The 000-week rescore (2026-09-12)
+
+The first full 3×3 LongGenBench sweep on a non-floor task. All three arm-C seeds
+wrote a complete 52/52-week document; the harness reported 1 of 3. Every defect
+below sits *downstream* of a correct artifact, which is the pattern to watch for:
+each one turns finished work into a zero, and each one biases arm C's mean in the
+direction that flatters a bare-agent comparison.
+
+Ground truth, all three seeds: `out/unit-01.md` weeks 1-20, `out/unit-02.md`
+21-40, `out/unit-03.md` 41-52. Arm A: 100 / 1.9 / 100 — seed 2 emitted zero
+blocks and closed by asserting it had written 52.
+
+### §P1. `harvest_artifact` assembled the document and refused to write it
+
+`run_longgen_bench.harvest_artifact` guarded its write with
+`if not artifact_path.is_file()`. On a halted run there is no assembly step, so
+the CLI's `--output-dir` copy had already dropped a *single* unit file at
+`raw/<stem>.md`; the guard then kept the correctly assembled text out of the
+file, and `write_predictions` re-reads that file. `raw/000-week_armC_seed1.md`
+was `out/unit-03.md` byte-for-byte (12 of 52 blocks), seed3's was `unit-02.md`
+(20 of 52), while `records.jsonl` said 100 % for both.
+
+Fixed: `_persist_artifact` always writes. Added a unit-file concatenation step
+(ordinal order, not lexical — `unit-10` must not sort before `unit-02`) ahead of
+the flat `out/*.md` candidate glob, so a halted run assembles rather than
+returning whichever single file the glob reached first.
+
+Also fixed while here: the `task_id` run-dir glob was `*{task_id}*arm{arm}*s{seed}*`,
+which cannot match `longgen_000-week_armC_seed1` — "seed1" contains no "s1". Only
+the pre-2026-09-07 `..._s1_<epoch>` naming ever matched, so a `--score-only`
+rerun without an explicit `run_id` silently found no run dir at all. Both
+namings are globbed now.
+
+### §P2. `count_units` under-counted a single-line artifact
+
+The unanchored fallback in `v1/gates.count_units` fired only when the
+line-anchored pattern matched *exactly zero* times. Seed 3's `unit-01.md` was
+21202 characters with zero newlines and 20 `#*#` markers glued to the preceding
+word ("...new year#*# Week 2"), so the anchored pattern matched once — not zero.
+The gate reported `units_min:20@#*#: units_found:1 < units_expected:20` against a
+correct 20-week artifact, burned all three attempts (~35 min of writer time) and
+escalated the run.
+
+Fixed: one `unit_matches()` is now the single implementation behind the gate, the
+shrink/resume accounting, the reviewer's fan-out split and the inline-cap resume
+anchor — so those four can no longer disagree about where a unit begins. It takes
+the larger of the anchored and unanchored match sets, but only for a *sigil*
+delimiter (punctuation-only, like `#*#`); a word-like delimiter ("Chapter",
+"Week") stays line-anchored so prose cannot inflate it. A sigil preceded by a
+quote character is a mention, not a unit start.
+
+### §P3. A truncated response was reported as invalid JSON
+
+Seed 1 finished every unit, entered review, and died on "structured output failed
+after 3 attempts: invalid JSON: Expecting value: line 1 column 1 (char 0)" — 408 s
+and three attempts whose `completion_tokens` were each **exactly 4096**, the
+`_default_max_tokens` value for that schema. Every orchestrator call in all three
+seeds returned exactly 1024, its own cap, surfacing as one
+`orchestrator_call_failed` ("no answer within 90s") per seed and repeated
+document-order fallbacks. `finish_reason` was never read anywhere in `src/`.
+
+On a reasoning model the cap covers the thinking trace as well as the JSON, so
+these responses were truncated before the object was emitted, not malformed.
+
+Fixed: `_first_choice_finish_reason` and `_hit_token_ceiling` (which also treats
+`completion_tokens >= cap` as a ceiling hit, since not every OpenAI-compatible
+host sets `finish_reason`); `complete_json` escalates the cap geometrically to
+`_MAX_STRUCTURED_TOKENS` (32768) and retries the **original** messages rather
+than appending a "that did not validate" turn — seed 1's three attempts grew the
+prompt 1312 → 5448 → 9585 while re-asking the same question at the same cap.
+Exhausting the ladder now names the ceiling instead of the JSON. Defaults raised:
+1024/2048/4096 → 2048/4096/8192, and `orchestrator_max_tokens` 1024 → 4096 (its
+schema has arrays; 1024 was never the right bucket).
+
+### §P4. Quarantining a halt on a complete document biases the mean
+
+`is_valid = halt_category not in ("transport", "budget", "unknown")` (§C2) excluded
+seed 3 with `invalid_reason: "unknown"` and raised `excessive_exclusions` — on a run
+that had produced the whole document. That rule discards exactly the runs where the
+*harness* failed, which moves the arm mean up.
+
+Fixed: a halt no longer quarantines a run whose artifact reached its expected unit
+count. The run records `halt_after_complete` and `summary.json` totals it per arm,
+so the harness defect stays visible instead of being averaged away. Also: the
+summary's wall clock falls back to the record's `wall_clock_s`, since `--score-only`
+records `harness_wall_clock_s = 0` and a rescored matrix otherwise reports 0.0s.
+
+Rescored result (`--score-only`, no model spend): **arm A 67.3 %, arm C 100 %,
+3 of 3 valid, `halts_after_complete: 2`.**
+
+### §P5. Selection: `--per-type N`
+
+The 400 tasks are 4 templates × 100 instantiations. Within a type the prompts are
+87-93 % character-identical (Week .928, Floor .922, Menu Week .868, Block .934);
+only the name, profession, birthday weeks, range event and periodic period/start
+change. Block and Floor are near-twins of each other (.278; the other pairs are
+.06-.13). So the effective n for a claim is templates × difficulty strata, not the
+item count, and averaging 100 within-type items to quote a tight interval is not
+evidence (§0.3).
+
+`--per-type N` ranks each type's instances by `constraint_count` (`checks_once` +
+`checks_range` + `checks_periodic`, the only axis that varies within a template)
+and picks at even quantiles — min/Q1/median/Q3/max at N=5. `--pin` forces indices
+in whatever their rank and counts them against the quota, so an already-paid-for
+task is reused. The emitted order round-robins across types, so a sweep
+interrupted halfway is still stratified.
+
+Tests: `tests/test_sweep_repair_p.py` (23). Full suite 1428 tests, one
+pre-existing failure (`test_mcp_server_overrides`, the Python 3.10 `tomllib` gap
+in §9.2).

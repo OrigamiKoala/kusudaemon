@@ -90,10 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dispatch-policy",
-        choices=("model", "document_order", "deterministic"),
-        default="deterministic",
-        help="document_order / deterministic skips the per-round orchestrator LLM call and "
-        "dispatches the earliest ready node in document order (PLAN-zeromem.md §1)",
+        choices=("orchestrator", "model", "document_order", "deterministic"),
+        default="orchestrator",
+        help="orchestrator (default): an agent decides every dispatch/redispatch, called at "
+        "start and whenever a node finishes (PLAN-SWEEP-REPAIR.md §L). document_order / "
+        "deterministic dispatch the earliest ready node with zero calls (PLAN-zeromem.md §1); "
+        "model is the legacy per-round call",
     )
     parser.add_argument(
         "--document-review",

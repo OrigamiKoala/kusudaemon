@@ -350,6 +350,24 @@ def survey_chunks_structural(
 survey_chunks_deterministic = survey_chunks_structural
 
 
+# PLAN-SWEEP-REPAIR.md §K2. Output-unit nouns a synthesized spine can be keyed on, in selection order
+# (the first one the goal mentions wins). ``v2/planner.py`` builds its
+# "<Nouns> N to M" range pattern from this same tuple: the two lists used to be
+# maintained separately, the planner's lacked entry/day/week/scene/step, and a
+# 000-week leaf briefed "Entrys 21 to 40" was budgeted units_expected=21.
+OUTPUT_UNIT_NOUNS: tuple[str, ...] = (
+    "floor", "block", "chapter", "entry", "item", "problem",
+    "section", "day", "week", "scene", "step", "part",
+)
+
+
+def pluralize_unit_noun(noun: str) -> str:
+    """English plural for an output-unit noun ("entry" -> "entries")."""
+    if len(noun) > 1 and noun.endswith("y") and noun[-2] not in "aeiou":
+        return noun[:-1] + "ies"
+    return noun + "s"
+
+
 @dataclass
 class SpineUnit:
     id: str
@@ -598,9 +616,8 @@ def synthesize_output_spine(
 
     delim = extract_unit_delimiter(goal)
 
-    nouns = ("floor", "block", "chapter", "entry", "item", "problem", "section", "day", "week", "scene", "step", "part")
     noun = "unit"
-    for cand in nouns:
+    for cand in OUTPUT_UNIT_NOUNS:
         if re.search(rf"\b{cand}s?\b", goal, re.IGNORECASE):
             noun = cand
             break
@@ -628,7 +645,8 @@ def synthesize_output_spine(
         end_idx = min(n, (i + 1) * units_per_leaf)
         count_in_leaf = end_idx - start_idx + 1
 
-        label = f"{noun.capitalize()}s {start_idx} to {end_idx}"
+        nouns_label = pluralize_unit_noun(noun).capitalize()
+        label = f"{nouns_label} {start_idx} to {end_idx}"
         unit_id = f"unit-{i + 1:02d}"
 
         constraints = _extract_constraints_for_range(goal, start_idx, end_idx, noun)
@@ -636,7 +654,7 @@ def synthesize_output_spine(
         delim_instruction = f"Use '{delim}' to separate the documentation for each {noun}." if delim else f"Format each {noun} clearly."
 
         context_text = (
-            f"# Assigned Range: {noun.capitalize()}s {start_idx} to {end_idx} (Total: {count_in_leaf} {noun}s)\n\n"
+            f"# Assigned Range: {nouns_label} {start_idx} to {end_idx} (Total: {count_in_leaf} {pluralize_unit_noun(noun)})\n\n"
             f"{delim_instruction}\n\n"
             f"## Specific Constraints for {label}:\n"
             f"{constraint_bullets}\n\n"

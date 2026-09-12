@@ -238,6 +238,13 @@ Four corrections to what it currently produces:
 Add `valid` / `invalid_reason` to the schema when §0.1's quarantine rule is
 implemented, so an excluded run is excluded in the data rather than by hand.
 
+- **`halt_after_complete` (§P4) is the fourth correction's companion.** The
+  quarantine rule must not fire on a run whose artifact reached its expected
+  unit count before the halt: those are harness defects, and excluding them
+  removes exactly the runs where the harness — not the model — failed, which
+  biases the arm mean upward. `run_longgen_bench.py` records the flag per run
+  and `summary.json` totals it per arm.
+
 ### 0.5 Why these benchmarks and not others
 
 The operational detail for each is in §3–§6; this is the case for spending the
@@ -1149,6 +1156,78 @@ and what deviates, so a reader can tell a bug from a deliberate choice.
   the per-category numbers instead of the average.
 
 ---
+
+### 4.1.5 Results to date
+
+Commit `dd0b7dc`, `opencode` / `nvidia/nemotron-3.5-lightning-30b-a3b`,
+`KUSUDAEMON_OUTPUT_SPINE=1`, 3 seeds per arm. Completion rate only — accuracy
+needs the judge (§4.1.4) and is not quoted here.
+
+| task | blocks | arm A (bare) | arm C (kusudaemon) | arm C config |
+|---|---|---|---|---|
+| `000-week` (idx 0) | 52 | 100 / **1.9** / 100 → **67.3 %** | 100 / 100 / 100 → **100 %** | T2, orchestrator, spine |
+| `100-floor` (idx 100) | 100 | 2 / 1 / 1 → **1.3 %** | 100 / 100 / 99 → **99.7 %** | T1/T2, deterministic |
+| `300-block` (idx 300) | 100 | 42 / 100 / 10 → **50.7 %** | 99 / 100 / 100 → **99.7 %** | T1, deterministic |
+| **all three** | | **39.8 %** (9 runs) | **99.8 %** (9 runs) | |
+
+**The arm-C column mixes two pipeline configurations and four commits.** `000-week`
+ran at T2 with `dispatch_policy=orchestrator` and the output spine; the `100-floor`
+and `300-block` arm-C cells ran at T1 with deterministic dispatch, which skips the
+spine phase entirely (the tier coin-flip, 2026-09-10), at commits `48ca02e4` /
+`19c945f8` / `da77ebe3` / `dd0b7dc`. Three of those cells never produced a bench
+record at all and were reconstructed from their run dirs (`"reconstructed": true`
+in the cell JSON; nothing inferred, everything read back off `cost.jsonl`,
+`events.jsonl`, `phase.json` and `run.spec.json`). Quote the per-task rows, not
+the pooled mean, until a single-commit sweep replaces them.
+
+**§P1 invalidates the recorded "100-floor regression".** The 2026-09-08 sweep
+recorded `100-floor` arm C at 5 / 11 / 2 % with three `score: 0.0` halts, and that
+number is cited elsewhere in this repo as evidence of a §O regression. Re-harvesting
+*the same run dirs* with the §P1 fix yields **101 / 101 / 99 blocks**. The documents
+were always there; `harvest_artifact` was reading one spine unit and
+`write_predictions` was re-reading that file. Treat every arm-C completion number
+recorded before 2026-09-12 as a lower bound, and re-derive it with `--score-only`
+before citing it.
+
+**`000-week` is the first clean arm-A-vs-arm-C delta.** Arm A seed 2 emitted zero
+`#*#` blocks and closed with a summary asserting "52 weekly entries … all
+requirements are met" — 909 bytes, empty workspace. That is the failure mode the
+benchmark exists to catch, and it is worth more than the mean.
+
+**Read the 2026-09-12 rescore before comparing to any earlier number.** The
+original sweep reported arm C at 1 of 3. Both "failures" were harness defects
+landing on documents that were already complete, and all three are fixed under
+`PLAN-SWEEP-REPAIR.md` §P:
+
+- §P1 `raw/` and `predictions/` held a single spine unit for the two halted
+  seeds (12 and 20 of 52 blocks) while `records.jsonl` correctly said 100 %.
+  `harvest_artifact` assembled the right text and then declined to write it.
+- §P2 seed 3 escalated on `units_min:20@#*#` reporting `units_found:1` against a
+  correct 20-week artifact, because the writer emitted it as one 21202-character
+  line and the unit counter was line-anchored.
+- §P3 seed 1 died in review on "invalid JSON: Expecting value: line 1 column 1"
+  — three attempts that each returned exactly 4096 completion tokens. The
+  response was truncated at the output ceiling, not malformed.
+
+Rescore with no model spend, after any §P change:
+
+```bash
+python3 scripts/run_longgen_bench.py --longgen-dir ~/LongGenBench \
+    --tasks 0 --arms A C --seeds 1 2 3 --score-only
+```
+
+`summary.json` now carries `halts_after_complete` per arm (2 for arm C here). A
+non-zero value is a harness defect to fix, never a capability result — and a
+halt after completion no longer quarantines the run, since excluding exactly the
+runs where the harness failed biases the arm mean upward.
+
+**Cost, for planning:** across the nine arm-C runs, 16.5 M tokens and 22580 s
+(`000-week` alone: 5.81 M tokens / 5925 s, so ~1.9 M and ~33 min per seed at 52
+blocks) against arm A's 9263 s. Arm A token totals are still 0 — the bare arm has
+no token accounting — so `tokens_per_completion_point` has no arm-A counterpart.
+Note the 100-block arm-C token figures are understated by the opencode cache-read
+drop and are not comparable across backends.
+
 
 ### 4.2 WritingBench
 

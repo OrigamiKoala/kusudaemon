@@ -25,13 +25,65 @@ rubrics derived from the frozen contract are future wiring.
 
 from __future__ import annotations
 
+import re as _re
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..v0.events import EventLog
 from ..roles.protocol import RoleProvider
 from ..v1.tree import NodeBudget, TaskNode, TaskTree
-from .survey import SpineUnit
+from .survey import OUTPUT_UNIT_NOUNS, SpineUnit, pluralize_unit_noun
+
+# "<Nouns> N to M" / "<noun> N-M" in a leaf brief. Built from the survey's own
+# noun tuple (plus the generic "unit"), singular and plural, so a label the
+# survey writes is always a label the planner can read back.
+_RANGE_NOUNS = sorted(
+    {form for noun in (*OUTPUT_UNIT_NOUNS, "unit") for form in (noun, pluralize_unit_noun(noun))},
+    key=len,
+    reverse=True,
+)
+UNIT_RANGE_RE = _re.compile(
+    r"\b(?:" + "|".join(_RANGE_NOUNS) + r")s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
+    _re.IGNORECASE,
+)
+
+
+def leaf_units_expected(brief: str, slice_units: list[SpineUnit]) -> tuple[int | None, str | None]:
+    """How many output units a leaf over ``slice_units`` must produce
+    (PLAN-SWEEP-REPAIR.md §K2).
+
+    Order of authority:
+    1. The spine's own per-unit counts, when every unit in the slice carries
+       one. A synthesized output spine computed them from the goal's declared
+       target, and a planner candidate tiles whole spine units, so their sum is
+       exact. Re-deriving the count from prose is what went wrong before: the
+       000-week brief "Entrys 21 to 40" missed the range pattern and fell
+       through to ``expected_units_info``, whose named-ordinal rule read
+       "Entrys 21" as a count of 21 (units_expected 1/21/41 for leaves of
+       20/20/12), demoted the gate to a warning, and armed the §L1 retry to
+       "append units 13-41" into another leaf's weeks.
+    2. An explicit "<Nouns> N to M" range in the brief.
+    3. ``expected_units_info`` over the brief, then any partial spine counts.
+    """
+    from ..tokens import expected_units_info
+
+    counts = [getattr(u, "units_expected", None) for u in slice_units]
+    if counts and all(isinstance(c, int) and c > 0 for c in counts):
+        return sum(counts), "declared"
+
+    m_range = UNIT_RANGE_RE.search(brief or "")
+    if m_range:
+        start, end = int(m_range.group(1)), int(m_range.group(2))
+        if end >= start:
+            return end - start + 1, "declared"
+
+    u_info, u_src = expected_units_info(brief or "")
+    if u_info is not None and u_info > 0:
+        return u_info, u_src
+    u_sum = sum(c for c in counts if isinstance(c, int) and c > 0)
+    if u_sum > 0:
+        return u_sum, "declared"
+    return None, None
 
 DEFAULT_DEPTH_CAP = 4
 DEFAULT_NODE_CAP = 400
@@ -469,30 +521,9 @@ def build_tree(
             if input_path_for is not None
             else [unit.id for unit in slice_units]
         )
-        from ..tokens import expected_units_info, extract_unit_delimiter
-        import re
+        from ..tokens import extract_unit_delimiter
 
-        units_expected: int | None = None
-        units_source: str | None = None
-
-        m_range = re.search(
-            r"\b(?:floor|block|unit|item|problem|section|chapter|part)s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
-            candidate.brief,
-            re.IGNORECASE,
-        )
-        if m_range:
-            units_expected = int(m_range.group(2)) - int(m_range.group(1)) + 1
-            units_source = "declared"
-        else:
-            u_info, u_src = expected_units_info(candidate.brief)
-            if u_info is not None and u_info > 0:
-                units_expected = u_info
-                units_source = u_src
-            elif slice_units:
-                u_sum = sum(getattr(u, "units_expected", None) or 0 for u in slice_units)
-                if u_sum > 0:
-                    units_expected = u_sum
-                    units_source = "declared"
+        units_expected, units_source = leaf_units_expected(candidate.brief, slice_units)
 
         delimiter = extract_unit_delimiter(candidate.brief)
         if not delimiter and slice_units:

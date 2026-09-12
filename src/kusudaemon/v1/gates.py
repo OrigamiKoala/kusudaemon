@@ -159,6 +159,101 @@ def _gate_contains(gate: str, arg: str, text: str) -> GateResult:
     return GateResult(gate=gate, passed=passed, detail=detail)
 
 
+# PLAN-TOKEN-ACCOUNTING.md §I3: a unit heading with an arbitrary prefix
+# delimiter (``#*#``, ``===``, ``---``, ``##``) followed by a unit noun and
+# its ordinal. Every ``\s*`` here is load-bearing: LongGenBench writes
+# ``#*# Floor 7:`` with a space after the delimiter, and a copy of this
+# pattern that omitted it counted zero units on every artifact this
+# benchmark has ever produced (PLAN-SWEEP-REPAIR.md §J9).
+_UNIT_NOUN_RE = re.compile(
+    r"(?im)^(?:\#\*\#\s*|===+\s*|---+\s*|#{1,6}\s*)?"
+    r"(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+"
+)
+
+# The first integer on a matched unit line — the unit's ordinal.
+_UNIT_ORDINAL_RE = re.compile(r"\d+")
+
+
+def unit_pattern(delim: str = "") -> "re.Pattern[str]":
+    """The line-anchored pattern that marks the start of one artifact unit.
+
+    ``delim`` is the run's resolved unit delimiter, already baked into a
+    node's ``units_min:N@<delim>`` gate by ``tokens.extract_unit_delimiter``.
+    When it is known it wins outright; the noun list is only the fallback
+    for a node whose gate does not declare one.
+    """
+    if delim:
+        return re.compile(r"(?m)^\s*" + re.escape(delim))
+    return _UNIT_NOUN_RE
+
+
+# A delimiter made only of punctuation (``#*#``, ``***``, ``---``) cannot be
+# confused with prose, so it is safe to look for it anywhere on a line. One
+# made of word characters ("Chapter", "Week") is not, and stays line-anchored.
+def _is_sigil(delim: str) -> bool:
+    return bool(delim) and re.search(r"\w", delim) is None
+
+
+# A sigil quoted in prose ("use `#*#` as the separator") is a mention, not a
+# unit start. Cheap guard, and it covers the shape models actually emit.
+_QUOTE_CHARS = "`'\"\u201c\u2018"
+
+
+def unit_matches(text: str, delim: str = "") -> list["re.Match[str]"]:
+    """Every unit-start match in ``text``, in document order.
+
+    The single implementation behind the ``units_min`` gate, the round loop's
+    shrink/resume accounting, the reviewer's fan-out split and the inline-cap
+    resume anchor, so those four can never disagree about where a unit begins.
+
+    PLAN-SWEEP-REPAIR.md §P2: the line-anchored pattern is the primary, but
+    the unanchored fallback used to fire only when it matched *exactly zero*
+    times. A writer that ran the whole document together on one line — 000-week
+    armC seed3's ``unit-01.md`` was 21202 characters, zero newlines, 20 ``#*#``
+    markers glued to the preceding word ("...new year#*# Week 2") — therefore
+    matched once, reported ``units_found:1 < units_expected:20`` against a
+    correct 20-week artifact, burned all three attempts and escalated the run.
+    Taking the larger of the two counts is what makes that artifact legible.
+    """
+    if not delim:
+        matches = list(_UNIT_NOUN_RE.finditer(text))
+        return matches or list(_MD_HEADING_RE.finditer(text))
+    strict = list(unit_pattern(delim).finditer(text))
+    if len(strict) > 1 and not _is_sigil(delim):
+        return strict
+    loose = [
+        m
+        for m in re.finditer(re.escape(delim), text)
+        if m.start() == 0 or text[m.start() - 1] not in _QUOTE_CHARS
+    ]
+    return loose if len(loose) > len(strict) else strict
+
+
+def count_units(text: str, delim: str = "") -> int:
+    """Count the artifact units in ``text`` (PLAN-SWEEP-REPAIR.md §J9, §P2)."""
+    return len(unit_matches(text, delim))
+
+
+def first_unit_key(text: str, delim: str = "") -> str:
+    """Identify which unit ``text`` starts at, for shrink classification.
+
+    Returns the first unit's ordinal when the unit line carries one
+    (``#*# Floor 41:`` -> ``"41"``), else the matched text lowercased, else
+    ``""``. Comparing ordinals is what distinguishes "the writer trimmed
+    inside its own range" from "the artifact no longer begins where it did"
+    — a bare delimiter compares equal to itself and would classify every
+    whole-file clobber as scoped.
+    """
+    matches = unit_matches(text, delim)
+    if not matches:
+        return ""
+    match = matches[0]
+    line_end = text.find("\n", match.start())
+    line = text[match.start(): line_end if line_end != -1 else len(text)]
+    ordinal = _UNIT_ORDINAL_RE.search(line)
+    return ordinal.group(0) if ordinal else match.group(0).strip().lower()
+
+
 def _gate_units_min(gate: str, arg: str, text: str) -> GateResult:
     delim = ""
     if "@" in arg:
@@ -170,23 +265,7 @@ def _gate_units_min(gate: str, arg: str, text: str) -> GateResult:
     except ValueError:
         return GateResult(gate=gate, passed=False, detail=f"malformed limit {arg!r}")
 
-    if delim:
-        # PLAN-TOKEN-ACCOUNTING.md §I3: delimiter-specific unit count
-        delim_pattern = re.compile(r"(?m)^\s*" + re.escape(delim))
-        matches = len(delim_pattern.findall(text))
-        if matches == 0:
-            matches = len(re.findall(re.escape(delim), text))
-    else:
-        # §I3: expanded nouns and arbitrary prefix delimiters (#*#, ===, ---, ##)
-        matches = len(
-            re.findall(
-                r"(?im)^(?:\#\*\#\s*|===+\s*|---+\s*|#{1,6}\s*)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+",
-                text,
-            )
-        )
-        if matches == 0:
-            matches = len(_MD_HEADING_RE.findall(text))
-
+    matches = count_units(text, delim)
     passed = matches >= min_units
     detail = "" if passed else f"units_found:{matches} < units_expected:{min_units}"
     return GateResult(gate=gate, passed=passed, detail=detail)

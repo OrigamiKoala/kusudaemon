@@ -87,10 +87,12 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--dispatch-policy",
-        choices=("model", "document_order"),
-        default="model",
-        help="document_order skips the per-round orchestrator LLM call and "
-        "dispatches the earliest ready node in document order (PLAN-zeromem.md §1)",
+        choices=("orchestrator", "model", "document_order"),
+        default="orchestrator",
+        help="orchestrator (default): an agent decides every dispatch/redispatch, called at "
+        "start and whenever a node finishes (PLAN-SWEEP-REPAIR.md §L). document_order "
+        "dispatches the earliest ready node with zero calls (PLAN-zeromem.md §1); model is "
+        "the legacy per-round call",
     )
     run_parser.add_argument(
         "--document-review",
@@ -1100,6 +1102,7 @@ def cmd_bench(
             "token_unit": "tokenizer-v1",
             "max_parallel": 1,
             "max_parallel_derived": 1,
+            "dispatch_policy": None,
             "tier_measured": None,
             "tier_final": None,
             "escalations": [],
@@ -1412,6 +1415,9 @@ def cmd_bench(
             "token_unit": "tokenizer-v1",
             "max_parallel": max_parallel_req,
             "max_parallel_derived": max_parallel_der,
+            # PLAN-SWEEP-REPAIR.md §L.7: arm-C cells before 2026-09-11 ran
+            # "deterministic"; the policy is part of what a record measured.
+            "dispatch_policy": options.dispatch_policy,
             "tier_measured": tier_measured,
             "tier_final": tier_final,
             "tier_degraded": tier_degraded,

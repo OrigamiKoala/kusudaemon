@@ -234,33 +234,77 @@ def _artifact_instruction(
         )
     else:
         parts_dir = run_dir / "out" / node.id
-        instruction = (
-            f"Write your artifact to `{absolute_path}` using your file tools. "
-            "That file is the deliverable; nothing else you write or say is.\n"
-            # PLAN-SWEEP-REPAIR.md §E1/§E2: every "do not rewrite" sentence in
-            # this harness used to live on a retry-only path (`_PATCH_RETRY_
-            # INSTRUCTION`, `runner.py`'s continuation framing), so a first
-            # attempt — the one that writes the whole 34 KB — was told nothing.
-            # Observed consequence: a writer fixed one duplicated heading by
-            # re-emitting the entire file ("Let me fix this by rewriting the
-            # file properly"), and fixed one stray brace in its handoff note by
-            # rewriting the note. State the rule on the first pass instead.
-            "Build the artifact incrementally: create it once, then extend it by "
-            "appending, and change what is already written with targeted edits. "
-            "Do not re-emit the whole file to change part of it — a whole-file "
-            "write over existing content risks losing finished work, and is a "
-            "defect rather than a fix. If an edit fails to match, re-read the "
-            "exact bytes on disk and retry a smaller, more distinctive edit.\n"
-            "For a long or multi-part document, prefer part files under "
-            f"`{parts_dir}` (e.g. `part-01.md`, `units-001-020.md`), which are "
-            "concatenated in order — each part is written once and never "
-            "rewritten, so no single write can carry more than one part.\n"
+        # PLAN-SWEEP-REPAIR.md §J10: once a parts directory exists it *is* the
+        # artifact. ``v0/run_dir.node_artifact_text`` concatenates
+        # ``out/<node>/*.md`` in filename order and shadows ``out/<node>.md``,
+        # and every reader (gate evaluation, reviewer, shrink check, assembly,
+        # the benchmark harvest) resolves through it. Telling a writer that has
+        # complied with the parts offer "that file is the deliverable; nothing
+        # else you write is" makes merging the parts back into the single file
+        # the correct-looking last step — observed on 100-floor arm-C seed 3,
+        # which spent an entire episode re-emitting five complete part files at
+        # ~80k context, the exact place this model's output degenerates. Name
+        # the parts as the deliverable and forbid the merge.
+        try:
+            existing_parts = sorted(f.name for f in parts_dir.glob("*.md"))
+        except OSError:
+            existing_parts = []
+        ascii_clause = (
             "Use plain ASCII punctuation throughout — straight quotes (' and \"), "
             "hyphens, and \"...\" rather than curly quotes, en/em dashes or a single-"
             "character ellipsis. Your edit tool matches text exactly, and a "
             "typographic character you cannot reproduce byte-for-byte later makes "
             "every edit that targets that line fail (PLAN-SWEEP-REPAIR.md \u00a7F6)."
         )
+        if existing_parts:
+            listed = ", ".join(f"`{name}`" for name in existing_parts)
+            instruction = (
+                f"Your artifact is the set of part files in `{parts_dir}`, which "
+                f"already holds {len(existing_parts)}: {listed}. The harness "
+                "concatenates them in filename order, and that concatenation is "
+                "the deliverable — it is what the gates count and what gets "
+                "assembled.\n"
+                "They are already combined. Do not merge, concatenate or copy "
+                f"them into one file, and do not write `{absolute_path}` — the "
+                "parts directory takes precedence over it, so anything written "
+                "there is ignored. Re-emitting content that is already in a part "
+                "produces nothing and risks losing it.\n"
+                "To add missing content, write a new part file next to the "
+                "others (`part-NN.md`, numbered after the highest existing "
+                "part); parts need not be written in order. To correct "
+                "something already written, make a targeted edit inside the one "
+                "part that contains it. Never rewrite a whole part to change "
+                "some of it.\n"
+                + ascii_clause
+            )
+        else:
+            instruction = (
+                f"Write your artifact to `{absolute_path}` using your file tools "
+                "— or, for a long or multi-part document, as part files under "
+                f"`{parts_dir}` (`part-01.md`, `part-02.md`, ...), which the "
+                "harness concatenates in filename order. Whichever of those two "
+                "layouts you choose is the deliverable; nothing else you write "
+                "or say is. Do not do both: a non-empty parts directory "
+                "shadows the single file.\n"
+                # PLAN-SWEEP-REPAIR.md §E1/§E2: every "do not rewrite" sentence in
+                # this harness used to live on a retry-only path (`_PATCH_RETRY_
+                # INSTRUCTION`, `runner.py`'s continuation framing), so a first
+                # attempt — the one that writes the whole 34 KB — was told nothing.
+                # Observed consequence: a writer fixed one duplicated heading by
+                # re-emitting the entire file ("Let me fix this by rewriting the
+                # file properly"), and fixed one stray brace in its handoff note by
+                # rewriting the note. State the rule on the first pass instead.
+                "Build the artifact incrementally: create it once, then extend it by "
+                "appending, and change what is already written with targeted edits. "
+                "Do not re-emit the whole file to change part of it — a whole-file "
+                "write over existing content risks losing finished work, and is a "
+                "defect rather than a fix. If an edit fails to match, re-read the "
+                "exact bytes on disk and retry a smaller, more distinctive edit.\n"
+                "Part files are preferred for anything long: each part is written "
+                "once and never rewritten, so no single write can carry more than "
+                "one part's worth of content.\n"
+                + ascii_clause
+            )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:
         claims_path = absolute_path.with_name(f"{node.id}_claims.jsonl")
         instruction += (
@@ -520,8 +564,20 @@ def segments(
                 retry_cap = node.budget.tokens if node.budget and node.budget.tokens > 0 else DEFAULT_ARTIFACT_CAP_TOKENS
                 prior_artifact = _prior_attempt_artifact(node, run_dir, ceiling_tokens=retry_cap)
                 if prior_artifact is not None:
-                    _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
-                    units_found = len(_u_re.findall(prior_artifact))
+                    # PLAN-SWEEP-REPAIR.md §J9: count through gates.count_units
+                    # with the node's own resolved delimiter. This was a second
+                    # private copy of the unit regex, missing ``\s*`` after the
+                    # ``#*#`` alternative, so ``units_found`` was 0 on every
+                    # LongGenBench artifact — §L1's "append units N+1..M"
+                    # framing never fired and the retry fell through to the
+                    # branch below, which inlines the whole prior artifact
+                    # under "fix it in place". That is how a retry holding 60
+                    # finished floors was handed back the entire document and
+                    # rewrote it.
+                    from ..v1.gates import count_units
+                    from ..v1.reviewer import unit_delimiter_from_gates
+
+                    units_found = count_units(prior_artifact, unit_delimiter_from_gates(node))
                     units_exp = node.budget.units_expected if node.budget else None
                     if prior_artifact.startswith("[ARTIFACT EXCEEDS INLINE CAP:"):
                         retry_block += (
@@ -601,8 +657,14 @@ def _prior_attempt_artifact(node: TaskNode, run_dir: Path, ceiling_tokens: int =
     if not text.strip():
         return None
     if estimate_tokens(text) > ceiling_tokens:
-        _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
-        matches = list(_u_re.finditer(text))
+        # PLAN-SWEEP-REPAIR.md §J9: third copy of the unit regex, same missing
+        # ``\s*``. Over the inline cap this told the writer "0 units currently
+        # on disk; resume at unit 1" about a full document, and anchored on the
+        # last 300 characters instead of the last unit.
+        from ..v1.gates import unit_matches
+        from ..v1.reviewer import unit_delimiter_from_gates
+
+        matches = unit_matches(text, unit_delimiter_from_gates(node))
         units_found = len(matches)
         resume_point = units_found + 1
         anchor = text[matches[-1].start():].strip()[:300] if matches else text[-300:].strip()

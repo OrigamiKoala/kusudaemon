@@ -231,7 +231,10 @@ class RunOptions:
     research_plan: dict[str, list[ResearchQuery]] = field(default_factory=dict)
     max_rounds: int = 100
     max_attempts: int = 3
-    dispatch_policy: str = "deterministic"
+    # PLAN-SWEEP-REPAIR.md §L: the event-driven orchestrator decides every
+    # dispatch and redispatch. "deterministic"/"document_order" (zero calls)
+    # and "model" (the legacy per-round call) remain selectable.
+    dispatch_policy: str = "orchestrator"
     # PLAN.md §C2: parallel dispatch within each round-loop wave. 1 is
     # today's exact serial behavior; >1 runs that many Writer episodes
     # concurrently per round (wave fill is code-derived from the ready
@@ -1732,10 +1735,63 @@ class RecursiveDriver:
                 return not is_empty
         return True
 
+    async def _ensure_spine_for_plan(self) -> None:
+        """Build the spine if the plan phase arrived without one.
+
+        PLAN-SWEEP-REPAIR.md §J8. ``_phase_explore`` skips the survey
+        outright for a tier with no plan phase ("tier has no plan phase"),
+        which is correct while the run *is* T1. But a size defect can
+        escalate T1 -> T2 mid-execute, and by then explore has already
+        completed: the driver re-enters ``plan`` with no ``spine.json``,
+        ``_plan_will_partition`` sees nothing to partition, and the run
+        falls through to ``build_single_node_tree`` — the same one-node
+        tree the escalation was supposed to replace. The escalation costs
+        a phase and buys no decomposition.
+
+        Building it here, at the first moment a plan phase actually
+        exists, is the narrowest place the repair fits: a normal T2/T3 run
+        already has ``spine.json`` from explore and skips this entirely.
+
+        Failure is deliberately not fatal. ``_phase_survey`` raises §D4's
+        loud error for a corpus-less, workspace-less goal with no declared
+        output units, and that case must keep landing on the single-node
+        fallback below — exactly what it did before the escalation.
+        """
+        if (self.run_dir / "spine.json").exists():
+            return
+        if "plan" not in phases_for(self._current_tier()):
+            return
+        try:
+            await self._phase_survey()
+        except Exception as exc:  # noqa: BLE001 - fallback is the contract
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": "survey_for_plan",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            return
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "spine_built_for_plan",
+                "phase": "plan",
+                "units": len(load_spine(self.run_dir)),
+                "detail": "plan phase reached without a spine (tier escalated after explore); surveyed now",
+            }
+        )
+
     async def _phase_plan(self) -> None:
         tier = self._current_tier()
         depth_cap = 1 if tier == "T2" else DEFAULT_DEPTH_CAP
         probe_sink: list[dict[str, Any]] = []
+        await self._ensure_spine_for_plan()
         units = load_spine(self.run_dir)
         corpus_inputs = (
             ("source.txt",) if self._effective_work_object().kind == "text" else ()

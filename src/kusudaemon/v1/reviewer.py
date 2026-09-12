@@ -294,7 +294,7 @@ def _shallowest_heading_starts(text: str) -> list[int]:
     return [m.start() for m in matches if len(m.group(1)) == shallowest]
 
 
-def _unit_delimiter_from_gates(node: TaskNode) -> str:
+def unit_delimiter_from_gates(node: TaskNode) -> str:
     """PLAN-SWEEP-REPAIR.md §F3: recover the artifact's unit delimiter from
     the node's own ``units_min:N@<delim>`` gate (PLAN-TOKEN-ACCOUNTING.md
     §I3's syntax, parsed identically by ``v1/gates._gate_units_min``).
@@ -314,6 +314,12 @@ def _unit_delimiter_from_gates(node: TaskNode) -> str:
     return ""
 
 
+# PLAN-SWEEP-REPAIR.md §J9: the round loop's shrink/resume accounting needs
+# the same delimiter the gate counts with, so this is public. The private
+# name stays as an alias for callers (and tests) that already use it.
+_unit_delimiter_from_gates = unit_delimiter_from_gates
+
+
 def _sections_by_delimiter(text: str, delim: str) -> list[str]:
     """Slice ``text`` at each line-leading occurrence of ``delim``, with the
     same contract as ``_sections_by_heading``: document order, preamble kept
@@ -329,7 +335,11 @@ def _sections_by_delimiter(text: str, delim: str) -> list[str]:
     """
     if not delim:
         return []
-    starts = [m.start() for m in re.finditer(r"(?m)^[ \t]*" + re.escape(delim), text)]
+    # §P2: one shared matcher with the ``units_min`` gate, so a writer that ran
+    # its units together on one line fans out into units instead of one section.
+    from .gates import unit_matches
+
+    starts = [m.start() for m in unit_matches(text, delim)]
     if not starts:
         return []
     sections = []

@@ -260,8 +260,14 @@ class PromptPreservationTest(unittest.TestCase):
         self.assertIn("targeted edits", lowered)
         self.assertIn("smaller, more distinctive edit", lowered)
         # Parts are the preferred shape for a long document, not a co-equal
-        # alternative to "write the single artifact directly".
-        self.assertIn("prefer part files", lowered)
+        # alternative to "write the single artifact directly". Asserted as
+        # the contract rather than one phrasing of it: the offer is present,
+        # it is marked as preferred for long documents, and the writer is
+        # told the harness concatenates them (PLAN-SWEEP-REPAIR.md §J10 —
+        # without that last clause a compliant writer merges its own parts).
+        self.assertIn("part files", lowered)
+        self.assertIn("preferred", lowered)
+        self.assertIn("concatenates in filename order", lowered)
         # The blanket permission that read as licence to restructure is gone.
         self.assertNotIn("freely edit", lowered)
 

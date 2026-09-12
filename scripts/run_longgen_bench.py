@@ -66,6 +66,17 @@ LONGGEN_REPO = "https://github.com/mozhu621/LongGenBench.git"
 DEFAULT_BACKEND = "opencode"
 DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
+# PLAN-SWEEP-REPAIR.md §K3. Arm A's bare CLI runs with its cwd in the per-cell workspace. OpenCode (and
+# most agent CLIs) resolve their project root by walking up to the nearest
+# ``.git``, so a workspace under ``bench_results/`` inside this repo made every
+# arm-A 000-week run operate on the kusudaemon checkout itself: opencode logged
+# ``creating instance`` for the workspace and then for the repo root, and seed 3
+# wrote ``<repo>/diary_2018.md`` and then ``rm``'d it. The
+# workspaces left behind were empty and the records scored 193-10858 chars of
+# stdout. Workspaces therefore live outside any git work tree by default, and
+# ``check_workspaces_root`` refuses a root that is inside one.
+DEFAULT_WORKSPACES_ROOT = Path.home() / ".kusudaemon" / "bench_workspaces" / "longgen"
+
 DATASETS = {
     "short": "Dataset/Dataset_short.json",
     "long": "Dataset/Dataset_long.json",
@@ -77,6 +88,88 @@ DATASETS = {
 # --------------------------------------------------------------------------
 
 
+def constraint_count(item: dict[str, Any]) -> int:
+    """How many scored constraints this instance carries.
+
+    ``checks_once`` + ``checks_range`` + ``checks_periodic`` — the three
+    categories `Evalution/eval.py` scores. This is the only difficulty axis
+    that varies *within* a scenario type: the four types are templates, and
+    within one the prompts are 87-93 % character-identical (measured over
+    Dataset_short: Week .928, Floor .922, Menu Week .868, Block .934). Name,
+    profession, the birthday weeks, the range event and the periodic event's
+    period and start are the slots that change. So running 100 Week items is
+    close to re-measuring one capability with different integers, and the
+    effective n for a claim is the number of templates x difficulty strata,
+    not the item count (§0.3). Spread the budget across this instead.
+    """
+    return sum(
+        len(item.get(key) or {})
+        for key in ("checks_once", "checks_range", "checks_periodic")
+    )
+
+
+def _quantile_positions(n_available: int, k: int) -> list[int]:
+    """``k`` evenly spaced positions over ``n_available`` ranked items.
+
+    k=5 over a sorted list gives min, Q1, median, Q3, max — a difficulty
+    ladder rather than a clump. Deterministic: no sampling anywhere.
+    """
+    if k <= 0 or n_available <= 0:
+        return []
+    if k >= n_available:
+        return list(range(n_available))
+    if k == 1:
+        return [n_available // 2]
+    step = (n_available - 1) / (k - 1)
+    seen: list[int] = []
+    for i in range(k):
+        pos = round(i * step)
+        while pos in seen and pos + 1 < n_available:
+            pos += 1
+        seen.append(pos)
+    return sorted(set(seen))
+
+
+def select_by_difficulty(
+    pool: list[tuple[int, dict[str, Any]]],
+    per_type: int,
+    pinned: set[int],
+) -> list[tuple[int, dict[str, Any]]]:
+    """``per_type`` instances of each scenario type, spread across difficulty.
+
+    Within a type, instances are ranked by (constraint_count, index) and the
+    picks are taken at even quantiles of that ranking. Indices in ``pinned``
+    are kept whatever their rank and count against the quota, so a task you
+    have already paid for is reused instead of re-run.
+
+    The returned order round-robins across types, so a sweep interrupted
+    halfway is still stratified rather than "all the Blocks and no Weeks".
+    """
+    buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, item in pool:
+        buckets.setdefault(str(item.get("type", "")), []).append((index, item))
+
+    chosen_by_type: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for type_name, entries in buckets.items():
+        ranked = sorted(entries, key=lambda e: (constraint_count(e[1]), e[0]))
+        kept = [e for e in ranked if e[0] in pinned]
+        rest = [e for e in ranked if e[0] not in pinned]
+        picks = [rest[i] for i in _quantile_positions(len(rest), per_type - len(kept))]
+        chosen_by_type[type_name] = sorted(
+            kept + picks, key=lambda e: (constraint_count(e[1]), e[0])
+        )
+
+    ordered: list[tuple[int, dict[str, Any]]] = []
+    round_index = 0
+    while any(len(v) > round_index for v in chosen_by_type.values()):
+        for type_name in sorted(chosen_by_type):
+            entries = chosen_by_type[type_name]
+            if len(entries) > round_index:
+                ordered.append(entries[round_index])
+        round_index += 1
+    return ordered
+
+
 def select_tasks(
     data: list[dict[str, Any]],
     *,
@@ -85,6 +178,8 @@ def select_tasks(
     exclude_tasks: list[str] | None = None,
     types: list[str] | None,
     stratify: bool,
+    per_type: int | None = None,
+    pin: list[int] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
     """Choose the subset to run, deterministically.
 
@@ -104,6 +199,19 @@ def select_tasks(
     if types:
         wanted = {t.lower() for t in types}
         pool = [(i, item) for i, item in pool if str(item.get("type", "")).lower() in wanted]
+
+    # --per-type wins over --limit/--stratify: it is a complete selection
+    # policy, not a truncation of one.
+    if per_type and not indices:
+        pool = select_by_difficulty(pool, per_type, set(pin or []))
+        if exclude_tasks:
+            excluded = {str(x).strip().lower() for x in exclude_tasks}
+            pool = [
+                (i, item)
+                for i, item in pool
+                if str(i) not in excluded and task_id_for(i, item).lower() not in excluded
+            ]
+        return pool
 
     if stratify and not indices:
         buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
@@ -131,6 +239,42 @@ def select_tasks(
         ]
 
     return pool
+
+
+# --------------------------------------------------------------------------
+# workspace isolation
+# --------------------------------------------------------------------------
+
+
+def enclosing_git_root(path: Path) -> Path | None:
+    """Nearest ancestor of ``path`` (inclusive) that holds a ``.git`` entry.
+
+    ``.git`` may be a directory (a normal checkout) or a file (a worktree or
+    submodule); both make an agent CLI adopt that ancestor as its project
+    root. ``path`` need not exist yet.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def workspaces_root_for(args: argparse.Namespace) -> Path:
+    raw = getattr(args, "workspaces_root", None)
+    return Path(raw).expanduser() if raw else DEFAULT_WORKSPACES_ROOT
+
+
+def check_workspaces_root(root: Path) -> None:
+    """Refuse a workspaces root inside a git work tree (see DEFAULT_WORKSPACES_ROOT)."""
+    repo = enclosing_git_root(root)
+    if repo is not None:
+        raise SystemExit(
+            f"workspaces root {root} is inside the git work tree at {repo}.\n"
+            "An agent CLI started there resolves its project root upward to that\n"
+            "repo and reads/writes it instead of the workspace. Pass\n"
+            f"--workspaces-root outside any repo (default: {DEFAULT_WORKSPACES_ROOT})."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +338,26 @@ def build_bench_cmd(
     return cmd
 
 
+def _persist_artifact(artifact_path: Path, text: str) -> None:
+    """Write the harvested text to ``artifact_path``, overwriting what is there.
+
+    PLAN-SWEEP-REPAIR.md §P1. This used to be guarded by
+    ``if not artifact_path.is_file()``. On a halted arm-C run the kusudaemon
+    CLI's ``--output-dir`` copy has already dropped a SINGLE unit file at
+    ``raw/<stem>.md`` (there is no assembly step on the halt path), so the
+    guard meant the correctly assembled text was returned to the record and
+    never reached disk. ``write_predictions`` then re-read the stale file:
+    000-week armC seed1's raw file was ``out/unit-03.md`` byte-for-byte
+    (12 of 52 blocks) while records.jsonl said completion_rate 100.0.
+    The harvested text is the most complete view we have, so it always wins.
+    """
+    try:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def harvest_artifact(
     arm: str,
     artifact_path: Path,
@@ -232,8 +396,21 @@ def harvest_artifact(
                     for out_file in out_dir.glob("*.md"):
                         candidates.append(out_file)
         elif task_id:
-            pattern = f"*{task_id}*arm{arm}*s{seed}*"
-            run_dirs = sorted(root.glob(pattern), reverse=True)
+            # §P1: run dirs come in two namings — `longgen_<task>_arm<A>_seed<N>`
+            # (current) and `bench_longgenbench_<task>_arm<A>_s<N>_<epoch>` (pre
+            # 2026-09-07). The single `*s{seed}*` pattern matched only the old
+            # one: "seed1" contains no "s1", so a --score-only rerun that had no
+            # run_id silently found no run dir and fell back to whatever single
+            # file was already sitting at the output path.
+            patterns = (
+                f"*{task_id}*arm{arm}*seed{seed}*",
+                f"*{task_id}*arm{arm}*s{seed}_*",
+            )
+            seen: dict[str, Path] = {}
+            for pattern in patterns:
+                for rdir in root.glob(pattern):
+                    seen[str(rdir)] = rdir
+            run_dirs = sorted(seen.values(), key=lambda q: q.name, reverse=True)
             for rdir in run_dirs:
                 out_dir = rdir / "out"
                 if out_dir.is_dir():
@@ -246,11 +423,7 @@ def harvest_artifact(
             if main_md.is_file():
                 text = main_md.read_text(encoding="utf-8", errors="replace")
                 if text.strip():
-                    if not artifact_path.is_file():
-                        try:
-                            artifact_path.write_text(text, encoding="utf-8")
-                        except OSError:
-                            pass
+                    _persist_artifact(artifact_path, text)
                     return text
         except OSError:
             pass
@@ -286,24 +459,39 @@ def harvest_artifact(
                     continue
             if parts_texts:
                 text = "\n\n".join(parts_texts) + "\n"
-                if not artifact_path.is_file():
-                    try:
-                        artifact_path.write_text(text, encoding="utf-8")
-                    except OSError:
-                        pass
+                _persist_artifact(artifact_path, text)
                 return text
         except Exception:
             pass
+    # §P1: last structured resort before the bare candidate list — a halted run
+    # leaves out/unit-NN.md per spine segment and no assembly step ever runs, so
+    # concatenating them in ordinal order is the whole document. Returning a
+    # single one of them (which the flat `candidates` glob below would do) is
+    # what silently scored 000-week armC seed1 at 12 of 52 blocks.
+    for rdir in run_dirs:
+        unit_files = sorted(
+            (rdir / "out").glob("unit-*.md"),
+            key=lambda q: (len(q.stem), q.stem),
+        ) if (rdir / "out").is_dir() else []
+        if len(unit_files) > 1:
+            parts = []
+            for uf in unit_files:
+                try:
+                    t = uf.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if t.strip():
+                    parts.append(t.rstrip())
+            if parts:
+                text = "\n\n".join(parts) + "\n"
+                _persist_artifact(artifact_path, text)
+                return text
     for path in candidates:
         try:
             if path.is_file():
                 text = path.read_text(encoding="utf-8", errors="replace")
                 if text.strip():
-                    if not artifact_path.is_file():
-                        try:
-                            artifact_path.write_text(text, encoding="utf-8")
-                        except OSError:
-                            pass
+                    _persist_artifact(artifact_path, text)
                     return text
         except OSError:
             continue
@@ -325,9 +513,17 @@ def run_one(
     prompts_dir = results_dir / "prompts"
     raw_dir = results_dir / "raw"
     bench_dir = results_dir / "bench"
-    ws_dir = results_dir / "workspaces" / stem
-    for d in (prompts_dir, raw_dir, bench_dir, ws_dir):
+    score_only = bool(getattr(args, "score_only", False))
+    ws_dir = workspaces_root_for(args) / stem
+    for d in (prompts_dir, raw_dir, bench_dir):
         d.mkdir(parents=True, exist_ok=True)
+    if not score_only:
+        # Checked per cell as well as once in main(): run_one is also driven
+        # directly (tests, ad-hoc reruns), and a cell must never launch an
+        # agent whose cwd sits inside a repo.
+        check_workspaces_root(ws_dir)
+        if not args.dry_run:
+            ws_dir.mkdir(parents=True, exist_ok=True)
 
     prompt_file = prompts_dir / f"{task_id}.txt"
     if not prompt_file.is_file():
@@ -342,7 +538,6 @@ def run_one(
     # --score-only: the artifact is already on disk (a finished or parked
     # run) — skip the model subprocess entirely and go straight to
     # harvest + score. Same record/prediction/summary shape as a real run.
-    score_only = bool(getattr(args, "score_only", False))
     if score_only:
         cmd: list[str] = []
     else:
@@ -461,8 +656,20 @@ def run_one(
     halt_category = classify_halt(halt_reason)
     # PLAN-SWEEP-REPAIR.md §C2: "unknown" (escalation with no detail) is
     # quarantined like transport/budget — not a capability measurement.
-    is_valid = halt_category not in ("transport", "budget", "unknown")
+    #
+    # §P4: unless the document was already finished when the halt landed. All
+    # three 000-week armC seeds wrote 52/52 blocks; seed1 then died in review
+    # on a truncated response and seed3 on a miscounted gate. Quarantining
+    # those discards a completion measurement that is fully on disk and, worse,
+    # discards exactly the runs where the harness (not the model) failed —
+    # which biases the arm-C mean upward. A halt after completion is a harness
+    # defect to fix, so it is recorded and surfaced, not excluded.
+    expected_blocks = int(item.get("number", 0) or 0)
+    complete = expected_blocks > 0 and len(parsed) >= expected_blocks
+    quarantined = halt_category in ("transport", "budget", "unknown")
+    is_valid = (not quarantined) or complete
     invalid_reason = halt_category if not is_valid else None
+    halt_after_complete = bool(halt_reason) and complete
 
     return {
         "benchmark": "longgenbench",
@@ -485,6 +692,7 @@ def run_one(
         "halt_reason": halt_reason,
         "valid": is_valid,
         "invalid_reason": invalid_reason,
+        "halt_after_complete": halt_after_complete,
         "flags": resolved_flags,
         "artifact_path": str(artifact_path) if artifact_path.is_file() else None,
         "artifact_chars": len(raw_text),
@@ -493,6 +701,7 @@ def run_one(
         "completion_rate": round(completion, 3),
         "max_parallel": record.get("max_parallel", int(getattr(args, "max_parallel", 1) or 1)),
         "max_parallel_derived": record.get("max_parallel_derived"),
+        "dispatch_policy": record.get("dispatch_policy"),
         "commit": record.get("commit"),
     }
 
@@ -550,6 +759,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "timeouts": 0,
                 "empty_artifacts": 0,
                 "halts": 0,
+                "halts_after_complete": 0,
                 "excluded_by_reason": {},
             },
         )
@@ -563,13 +773,22 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             bucket["completion_rates"].append(rec.get("completion_rate", 0.0))
             bucket["tokens"] += _total_tokens(rec)
 
-        bucket["wall_clock_s"] += float(rec.get("harness_wall_clock_s") or 0.0)
+        # §P4: --score-only records harness_wall_clock_s = 0 (no subprocess was
+        # run), so a rescored matrix must fall back to the wall clock the
+        # original run recorded or the summary reports 0.0s for real work.
+        bucket["wall_clock_s"] += float(
+            rec.get("harness_wall_clock_s") or rec.get("wall_clock_s") or 0.0
+        )
         if rec.get("timed_out"):
             bucket["timeouts"] += 1
         if not rec.get("artifact_chars"):
             bucket["empty_artifacts"] += 1
         if rec.get("halt_reason"):
             bucket["halts"] += 1
+            # §P4: a halt on an already-complete document is a harness defect,
+            # not a capability result. Surfaced so it cannot hide inside `halts`.
+            if rec.get("halt_after_complete"):
+                bucket["halts_after_complete"] += 1
 
     summary: dict[str, Any] = {"arms": {}}
     for arm, bucket in sorted(by_arm.items()):
@@ -585,6 +804,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "total_tokens": bucket["tokens"],
             "total_wall_clock_s": round(bucket["wall_clock_s"], 1),
             "timeouts": bucket["timeouts"],
+            "halts_after_complete": bucket["halts_after_complete"],
             "empty_artifacts": bucket["empty_artifacts"],
             "halts": bucket["halts"],
             "excluded": {
@@ -704,8 +924,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flags", default=None,
                    help="Comma- or space-separated env flags to pass through (e.g. KUSUDAEMON_TIER_OUTPUT_SIGNALS=1).")
     p.add_argument("--results-dir", default=str(_REPO_ROOT / "bench_results" / "longgen"))
+    p.add_argument("--workspaces-root", default=None,
+                   help="Parent of the per-cell agent workspaces. Must be outside any git "
+                        f"work tree (default {DEFAULT_WORKSPACES_ROOT}).")
     p.add_argument("--resume", action="store_true",
                    help="Skip a cell whose bench record already exists.")
+    p.add_argument("--per-type", type=int, default=None,
+                   help="Run N instances of EACH scenario type, spread across the "
+                        "constraint-count distribution (min/Q1/median/Q3/max at N=5). "
+                        "Overrides --limit/--stratify. See select_by_difficulty.")
+    p.add_argument("--pin", type=int, nargs="+", default=None,
+                   help="Dataset indices --per-type must include whatever their rank "
+                        "(they count against the per-type quota) — use this to reuse "
+                        "tasks you have already run.")
     p.add_argument("--score-only", action="store_true",
                    help="Skip the model subprocess per cell; harvest the "
                         "artifact already on disk (finished or parked run) "
@@ -749,19 +980,26 @@ def main() -> int:
         exclude_tasks=args.exclude_tasks,
         types=args.types,
         stratify=args.stratify,
+        per_type=getattr(args, "per_type", None),
+        pin=getattr(args, "pin", None),
     )
     if not tasks:
         raise SystemExit("no tasks selected")
 
     results_dir = Path(args.results_dir).expanduser()
     results_dir.mkdir(parents=True, exist_ok=True)
+    if not args.score_only and not args.list_tasks:
+        check_workspaces_root(workspaces_root_for(args))
 
     print(f"dataset:  {dataset_path}  ({len(data)} tasks)")
     print(f"selected: {len(tasks)} tasks x {len(args.arms)} arms x {len(args.seeds)} seeds "
           f"= {len(tasks) * len(args.arms) * len(args.seeds)} runs")
+    pinned = set(getattr(args, "pin", None) or [])
     for index, item in tasks:
         print(f"  [{index:3d}] {task_id_for(index, item)}  "
-              f"{item.get('number')} x {item.get('type')!r} entries")
+              f"{item.get('number')} x {item.get('type')!r} entries  "
+              f"{constraint_count(item)} checks"
+              f"{'  (pinned)' if index in pinned else ''}")
     if args.list_tasks:
         return 0
 

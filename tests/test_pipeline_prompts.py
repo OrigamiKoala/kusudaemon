@@ -455,7 +455,10 @@ class WorkspaceModePromptsTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"KUSUDAEMON_WORKSPACE_ARTIFACT_PROMPT": "0"}):
                 p_single_def = build_node_prompt(single_node, run_dir, is_workspace=True, workspace_root=ws_root)
                 p_planner_def = build_node_prompt(planner_leaf, run_dir, is_workspace=True, workspace_root=ws_root)
-                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_single_def)
+                # PLAN-SWEEP-REPAIR.md §J10 reworded the lead sentence to name both
+                # accepted layouts (single file or part files); the clause that
+                # distinguishes this branch from the workspace one is the tail.
+                self.assertIn("is the deliverable; nothing else you write or say is.", p_single_def)
                 self.assertNotIn("Your deliverables are the files your brief names", p_single_def)
 
             # 2. Flag=1, is_workspace=True:
@@ -464,17 +467,17 @@ class WorkspaceModePromptsTest(unittest.TestCase):
                 p_single = build_node_prompt(single_node, run_dir, is_workspace=True, workspace_root=ws_root)
                 self.assertIn("Your deliverables are the files your brief names", p_single)
                 self.assertIn("written in place under", p_single)
-                self.assertNotIn("That file is the deliverable; nothing else you write or say is.", p_single)
+                self.assertNotIn("is the deliverable; nothing else you write or say is.", p_single)
 
                 # §R2: planner_leaf keeps standard prompt byte-for-byte in artifact_instruction segment
                 p_planner = build_node_prompt(planner_leaf, run_dir, is_workspace=True, workspace_root=ws_root)
                 self.assertEqual(p_planner, p_planner_def)
-                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_planner)
+                self.assertIn("is the deliverable; nothing else you write or say is.", p_planner)
                 self.assertNotIn("Your deliverables are the files your brief names", p_planner)
 
                 # text/corpus mode (is_workspace=False) keeps standard prompt
                 p_corpus = build_node_prompt(single_node, run_dir, is_workspace=False)
-                self.assertIn("That file is the deliverable; nothing else you write or say is.", p_corpus)
+                self.assertIn("is the deliverable; nothing else you write or say is.", p_corpus)
 
     def test_declared_inputs_manifest_segment(self) -> None:
         from kusudaemon.v1.tree import NodeBudget

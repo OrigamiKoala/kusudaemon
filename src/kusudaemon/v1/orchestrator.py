@@ -18,6 +18,15 @@ deterministic`` performs the same halt/escalate arbitration (already
 code-side) and picks the first ready node — which, by construction
 (``v2/planner.py`` writes tree.json in spine order and leaves carry
 ``depends_on=[]``), is the earliest unfinished node in document order.
+
+PLAN-SWEEP-REPAIR.md §L adds the event-driven orchestrator
+(``dispatch_policy="orchestrator"``, the default): the one agent whose only
+job is deciding when to dispatch or redispatch. It is consulted every time a
+node finishes (and once at the start), is told what finished and how, sees
+what is in flight and what is dispatchable, and answers ``dispatch`` (up to
+the free slots) or ``wait`` (naming the in-flight nodes it is waiting on).
+Failed nodes come back to it instead of retrying in place. Terminal states —
+all passed, or nothing ready and nothing in flight — stay code-decided.
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ from ..roles.protocol import RoleProvider
 from .manifest import read_manifest_tail
 from .tree import TaskTree
 
-DispatchPolicy = Literal["model", "document_order", "deterministic"]
+DispatchPolicy = Literal["orchestrator", "model", "document_order", "deterministic"]
 
 DISPATCH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -231,3 +240,399 @@ def _count_statuses(tree: TaskTree) -> dict[str, int]:
     for node in tree.nodes.values():
         counts[node.status] = counts.get(node.status, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# PLAN-SWEEP-REPAIR.md §L — the event-driven orchestrator
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = _os.getenv(name)
+    try:
+        return max(minimum, int(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _os.getenv(name)
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def orchestrator_max_tokens() -> int:
+    """§L.2 output cap. ``provider._default_max_tokens`` gives any schema with a
+    non-scalar property 4096; the legacy scalar dispatch schema got 1024.
+
+    §P3: raised 1024 -> 4096 to match that peer value. ORCHESTRATOR_SCHEMA has
+    arrays, so 1024 was never the right bucket for it, and on a reasoning model
+    the cap covers the thinking trace too: every orchestrator call in the
+    2026-09-12 000-week sweep returned exactly 1024 completion tokens and no
+    parseable decision, surfacing as "no answer within 90s" and a document-order
+    fallback in all three seeds. ``complete_json`` escalates from here if a
+    response still stops at the ceiling; the deadline
+    (KUSUDAEMON_ORCHESTRATOR_DEADLINE_S, 90s) bounds the wall clock either way.
+    """
+    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", 4096)
+
+
+def orchestrator_deadline_s() -> float:
+    """§L.2: how long a free slot may wait on one decision before the harness
+    dispatches in document order instead. ``<= 0`` disables the deadline."""
+    return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 90.0)
+
+
+def orchestrator_max_listed() -> int:
+    """§L.3: per-section cap on listed nodes/events, so a call's input is
+    bounded by a constant instead of by the ready set (PLAN-zeromem.md §1.8)."""
+    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_LISTED", 20)
+
+
+# §L.2: every property is required and no string-length keywords are used, so
+# the schema is valid under ``response_format: json_schema, strict: true``
+# (strict endpoints reject optional properties). Unused arrays are sent empty.
+ORCHESTRATOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["action", "node_ids", "wait_on", "reason"],
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["dispatch", "wait"]},
+        "node_ids": {"type": "array", "items": {"type": "string"}},
+        "wait_on": {"type": "array", "items": {"type": "string"}},
+        "reason": {"type": "string"},
+    },
+}
+
+_REASON_CAP = 600
+
+ORCHESTRATOR_SYSTEM_PROMPT = (
+    "You are the Orchestrator of a long-horizon task harness. Your only job is "
+    "deciding when to dispatch or redispatch nodes. Writers do the work; gates "
+    "and a reviewer judge it; you never see node content and never judge "
+    "correctness.\n\n"
+    "You are called at the start of execution and again every time a node "
+    "finishes. Each call tells you what just finished and how, your previous "
+    "decision, what is running, and which nodes can be dispatched now. Answer "
+    "with exactly one JSON object, always including all four fields:\n"
+    '- {"action": "dispatch", "node_ids": [...], "wait_on": [], "reason": "..."} '
+    "— start these nodes now. Name only nodes listed as dispatchable, at most "
+    "as many as there are free slots.\n"
+    '- {"action": "wait", "node_ids": [], "wait_on": [...], "reason": "..."} — '
+    "start nothing now. Name the running node(s) whose result you need first. "
+    "You cannot wait when nothing is running: nothing would ever wake you.\n\n"
+    "Rules and guidance:\n"
+    "- Free slots are filled unless you say why not. If you dispatch fewer "
+    "nodes than there are free slots while other nodes are dispatchable, put "
+    "the running or just-dispatched node(s) you are waiting for in wait_on; "
+    "with wait_on empty the harness fills the remaining slots in document order.\n"
+    "- A failed node reappears as dispatchable with its defect and attempt "
+    "count. Redispatch it, run other work first, or wait for a running node "
+    "whose output it needs. The harness stops a node at its attempt limit.\n"
+    "- Declared dependencies are already enforced: nodes held by them are "
+    "listed separately and are not dispatchable. You may also hold a "
+    "dispatchable node back for a dependency nobody declared, but only by "
+    "naming the running node it waits on.\n"
+    "- Long lists are truncated; unlisted dispatchable nodes come later in "
+    "document order and remain valid choices.\n"
+    "Respond with the JSON object only."
+)
+
+
+@dataclass
+class NodeEvent:
+    """One node finishing, as the orchestrator is told about it."""
+
+    node_id: str
+    outcome: str  # passed | failed | blocked | throttled | split | crashed | stopped
+    attempts: int
+    defect: str = ""
+    duration_s: float | None = None
+
+
+@dataclass
+class OrchestratorDecision:
+    action: str  # "dispatch" | "wait"
+    node_ids: list[str]
+    wait_on: list[str]
+    reason: str
+    corrections: list[str]
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "node_ids": list(self.node_ids),
+            "wait_on": list(self.wait_on),
+            "reason": self.reason,
+            "corrections": list(self.corrections),
+        }
+
+
+def classify_node_event(
+    node: Any, *, duration_s: float | None = None, crashed: BaseException | None = None
+) -> NodeEvent:
+    if crashed is not None:
+        outcome = "crashed"
+        defect = f"{type(crashed).__name__}: {crashed}"
+    else:
+        status = getattr(node, "status", "")
+        defect = getattr(node, "last_defect", "") or ""
+        if status == "passed":
+            outcome, defect = "passed", ""
+        elif status == "split":
+            outcome = "split"
+        elif status == "blocked":
+            outcome = "blocked"
+        elif status == "pending" and "throttled" in defect:
+            outcome = "throttled"
+        elif status == "pending":
+            outcome = "failed"
+        else:
+            outcome = "stopped"
+    return NodeEvent(
+        node_id=node.id,
+        outcome=outcome,
+        attempts=int(getattr(node, "attempts", 0) or 0),
+        defect=defect,
+        duration_s=duration_s,
+    )
+
+
+def _describe_event(event: NodeEvent, max_attempts: int) -> str:
+    took = f" after {event.duration_s:.0f}s" if event.duration_s is not None else ""
+    if event.outcome == "passed":
+        return f"- {event.node_id} PASSED{took}"
+    if event.outcome == "failed":
+        return (
+            f"- {event.node_id} FAILED attempt {event.attempts} of {max_attempts}{took}: "
+            f"{event.defect[:300]}"
+        )
+    if event.outcome == "blocked":
+        return (
+            f"- {event.node_id} BLOCKED — attempt limit ({max_attempts}) reached{took}; "
+            f"last defect: {event.defect[:300]}"
+        )
+    if event.outcome == "throttled":
+        return f"- {event.node_id} THROTTLED by the provider{took} (not counted as an attempt)"
+    if event.outcome == "split":
+        return f"- {event.node_id} SPLIT into child nodes{took}"
+    if event.outcome == "crashed":
+        return f"- {event.node_id} CRASHED in the harness{took}: {event.defect[:300]}"
+    return f"- {event.node_id} stopped{took} with status {event.outcome}"
+
+
+def _describe_previous(previous: dict[str, Any] | None) -> str:
+    if not previous:
+        return "- none in this run yet"
+    age = previous.get("age_s")
+    when = f" ({age:.0f}s ago)" if isinstance(age, (int, float)) else ""
+    head = f"- decision {previous.get('round', '?')}{when}: {previous.get('action')}"
+    if previous.get("node_ids"):
+        head += f" {previous['node_ids']}"
+    if previous.get("wait_on"):
+        head += f", waiting on {previous['wait_on']}"
+    lines = [head, f"  reason: {str(previous.get('reason', ''))[:300]}"]
+    if previous.get("corrections"):
+        lines.append(f"  harness corrections: {'; '.join(map(str, previous['corrections']))[:300]}")
+    return "\n".join(lines)
+
+
+def build_orchestrator_messages(
+    tree: TaskTree,
+    *,
+    events: list[NodeEvent],
+    ready: list[str],
+    in_flight: list[tuple[str, float]],
+    free_slots: int,
+    max_slots: int,
+    max_attempts: int,
+    manifest_path: str,
+    decision_index: int,
+    first_call: bool,
+    previous_decision: dict[str, Any] | None = None,
+    max_listed: int | None = None,
+) -> list[dict[str, str]]:
+    """Compact state for one orchestrator call, bounded by a constant.
+
+    §L.3: each list is capped at ``max_listed`` entries (retry candidates
+    first, then document order), with the overflow stated as a count, so the
+    input per call no longer grows with the ready set and a run's total
+    orchestrator input is O(completions), not O(completions x ready).
+    """
+    cap = max_listed if max_listed is not None else orchestrator_max_listed()
+    lines = [f"decision: {decision_index}", f"free slots: {free_slots} of {max_slots}", ""]
+
+    lines.append("what just happened:")
+    if events:
+        shown = events[-cap:]
+        omitted = events[:-cap] if len(events) > cap else []
+        if omitted:
+            tally: dict[str, int] = {}
+            for e in omitted:
+                tally[e.outcome] = tally.get(e.outcome, 0) + 1
+            lines.append(f"- … {len(omitted)} earlier completions not listed: {tally}")
+        lines += [_describe_event(e, max_attempts) for e in shown]
+    elif first_call:
+        lines.append("- execution is starting; nothing has run yet in this process")
+    else:
+        lines.append("- no node has finished since your last decision")
+    lines.append("")
+
+    lines.append("your previous decision:")
+    lines.append(_describe_previous(previous_decision))
+    lines.append("")
+
+    lines.append(f"running now ({len(in_flight)}):")
+    if in_flight:
+        for node_id, elapsed in in_flight[:cap]:
+            node = tree.nodes.get(node_id)
+            attempt = (node.attempts + 1) if node is not None else "?"
+            brief = node.brief[:120] if node is not None else ""
+            lines.append(f"- {node_id} running {elapsed:.0f}s, attempt {attempt} :: {brief}")
+        if len(in_flight) > cap:
+            lines.append(f"- … {len(in_flight) - cap} more running")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append(f"dispatchable now ({len(ready)}):")
+    retries = [i for i in ready if tree.nodes[i].attempts > 0]
+    fresh = [i for i in ready if tree.nodes[i].attempts == 0]
+    listed = (retries + fresh)[:cap]
+    for node_id in listed:
+        node = tree.nodes[node_id]
+        defect = f' last_defect="{node.last_defect[:200]}"' if node.last_defect else ""
+        lines.append(
+            f"- {node.id} attempts={node.attempts}/{max_attempts}{defect} :: {node.brief[:160]}"
+        )
+    if len(ready) > len(listed):
+        lines.append(
+            f"- … {len(ready) - len(listed)} more dispatchable, not listed (later in document order)"
+        )
+    if not ready:
+        lines.append("- (none)")
+
+    held = [
+        n for n in tree.nodes.values()
+        if n.status == "pending" and n.id not in ready and n.depends_on
+    ]
+    if held:
+        lines.append("")
+        lines.append(f"held by declared dependencies ({len(held)}):")
+        for node in held[:cap]:
+            deps = ", ".join(
+                f"{d} ({tree.nodes[d].status if d in tree.nodes else 'missing'})" for d in node.depends_on
+            )
+            lines.append(f"- {node.id} waits on {deps} :: {node.brief[:80]}")
+        if len(held) > cap:
+            lines.append(f"- … {len(held) - cap} more held")
+
+    lines += ["", f"all nodes by status: {_count_statuses(tree)}"]
+    tail = read_manifest_tail(manifest_path, n=5)
+    if tail:
+        lines.append("")
+        lines.append("recent manifest:")
+        for entry in tail:
+            lines.append(f"- {entry.get('node')}: gates={entry.get('gates')}")
+    return [
+        {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def fallback_decision_payload(ready: list[str], free_slots: int, why: str) -> dict[str, Any]:
+    """Document order for one decision, when the orchestrator did not answer."""
+    return {
+        "action": "dispatch",
+        "node_ids": list(ready[: max(0, free_slots)]),
+        "wait_on": [],
+        "reason": f"harness fallback (document order): {why}",
+    }
+
+
+def parse_orchestrator_decision(
+    payload: dict[str, Any],
+    *,
+    ready: list[str],
+    in_flight: list[str],
+    free_slots: int,
+) -> OrchestratorDecision:
+    """Validate a decision against the harness-computed state; correct by code.
+
+    Invariant 2 ("gated by code, not by model judgment") applied to the two
+    actions: a dispatch may only name dispatchable nodes and only fill free
+    slots; a wait must name running nodes, and waiting with nothing running
+    is refused because nothing would ever wake the orchestrator again. §L.6:
+    a dispatch that leaves slots free while work is dispatchable must name
+    what it is waiting on, or code fills the slots. Every correction is
+    recorded on the decision.
+    """
+    action = str(payload.get("action", "dispatch"))
+    reason = str(payload.get("reason", ""))[:_REASON_CAP]
+    corrections: list[str] = []
+    free_slots = max(0, free_slots)
+    named_waits = [str(x) for x in (payload.get("wait_on") or [])]
+
+    def first_ready() -> OrchestratorDecision:
+        return OrchestratorDecision("dispatch", ready[:1], [], reason, corrections)
+
+    if action == "wait":
+        if payload.get("node_ids"):
+            corrections.append(f"ignored node_ids {payload.get('node_ids')!r} on a wait")
+        valid = [x for x in dict.fromkeys(named_waits) if x in in_flight]
+        if not in_flight:
+            if ready and free_slots > 0:
+                corrections.append(
+                    "wait with nothing running would never wake; harness dispatched "
+                    f"{ready[0]!r}"
+                )
+                return first_ready()
+            corrections.append("wait with nothing running and nothing dispatchable")
+            return OrchestratorDecision("wait", [], [], reason, corrections)
+        if not valid:
+            corrections.append(
+                f"wait named no running node ({named_waits!r}); harness waits on all running nodes"
+            )
+            valid = list(in_flight)
+        elif len(valid) != len(set(named_waits)):
+            corrections.append(f"dropped non-running wait targets {sorted(set(named_waits) - set(valid))!r}")
+        return OrchestratorDecision("wait", [], valid, reason, corrections)
+
+    if action != "dispatch":
+        corrections.append(f"unknown action {action!r} treated as dispatch")
+    named = [str(x) for x in (payload.get("node_ids") or [])]
+    unique = list(dict.fromkeys(named))
+    valid = [x for x in unique if x in ready]
+    if len(valid) != len(unique):
+        corrections.append(f"dropped non-dispatchable node ids {sorted(set(unique) - set(valid))!r}")
+    if len(valid) > free_slots:
+        corrections.append(f"trimmed dispatch to {free_slots} free slot(s); dropped {valid[free_slots:]!r}")
+        valid = valid[:free_slots]
+    if not valid:
+        if in_flight:
+            corrections.append("dispatch named nothing dispatchable; harness waits on all running nodes")
+            return OrchestratorDecision("wait", [], list(in_flight), reason, corrections)
+        if ready and free_slots > 0:
+            corrections.append(
+                f"dispatch named nothing dispatchable and nothing is running; harness dispatched {ready[0]!r}"
+            )
+            return first_ready()
+        return OrchestratorDecision("wait", [], [], reason, corrections)
+
+    # §L.6: slots left free while work is dispatchable need a stated reason.
+    remaining = [x for x in ready if x not in valid]
+    idle = free_slots - len(valid)
+    wait_targets = [x for x in dict.fromkeys(named_waits) if x in in_flight or x in valid]
+    if idle > 0 and remaining:
+        if wait_targets:
+            return OrchestratorDecision("dispatch", valid, wait_targets, reason, corrections)
+        fill = remaining[:idle]
+        corrections.append(
+            f"left {idle} slot(s) free with no wait_on; harness filled them in document order with {fill!r}"
+        )
+        return OrchestratorDecision("dispatch", valid + fill, [], reason, corrections)
+    return OrchestratorDecision("dispatch", valid, [], reason, corrections)

@@ -92,23 +92,38 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
-from .gates import GateResult, all_passed, evaluate_gates, unmet, write_gate_cache
+from .gates import (
+    GateResult,
+    all_passed,
+    count_units,
+    evaluate_gates,
+    first_unit_key,
+    unmet,
+    write_gate_cache,
+)
 from .manifest import append_manifest_line
 from .orchestrator import (
     DispatchDecision,
     DispatchPolicy,
+    decide_next_action_deterministic,
     decide_next_action_with_policy,
 )
 from ..roles.protocol import RoleProvider
-from .reviewer import ReviewVerdict, compute_verdict_digest, review_node
+from .reviewer import (
+    ReviewVerdict,
+    compute_verdict_digest,
+    review_node,
+    unit_delimiter_from_gates,
+)
 from .run_dir import (
     audit_path,
     ensure_audit_path,
@@ -561,6 +576,13 @@ async def run_round_loop(
     way. ``max_parallel=1`` is the byte-identical event sequence to the
     pre-§C2 loop: chunks of one are sequential awaits in the same order.
 
+    PLAN-SWEEP-REPAIR.md §K1 supersedes the gather for ``max_parallel > 1``:
+    ``refill_loop`` runs each node as its own dispatch/review/retry job and
+    refills a slot as soon as any job finishes, so a fast failure retries
+    immediately and a waiting ready node starts without waiting for the
+    slowest episode. The orchestrator is still consulted once per fill and
+    the fill still adds ready nodes by code with no extra model calls.
+
     Concurrency guards (all inert at ``max_parallel=1``):
     - ``EventLog`` serializes appends with its own ``threading.Lock``
     (``v0/events.py``).
@@ -649,150 +671,668 @@ async def run_round_loop(
             triage_provider=triage_provider,
         )
 
-    # §C2: "gather the resume scan" — nodes caught mid-flight by a crash
-    # resume in max_parallel-sized chunks instead of one big sequential
-    # pass. Chunks of one = today's exact sequence.
-    in_flight_dispatch = [n for n in tree.nodes.values() if n.status == "dispatched"]
-    for chunk in chunks(in_flight_dispatch):
-        await asyncio.gather(*(dispatch(n) for n in chunk))
-    in_flight_review = [
-        n for n in tree.nodes.values()
-        if n.status == "awaiting_review"
-        or (n.status in ("pending", "blocked") and (is_node_bypassed(run_dir, n.id, "review") or is_node_bypassed(run_dir, n.id)))
-    ]
-    for chunk in chunks(in_flight_review):
-        for n in chunk:
-            if n.status != "awaiting_review":
+    # ------------------------------------------------------------------
+    # max_parallel > 1: continuous refill (PLAN-SWEEP-REPAIR.md §K1).
+    #
+    # The §C2 wave used to be ``await asyncio.gather(*wave)`` followed by a
+    # serial per-node retry loop, so a node's retry — and every ready node
+    # the wave had no room for — waited on the *slowest* episode in the
+    # wave, and then on each other's retries one at a time. On
+    # longgen_000-week_armC_seed1 unit-01 died in 0.7 s and unit-03 was
+    # never admitted, and both sat idle behind unit-02's 1800 s episode.
+    #
+    # Here each node runs as its own job (dispatch -> review -> in-place
+    # retries, exactly the §11.10.5 sequence) and the loop wakes on the
+    # FIRST job to finish, refilling the freed slot straight away. The
+    # orchestrator is consulted once per refill, on a view of the tree in
+    # which every node a job still owns reads as "dispatched" — a job
+    # sitting in its retry backoff is "pending" on disk and in memory, and
+    # must not be handed to a second job.
+    # ------------------------------------------------------------------
+    async def refill_loop(first_round: int, max_ready_width: int) -> int:
+        running: dict[asyncio.Future, TaskNode] = {}
+        stopping = False  # stop starting work, including in-job retries
+        no_new_rounds = False  # stop consulting the orchestrator only
+        first_error: BaseException | None = None
+        rounds_used = 0
+
+        def claimed_ids() -> set[str]:
+            return {n.id for n in running.values()}
+
+        def wave_cap() -> int:
+            return max(1, min(max_parallel, admission.current_wave_cap))
+
+        def halted() -> bool:
+            return stopping or (should_halt is not None and should_halt())
+
+        async def after_attempt(node: TaskNode) -> None:
+            # §B7.3 AIMD, per finished attempt rather than per wave.
+            throttled = 1 if "throttled" in (node.last_defect or "") else 0
+            admission.record_wave_outcome(throttled, max_parallel)
+            if throttled:
+                await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
+
+        async def node_job(node: TaskNode, start: str) -> None:
+            if start == "dispatch":
+                await dispatch(node)
+                await after_attempt(node)
+            if node.status == "awaiting_review":
+                await review(node)
+            # §11.10.5 in-place retry, unchanged except that it no longer
+            # waits for the rest of the wave.
+            while node.status == "pending" and node.attempts < max_attempts:
+                if is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id):
+                    node.status = "awaiting_review"
+                    await _save_tree_locked(tree, tree_path, tree_lock)
+                    await review(node)
+                    break
+                # §E15 (c)
+                if halted():
+                    break
+                if node.attempts > 0:
+                    await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
+                    if halted():
+                        break
+                node.status = "dispatched"
+                await _save_tree_locked(tree, tree_path, tree_lock)
+                await dispatch(node)
+                await after_attempt(node)
+                if node.status == "awaiting_review":
+                    await review(node)
+
+        def start_job(node: TaskNode, start: str) -> None:
+            running[asyncio.ensure_future(node_job(node, start))] = node
+
+        # §C2 resume scan: nodes a crash left mid-flight become jobs first,
+        # admitted through the same slots as everything else.
+        resume_queue: list[tuple[TaskNode, str]] = [
+            (n, "dispatch") for n in tree.nodes.values() if n.status == "dispatched"
+        ]
+        for n in tree.nodes.values():
+            if n.status == "awaiting_review" or (
+                n.status in ("pending", "blocked")
+                and (is_node_bypassed(run_dir, n.id, "review") or is_node_bypassed(run_dir, n.id))
+            ):
                 n.status = "awaiting_review"
-        await asyncio.gather(*(review(n) for n in chunk))
+                resume_queue.append((n, "review"))
 
-    # §11.10.16: round indices continue across process runs. round_index
-    # used to restart at 0 on every resume while the trace files were opened
-    # "a", so round 0 of the third resume appended to round 0 of the first —
-    # one file, three processes' interleaved rounds, impossible to separate.
-    # The orchestrator's own view is stateless per round, so rebasing the
-    # numbers is free: this run's rounds are just pick up where the last
-    # process left off.
-    first_round = _next_round_index(run_dir)
-    max_ready_width = len(tree.ready_nodes())
-    for offset in range(max_rounds):
-        # §E15 (a): before the orchestrator's dispatch decision — a hit
-        # here means no call is even made for a round that will never run.
-        if should_halt is not None and should_halt():
-            break
-        _sync_tree_from_disk(tree, tree_path)
-        max_ready_width = max(max_ready_width, len(tree.ready_nodes()))
-        round_index = first_round + offset
-        decision = decide_next_action_with_policy(
-            tree,
-            str(manifest),
-            provider,
-            round_index=round_index,
-            policy=dispatch_policy,
-            max_parallel=max_parallel,
-        )
-        _write_round_trace(run_dir, round_index, tree, decision)
-
-        if decision.action == "halt":
-            break
-        if decision.action == "escalate":
-            log.append(
-                {
-                    "node_id": decision.node_id or "-",
-                    "role": "orchestrator",
-                    "round": round_index,
-                    "type": "run_escalated",
-                    "reason": decision.reason,
-                }
-            )
-            break
-
-        # §E15 (b): before this round's wave is committed (nodes marked
-        # "dispatched" and actually sent out) — a hit here leaves the tree
-        # exactly as the previous round left it, no partial mutation.
-        if should_halt is not None and should_halt():
-            break
-
-        # §C2 wave: the decided node first, then the next ready nodes in
-        # tree order up to max_parallel — code-derived, zero extra model
-        # calls, and stable under resume (the ready set is deterministic).
-        target_parallel = min(max_parallel, admission.current_wave_cap)
-        wave = [tree.nodes[decision.node_id]]
-        if target_parallel > 1:
-            picked = {wave[0].id}
-            for candidate_id in tree.ready_nodes():
-                if candidate_id in picked:
-                    continue
-                # §B4: If candidate conflicted twice, it runs alone in its wave
-                if worktree_manager is not None and worktree_manager.conflict_count(candidate_id) >= 2:
-                    if len(wave) > 0:
+        try:
+            while True:
+                while not stopping and len(running) < wave_cap():
+                    if resume_queue:
+                        start_job(*resume_queue.pop(0))
                         continue
-                # §B8.3: wave-fill hardware admission
-                from ..utils.system_resources import can_admit_episode
-                if not can_admit_episode():
-                    break
-                wave.append(tree.nodes[candidate_id])
-                picked.add(candidate_id)
-                if len(wave) >= target_parallel:
-                    break
-            assert len({n.artifact for n in wave}) == len(wave), (
-                f"two in-flight nodes share an artifact path: "
-                f"{[n.artifact for n in wave]}"
-            )
+                    if no_new_rounds or rounds_used >= max_rounds:
+                        break
+                    # §E15 (a)
+                    if should_halt is not None and should_halt():
+                        no_new_rounds = True
+                        break
+                    claimed = claimed_ids()
+                    _sync_tree_from_disk(tree, tree_path, skip=claimed)
+                    with _claimed_read_as_dispatched(tree, claimed):
+                        ready = tree.ready_nodes()
+                        max_ready_width = max(max_ready_width, len(ready))
+                        if not ready and running:
+                            # Nothing new to hand out until a job finishes.
+                            break
+                        round_index = first_round + rounds_used
+                        rounds_used += 1
+                        decision = decide_next_action_with_policy(
+                            tree,
+                            str(manifest),
+                            provider,
+                            round_index=round_index,
+                            policy=dispatch_policy,
+                            max_parallel=max_parallel,
+                        )
+                        _write_round_trace(run_dir, round_index, tree, decision)
 
-        for node in wave:
-            node.status = "dispatched"
-            await _save_tree_locked(tree, tree_path, tree_lock)
+                    if decision.action == "halt":
+                        no_new_rounds = True
+                        break
+                    if decision.action == "escalate":
+                        log.append(
+                            {
+                                "node_id": decision.node_id or "-",
+                                "role": "orchestrator",
+                                "round": round_index,
+                                "type": "run_escalated",
+                                "reason": decision.reason,
+                            }
+                        )
+                        no_new_rounds = True
+                        break
+                    # §E15 (b)
+                    if should_halt is not None and should_halt():
+                        no_new_rounds = True
+                        break
+                    if decision.node_id in claimed or decision.node_id not in tree.nodes:
+                        break
+
+                    free = wave_cap() - len(running)
+                    wave = [tree.nodes[decision.node_id]]
+                    picked = claimed | {decision.node_id}
+                    admission_refused = False
+                    for candidate_id in ready:
+                        if len(wave) >= free:
+                            break
+                        if candidate_id in picked:
+                            continue
+                        # §B4: a node that conflicted twice never joins a fill
+                        if worktree_manager is not None and worktree_manager.conflict_count(candidate_id) >= 2:
+                            continue
+                        # §B8.3: wave-fill hardware admission
+                        from ..utils.system_resources import can_admit_episode
+                        if not can_admit_episode():
+                            admission_refused = True
+                            break
+                        wave.append(tree.nodes[candidate_id])
+                        picked.add(candidate_id)
+                    in_flight_artifacts = [n.artifact for n in running.values()] + [n.artifact for n in wave]
+                    assert len(set(in_flight_artifacts)) == len(in_flight_artifacts), (
+                        f"two in-flight nodes share an artifact path: {in_flight_artifacts}"
+                    )
+
+                    for node in wave:
+                        node.status = "dispatched"
+                        await _save_tree_locked(tree, tree_path, tree_lock)
+                        log.append(
+                            {
+                                "node_id": node.id,
+                                "role": "orchestrator",
+                                "round": round_index,
+                                "type": "node_dispatch_decided",
+                                "reason": (
+                                    decision.reason
+                                    if node.id == decision.node_id
+                                    else f"parallel wave fill (max_parallel={max_parallel})"
+                                ),
+                            }
+                        )
+                        start_job(node, "dispatch")
+                    if admission_refused:
+                        break
+
+                if not running:
+                    break
+                done, _ = await asyncio.wait(list(running), return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    running.pop(fut, None)
+                    exc = fut.exception()
+                    if exc is not None and first_error is None:
+                        # Let siblings finish the attempt they are in, start
+                        # nothing else, then surface the failure — gather()
+                        # used to raise at once and orphan them.
+                        first_error = exc
+                        stopping = True
+        except asyncio.CancelledError:
+            # The loop itself is being cancelled (process shutdown): take the
+            # jobs down with it.
+            for fut in running:
+                fut.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            raise
+        except Exception as exc:
+            # §L.4: a harness error here must not kill writer episodes
+            # mid-turn (§E15). Start nothing new, let in-flight attempts
+            # finish and record their outcomes, then surface the error.
             log.append(
                 {
-                    "node_id": node.id,
-                    "role": "orchestrator",
-                    "round": round_index,
-                    "type": "node_dispatch_decided",
-                    "reason": (
-                        decision.reason
-                        if node.id == decision.node_id
-                        else f"parallel wave fill (max_parallel={max_parallel})"
-                    ),
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "round_loop_error_draining",
+                    "detail": f"{type(exc).__name__}: {exc}"[:500],
+                    "in_flight": sorted(n.id for n in running.values()),
                 }
             )
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            raise
+        if first_error is not None:
+            raise first_error
+        return max_ready_width
 
-        for chunk in chunks(wave):
+    # ------------------------------------------------------------------
+    # dispatch_policy="orchestrator" (PLAN-SWEEP-REPAIR.md §L): the event-
+    # driven orchestrator. It is consulted at the start and whenever a node
+    # finishes; it alone decides what to dispatch or redispatch, or to wait.
+    # A job here is one attempt (dispatch -> review) — a failed node goes
+    # back to the pool and the orchestrator decides when it runs again.
+    # ------------------------------------------------------------------
+    async def orchestrated_loop(first_round: int, max_ready_width: int) -> int:
+        from .orchestrator import (
+            ORCHESTRATOR_SCHEMA,
+            build_orchestrator_messages,
+            classify_node_event,
+            fallback_decision_payload,
+            orchestrator_deadline_s,
+            orchestrator_max_tokens,
+            parse_orchestrator_decision,
+        )
+        from .provider import call_scope
+
+        running: dict[asyncio.Future, TaskNode] = {}
+        started_at: dict[str, float] = {}
+        events: list[Any] = []
+        news = True  # something happened since the last decision
+        calls = 0
+        # §L.5: the orchestrator is stateless per call, so its own last
+        # decision is handed back to it — recovered from events.jsonl on a
+        # resume (the filesystem is the state).
+        last_decision: dict[str, Any] | None = _last_orchestrator_decision(run_dir)
+        # §L.2: a call abandoned at its deadline keeps its worker thread; no
+        # second call is started until it returns.
+        abandoned: asyncio.Future | None = None
+        fresh_rounds = 0  # decisions that started never-attempted work (max_rounds)
+        no_new_work = False
+        stopping = False
+        first_error: BaseException | None = None
+
+        def claimed_ids() -> set[str]:
+            return {n.id for n in running.values()}
+
+        def wave_cap() -> int:
+            return max(1, min(max_parallel, admission.current_wave_cap))
+
+        async def attempt_job(node: TaskNode, start: str) -> None:
+            if start == "dispatch":
+                if node.attempts > 0 and (
+                    is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id)
+                ):
+                    node.status = "awaiting_review"
+                    await _save_tree_locked(tree, tree_path, tree_lock)
+                else:
+                    if node.attempts > 0:
+                        # Transient-failure spacing, as the in-place retry had.
+                        await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
+                    await dispatch(node)
+                    throttled = 1 if "throttled" in (node.last_defect or "") else 0
+                    admission.record_wave_outcome(throttled, max_parallel)
+                    if throttled:
+                        await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
+            if node.status == "awaiting_review":
+                await review(node)
+
+        def start_job(node: TaskNode, start: str) -> None:
+            started_at[node.id] = time.monotonic()
+            running[asyncio.ensure_future(attempt_job(node, start))] = node
+
+        resume_queue: list[tuple[TaskNode, str]] = [
+            (n, "dispatch") for n in tree.nodes.values() if n.status == "dispatched"
+        ]
+        for n in tree.nodes.values():
+            if n.status == "awaiting_review" or (
+                n.status in ("pending", "blocked")
+                and (is_node_bypassed(run_dir, n.id, "review") or is_node_bypassed(run_dir, n.id))
+            ):
+                n.status = "awaiting_review"
+                resume_queue.append((n, "review"))
+
+        try:
+            while True:
+                while resume_queue and len(running) < wave_cap():
+                    start_job(*resume_queue.pop(0))
+
+                if not stopping and not no_new_work and not resume_queue and news:
+                    # §E15 (a)
+                    if should_halt is not None and should_halt():
+                        no_new_work = True
+                    else:
+                        claimed = claimed_ids()
+                        _sync_tree_from_disk(tree, tree_path, skip=claimed)
+                        with _claimed_read_as_dispatched(tree, claimed):
+                            ready = tree.ready_nodes()
+                            max_ready_width = max(max_ready_width, len(ready) + len(claimed))
+                            free = wave_cap() - len(running)
+                            if not ready and not running:
+                                # Terminal, and code-decided: all passed, or stuck.
+                                terminal = decide_next_action_deterministic(tree, round_index=first_round + calls)
+                                _write_round_trace(run_dir, first_round + calls, tree, terminal)
+                                if terminal.action == "escalate":
+                                    log.append(
+                                        {
+                                            "node_id": "-",
+                                            "role": "orchestrator",
+                                            "round": first_round + calls,
+                                            "type": "run_escalated",
+                                            "reason": terminal.reason,
+                                        }
+                                    )
+                                break
+                            messages = None
+                            if ready and free > 0:
+                                now = time.monotonic()
+                                previous = None
+                                if last_decision is not None:
+                                    previous = dict(last_decision)
+                                    if isinstance(previous.get("ts"), (int, float)):
+                                        previous["age_s"] = max(0.0, time.time() - previous["ts"])
+                                messages = build_orchestrator_messages(
+                                    tree,
+                                    events=events,
+                                    ready=ready,
+                                    in_flight=[
+                                        (n.id, now - started_at.get(n.id, now)) for n in running.values()
+                                    ],
+                                    free_slots=free,
+                                    max_slots=max_parallel,
+                                    max_attempts=max_attempts,
+                                    manifest_path=str(manifest),
+                                    decision_index=first_round + calls,
+                                    first_call=(calls == 0),
+                                    previous_decision=previous,
+                                )
+                        if messages is None:
+                            # Nothing dispatchable, or no free slot: the only
+                            # possible answer is "wait", so no call is spent.
+                            # The events stay queued for the next real decision.
+                            news = False
+                        else:
+                            round_index = first_round + calls
+                            calls += 1
+                            told = events
+                            events = []
+                            news = False
+                            payload: Any = None
+                            why: str | None = None
+                            deadline = orchestrator_deadline_s()
+                            if abandoned is not None and not abandoned.done():
+                                why = "previous orchestrator call is still running past its deadline"
+                            else:
+                                abandoned = None
+                                cap_tokens = orchestrator_max_tokens()
+
+                                def _call(msgs: list[dict[str, str]] = messages) -> Any:
+                                    # §L.2/§L.7: bounded output, and cost stamped
+                                    # "orchestrator" — thread-local, so the shared
+                                    # provider's other callers are unaffected.
+                                    with call_scope(role="orchestrator", max_tokens=cap_tokens):
+                                        return provider.complete_json(msgs, ORCHESTRATOR_SCHEMA)
+
+                                call_task = asyncio.ensure_future(asyncio.to_thread(_call))
+                                call_task.add_done_callback(
+                                    lambda t: None if t.cancelled() else t.exception()
+                                )
+                                try:
+                                    if deadline > 0:
+                                        payload = await asyncio.wait_for(asyncio.shield(call_task), deadline)
+                                    else:
+                                        payload = await call_task
+                                except asyncio.TimeoutError:
+                                    abandoned = call_task
+                                    why = f"no answer within {deadline:.0f}s"
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:  # §L.4: never fatal to the run
+                                    why = f"{type(exc).__name__}: {exc}"
+                                if why is None and not isinstance(payload, dict):
+                                    why = f"non-object answer {type(payload).__name__}"
+                            if why is not None:
+                                payload = fallback_decision_payload(ready, free, why)
+                                log.append(
+                                    {
+                                        "node_id": "-",
+                                        "role": "orchestrator",
+                                        "round": round_index,
+                                        "type": "orchestrator_call_failed",
+                                        "detail": why[:500],
+                                    }
+                                )
+                            # The call took time: re-read the state it is applied to.
+                            claimed = claimed_ids()
+                            with _claimed_read_as_dispatched(tree, claimed):
+                                ready_now = tree.ready_nodes()
+                            decision = parse_orchestrator_decision(
+                                payload,
+                                ready=ready_now,
+                                in_flight=sorted(claimed),
+                                free_slots=wave_cap() - len(running),
+                            )
+                            last_decision = {"round": round_index, **decision.as_record(), "ts": time.time()}
+                            log.append(
+                                {
+                                    "node_id": "-",
+                                    "role": "orchestrator",
+                                    "round": round_index,
+                                    "type": "orchestrator_decision",
+                                    "action": decision.action,
+                                    "node_ids": decision.node_ids,
+                                    "wait_on": decision.wait_on,
+                                    "reason": decision.reason,
+                                    "corrections": decision.corrections,
+                                    "fallback": why is not None,
+                                    "events": [
+                                        {"node_id": e.node_id, "outcome": e.outcome, "attempts": e.attempts}
+                                        for e in told
+                                    ],
+                                    "ready": ready_now,
+                                    "in_flight": sorted(claimed),
+                                }
+                            )
+                            _write_round_trace(
+                                run_dir,
+                                round_index,
+                                tree,
+                                DispatchDecision(
+                                    decision.action,
+                                    (decision.node_ids or decision.wait_on or [None])[0],
+                                    decision.reason,
+                                ),
+                                extra={
+                                    "node_ids": decision.node_ids,
+                                    "wait_on": decision.wait_on,
+                                    "corrections": decision.corrections,
+                                    "fallback": why is not None,
+                                },
+                            )
+                            # §E15 (b)
+                            if should_halt is not None and should_halt():
+                                no_new_work = True
+                            elif decision.action == "dispatch":
+                                if any(tree.nodes[i].attempts == 0 for i in decision.node_ids):
+                                    fresh_rounds += 1
+                                for node_id in decision.node_ids:
+                                    node = tree.nodes[node_id]
+                                    node.status = "dispatched"
+                                    await _save_tree_locked(tree, tree_path, tree_lock)
+                                    log.append(
+                                        {
+                                            "node_id": node.id,
+                                            "role": "orchestrator",
+                                            "round": round_index,
+                                            "type": "node_dispatch_decided",
+                                            "reason": decision.reason,
+                                            "redispatch": node.attempts > 0,
+                                        }
+                                    )
+                                    start_job(node, "dispatch")
+                                if fresh_rounds >= max_rounds:
+                                    no_new_work = True
+                                # Slots the orchestrator left free stay free until
+                                # the next node finishes.
+
+                if not running:
+                    if resume_queue:
+                        continue
+                    if not stopping and not no_new_work and not news:
+                        # Nothing running and nothing decided (the state moved
+                        # under a call): look again; the terminal check above
+                        # ends the loop if there is truly nothing left.
+                        news = True
+                        continue
+                    break
+                done, _ = await asyncio.wait(list(running), return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    node = running.pop(fut)
+                    elapsed = time.monotonic() - started_at.pop(node.id, time.monotonic())
+                    exc = fut.exception()
+                    events.append(classify_node_event(node, duration_s=elapsed, crashed=exc))
+                    news = True
+                    if exc is not None and first_error is None:
+                        first_error = exc
+                        stopping = True
+        except asyncio.CancelledError:
+            # The loop itself is being cancelled (process shutdown): take the
+            # jobs down with it.
+            for fut in running:
+                fut.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            raise
+        except Exception as exc:
+            # §L.4: a harness error here must not kill writer episodes
+            # mid-turn (§E15). Start nothing new, let in-flight attempts
+            # finish and record their outcomes, then surface the error.
+            log.append(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "round_loop_error_draining",
+                    "detail": f"{type(exc).__name__}: {exc}"[:500],
+                    "in_flight": sorted(n.id for n in running.values()),
+                }
+            )
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+            raise
+        if first_error is not None:
+            raise first_error
+        return max_ready_width
+
+    if dispatch_policy == "orchestrator":
+        max_ready_width = await orchestrated_loop(
+            _next_round_index(run_dir), len(tree.ready_nodes())
+        )
+    elif max_parallel > 1:
+        max_ready_width = await refill_loop(
+            _next_round_index(run_dir), len(tree.ready_nodes())
+        )
+    else:
+        # max_parallel == 1: the pre-§C2 serial loop, byte-identical event sequence.
+        # §C2: "gather the resume scan" — nodes caught mid-flight by a crash
+        # resume in max_parallel-sized chunks instead of one big sequential
+        # pass. Chunks of one = today's exact sequence.
+        in_flight_dispatch = [n for n in tree.nodes.values() if n.status == "dispatched"]
+        for chunk in chunks(in_flight_dispatch):
             await asyncio.gather(*(dispatch(n) for n in chunk))
-        for chunk in chunks([n for n in wave if n.status == "awaiting_review"]):
+        in_flight_review = [
+            n for n in tree.nodes.values()
+            if n.status == "awaiting_review"
+            or (n.status in ("pending", "blocked") and (is_node_bypassed(run_dir, n.id, "review") or is_node_bypassed(run_dir, n.id)))
+        ]
+        for chunk in chunks(in_flight_review):
+            for n in chunk:
+                if n.status != "awaiting_review":
+                    n.status = "awaiting_review"
             await asyncio.gather(*(review(n) for n in chunk))
 
-        # §B7.3: AIMD adjustment on wave size
-        throttled_count = sum(1 for n in wave if "throttled" in (n.last_defect or ""))
-        admission.record_wave_outcome(throttled_count, max_parallel)
-        if throttled_count > 0:
-            await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
-        # §11.10.5: a gate or review failure that still has attempts left is
-        # a retry of the node the harness already knows it wants. Re-dispatch
-        # in place instead of round-tripping the orchestrator for a call
-        # whose only possible answer is "dispatch the same node again" — the
-        # retry's prompt differs (last_defect is carried forward by
-        # PLAN-zeromem.md §9), so this is a correction, not a resample.
-        for chunk in chunks(wave):
-            for node in chunk:
-                while node.status == "pending" and node.attempts < max_attempts:
-                    if is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id):
-                        node.status = "awaiting_review"
+        # §11.10.16: round indices continue across process runs. round_index
+        # used to restart at 0 on every resume while the trace files were opened
+        # "a", so round 0 of the third resume appended to round 0 of the first —
+        # one file, three processes' interleaved rounds, impossible to separate.
+        # The orchestrator's own view is stateless per round, so rebasing the
+        # numbers is free: this run's rounds are just pick up where the last
+        # process left off.
+        first_round = _next_round_index(run_dir)
+        max_ready_width = len(tree.ready_nodes())
+        for offset in range(max_rounds):
+            # §E15 (a): before the orchestrator's dispatch decision — a hit
+            # here means no call is even made for a round that will never run.
+            if should_halt is not None and should_halt():
+                break
+            _sync_tree_from_disk(tree, tree_path)
+            max_ready_width = max(max_ready_width, len(tree.ready_nodes()))
+            round_index = first_round + offset
+            decision = decide_next_action_with_policy(
+                tree,
+                str(manifest),
+                provider,
+                round_index=round_index,
+                policy=dispatch_policy,
+                max_parallel=max_parallel,
+            )
+            _write_round_trace(run_dir, round_index, tree, decision)
+
+            if decision.action == "halt":
+                break
+            if decision.action == "escalate":
+                log.append(
+                    {
+                        "node_id": decision.node_id or "-",
+                        "role": "orchestrator",
+                        "round": round_index,
+                        "type": "run_escalated",
+                        "reason": decision.reason,
+                    }
+                )
+                break
+
+            # §E15 (b): before this round's wave is committed (nodes marked
+            # "dispatched" and actually sent out) — a hit here leaves the tree
+            # exactly as the previous round left it, no partial mutation.
+            if should_halt is not None and should_halt():
+                break
+
+            # A wave of one: max_parallel > 1 runs through refill_loop above.
+            wave = [tree.nodes[decision.node_id]]
+
+            for node in wave:
+                node.status = "dispatched"
+                await _save_tree_locked(tree, tree_path, tree_lock)
+                log.append(
+                    {
+                        "node_id": node.id,
+                        "role": "orchestrator",
+                        "round": round_index,
+                        "type": "node_dispatch_decided",
+                        "reason": (
+                            decision.reason
+                            if node.id == decision.node_id
+                            else f"parallel wave fill (max_parallel={max_parallel})"
+                        ),
+                    }
+                )
+
+            for chunk in chunks(wave):
+                await asyncio.gather(*(dispatch(n) for n in chunk))
+            for chunk in chunks([n for n in wave if n.status == "awaiting_review"]):
+                await asyncio.gather(*(review(n) for n in chunk))
+
+            # §B7.3: AIMD adjustment on wave size
+            throttled_count = sum(1 for n in wave if "throttled" in (n.last_defect or ""))
+            admission.record_wave_outcome(throttled_count, max_parallel)
+            if throttled_count > 0:
+                await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
+            # §11.10.5: a gate or review failure that still has attempts left is
+            # a retry of the node the harness already knows it wants. Re-dispatch
+            # in place instead of round-tripping the orchestrator for a call
+            # whose only possible answer is "dispatch the same node again" — the
+            # retry's prompt differs (last_defect is carried forward by
+            # PLAN-zeromem.md §9), so this is a correction, not a resample.
+            for chunk in chunks(wave):
+                for node in chunk:
+                    while node.status == "pending" and node.attempts < max_attempts:
+                        if is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id):
+                            node.status = "awaiting_review"
+                            await _save_tree_locked(tree, tree_path, tree_lock)
+                            await review(node)
+                            break
+                        # §E15 (c): before starting a new retry attempt — the
+                        # node is simply left "pending" (its state from the
+                        # just-failed attempt), not marked failed or blocked.
+                        if should_halt is not None and should_halt():
+                            break
+                        if node.attempts > 0:
+                            await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
+                        node.status = "dispatched"
                         await _save_tree_locked(tree, tree_path, tree_lock)
-                        await review(node)
-                        break
-                    # §E15 (c): before starting a new retry attempt — the
-                    # node is simply left "pending" (its state from the
-                    # just-failed attempt), not marked failed or blocked.
-                    if should_halt is not None and should_halt():
-                        break
-                    if node.attempts > 0:
-                        await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
-                    node.status = "dispatched"
-                    await _save_tree_locked(tree, tree_path, tree_lock)
-                    await dispatch(node)
-                    if node.status == "awaiting_review":
-                        await review(node)
+                        await dispatch(node)
+                        if node.status == "awaiting_review":
+                            await review(node)
 
     if max_parallel > 1 and max_ready_width <= 1:
         log.append(
@@ -853,8 +1393,16 @@ async def _transition_after_writer(
     regressed_accidental = False
     current_text = _read_artifact(r_dir, node.id)
     current_bytes = len(current_text.encode("utf-8"))
-    _u_re = re.compile(r"(?im)^(?:\#\*\#|===+|---+|###?\s+)?(?:block|entry|item|problem|section|chapter|floor|day|week|scene|step|part)\s+\d+")
-    current_units = len(_u_re.findall(current_text))
+    # PLAN-SWEEP-REPAIR.md §J9: count with the run's own resolved delimiter
+    # (read back off the node's ``units_min:N@<delim>`` gate) through the
+    # same ``gates.count_units`` the gate itself uses. This module used to
+    # carry a private copy of the noun regex that was missing ``\s*`` after
+    # the ``#*#`` alternative, so every LongGenBench artifact counted zero
+    # units — which made the timeout defect below say "0 of 100 units
+    # written; resume at unit 1" over a file holding 60 floors, and
+    # ``prompts.py`` handed that resume point straight to the writer.
+    _u_delim = unit_delimiter_from_gates(node)
+    current_units = count_units(current_text, _u_delim)
 
     snaps = list_attempt_snapshots(r_dir, node.id)
     if snaps:
@@ -862,7 +1410,7 @@ async def _transition_after_writer(
         try:
             prior_text = read_attempt_snapshot_text(latest_snap)
             prior_bytes = len(prior_text.encode("utf-8"))
-            prior_units = len(_u_re.findall(prior_text))
+            prior_units = count_units(prior_text, _u_delim)
 
             if current_bytes < prior_bytes or (prior_units > 0 and current_units < prior_units):
                 corrupted, _ = is_artifact_corrupted(r_dir, node)
@@ -870,9 +1418,9 @@ async def _transition_after_writer(
                 if not current_text.strip() or corrupted:
                     classification = "unscoped"
                 elif prior_units > 0 and current_units < prior_units:
-                    p_m = _u_re.search(prior_text)
-                    c_m = _u_re.search(current_text)
-                    if p_m and c_m and p_m.group(0).lower() != c_m.group(0).lower():
+                    p_k = first_unit_key(prior_text, _u_delim)
+                    c_k = first_unit_key(current_text, _u_delim)
+                    if p_k and c_k and p_k != c_k:
                         classification = "unscoped"
 
                 log.append(
@@ -1029,12 +1577,57 @@ async def _transition_after_review(
     await _save_tree_locked(tree, tree_path, tree_lock)
 
 
-def _sync_tree_from_disk(tree: TaskTree, tree_path: str | Path) -> None:
+def _last_orchestrator_decision(run_dir: str | Path, tail_bytes: int = 262_144) -> dict[str, Any] | None:
+    """The most recent ``orchestrator_decision`` in events.jsonl (§L.5).
+
+    Reads only the file's tail: events.jsonl is append-only and can be large.
+    Returns None when there is none (a fresh run, or an older policy)."""
+    path = Path(events_path(run_dir))
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - tail_bytes))
+            data = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(data.splitlines()):
+        if '"orchestrator_decision"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") != "orchestrator_decision":
+            continue
+        return {
+            "round": event.get("round"),
+            "action": event.get("action"),
+            "node_ids": event.get("node_ids") or [],
+            "wait_on": event.get("wait_on") or [],
+            "reason": event.get("reason", ""),
+            "corrections": event.get("corrections") or [],
+            "ts": event.get("ts"),
+        }
+    return None
+
+
+def _sync_tree_from_disk(
+    tree: TaskTree, tree_path: str | Path, *, skip: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Fold operator edits on disk (a redispatch, a manual pass) into memory.
+
+    ``skip`` names nodes a live job owns (``refill_loop``). Their in-memory
+    state is authoritative and can be ahead of disk: a job that just bumped
+    ``attempts`` may still be waiting on the tree lock to save it, and
+    copying the stale on-disk count back would hand it an extra attempt.
+    """
     try:
         on_disk = TaskTree.load(tree_path)
     except Exception:
         return
     for node_id, disk_node in on_disk.nodes.items():
+        if node_id in skip:
+            continue
         mem_node = tree.nodes.get(node_id)
         if mem_node is None:
             tree.nodes[node_id] = disk_node
@@ -1048,6 +1641,29 @@ def _sync_tree_from_disk(tree: TaskTree, tree_path: str | Path) -> None:
             mem_node.status = "passed"
             mem_node.attempts = disk_node.attempts
             mem_node.last_defect = disk_node.last_defect
+
+
+@contextmanager
+def _claimed_read_as_dispatched(tree: TaskTree, claimed: set[str]) -> Iterator[None]:
+    """Within the block, nodes a live job owns read as ``dispatched``.
+
+    A job between attempts (retry backoff, or awaiting the tree lock right
+    after its review transition) is ``pending``, which ``ready_nodes`` and
+    both dispatch policies would hand out again. The block must contain no
+    ``await`` — it relies on the event loop not switching tasks inside it.
+    Statuses are restored on exit, so nothing masked is ever saved.
+    """
+    masked: dict[str, str] = {}
+    for node_id in claimed:
+        node = tree.nodes.get(node_id)
+        if node is not None and node.status not in ("dispatched", "awaiting_review"):
+            masked[node_id] = node.status
+            node.status = "dispatched"
+    try:
+        yield
+    finally:
+        for node_id, status in masked.items():
+            tree.nodes[node_id].status = status
 
 
 async def _save_tree_locked(
@@ -1140,8 +1756,15 @@ def _next_round_index(run_dir: Path) -> int:
 
 
 def _write_round_trace(
-    run_dir: Path, round_index: int, tree: TaskTree, decision: DispatchDecision
+    run_dir: Path,
+    round_index: int,
+    tree: TaskTree,
+    decision: DispatchDecision,
+    *,
+    extra: dict[str, Any] | None = None,
 ) -> None:
+    """``extra`` (§L.7) carries the orchestrator's list fields; ``node_id``
+    stays a single id (the first) so older readers keep working."""
     line = {
         "round": round_index,
         "ts": time.time(),
@@ -1150,6 +1773,7 @@ def _write_round_trace(
             "action": decision.action,
             "node_id": decision.node_id,
             "reason": decision.reason,
+            **(extra or {}),
         },
     }
     with open(ensure_orchestrator_dir(run_dir) / f"round-{round_index:03d}.jsonl", "a", encoding="utf-8") as fh:

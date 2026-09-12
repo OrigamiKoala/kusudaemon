@@ -1135,7 +1135,7 @@ class RunState:
             research_plan=_parse_plan_payload(body.get("research_plan")),
             max_rounds=int(body.get("max_rounds", 100)),
             max_attempts=int(body.get("max_attempts", 3)),
-            dispatch_policy=str(body.get("dispatch_policy") or "deterministic"),
+            dispatch_policy=str(body.get("dispatch_policy") or "orchestrator"),
             max_parallel=int(body.get("max_parallel", 1)),
             document_review=bool(body.get("document_review", False)),
             survey_mode=str(body.get("survey_mode") or "auto"),

@@ -28,16 +28,45 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 from .gates import estimate_tokens
 from .json_schema import describe_schema, validate
 from ..provider_config import require, resolve
 
+# PLAN-SWEEP-REPAIR.md §L.2: per-call overrides that don't widen the
+# RoleProvider protocol. The event-driven orchestrator shares the run's main
+# provider instance with other roles, so stamping ``provider.role`` would race;
+# a thread-local scope applies only to calls made on the thread that opened it
+# (the orchestrator's call runs on its own ``asyncio.to_thread`` worker).
+_CALL_SCOPE = threading.local()
+
+
+@contextmanager
+def call_scope(*, role: str | None = None, max_tokens: int | None = None) -> Iterator[None]:
+    """Within the block, calls on this thread record ``role`` and default to ``max_tokens``."""
+    prev = (getattr(_CALL_SCOPE, "role", None), getattr(_CALL_SCOPE, "max_tokens", None))
+    _CALL_SCOPE.role, _CALL_SCOPE.max_tokens = role, max_tokens
+    try:
+        yield
+    finally:
+        _CALL_SCOPE.role, _CALL_SCOPE.max_tokens = prev
+
+
+def _scoped_role(default: str | None) -> str | None:
+    return getattr(_CALL_SCOPE, "role", None) or default
+
+
+def _scoped_max_tokens() -> int | None:
+    return getattr(_CALL_SCOPE, "max_tokens", None)
+
 # Defaults: OpenCode Zen (see ..provider_config — the user can override via
 # ./provider.json, KUSUDAEMON_PROVIDER_*, or OPENAI_* env vars).
 _DEFAULT_STRUCTURED_RETRIES = 2
+# §P3: upper bound for the cap-escalation ladder in ``complete_json``.
+_MAX_STRUCTURED_TOKENS = 32768
 _DEFAULT_HTTP_RETRIES = 3
 _DEFAULT_CONCURRENCY = 4
 
@@ -206,7 +235,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             estimated = True
         if self.cost_ledger is not None and hasattr(self.cost_ledger, "record"):
             self.cost_ledger.record(
-                role=self.role,
+                role=_scoped_role(self.role),
                 phase=self.phase,
                 node=self.node_id,
                 model=self.model,
@@ -290,15 +319,35 @@ class OpenAICompatibleProvider(RoleProviderBase):
             ]
 
         def _default_max_tokens(sch: dict[str, Any]) -> int:
+            # §P3: these were 1024 / 2048 / 4096. On a reasoning model the cap
+            # covers the thinking trace as well as the JSON, so the small-schema
+            # budget was spent before the object was ever emitted — every
+            # orchestrator call in the 000-week sweep returned exactly 1024
+            # tokens and no parseable decision ("no answer within 90s"), and
+            # every reviewer call exactly 4096. Doubling the floors costs
+            # nothing when the model stops early; `_escalate` covers the rest.
             props = sch.get("properties") or {}
             if len(props) <= 4 and all(
                 isinstance(p, dict) and p.get("type") in ("string", "integer", "number", "boolean")
                 for p in props.values()
             ):
-                return 1024
-            if "questions" in props or "objections" in props:
                 return 2048
-            return 4096
+            if "questions" in props or "objections" in props:
+                return 4096
+            return 8192
+
+        effective_max_tokens = max_tokens if max_tokens is not None else _scoped_max_tokens()
+        if effective_max_tokens is None and os.getenv("KUSUDAEMON_ROLE_MAX_TOKENS"):
+            try:
+                effective_max_tokens = int(os.environ["KUSUDAEMON_ROLE_MAX_TOKENS"])
+            except ValueError:
+                pass
+        if effective_max_tokens is None:
+            effective_max_tokens = _default_max_tokens(schema)
+        # §P3: mutable across attempts — a response that stopped at the ceiling
+        # is retried with a bigger ceiling, not with the same one plus a
+        # "that did not validate" turn that only grows the prompt.
+        cap = {"max_tokens": effective_max_tokens}
 
         def make_payload(with_format: bool) -> dict[str, Any]:
             payload: dict[str, Any] = {
@@ -307,16 +356,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 "temperature": temperature,
                 "stream": streaming,
             }
-            effective_max_tokens = max_tokens
-            if effective_max_tokens is None and os.getenv("KUSUDAEMON_ROLE_MAX_TOKENS"):
-                try:
-                    effective_max_tokens = int(os.environ["KUSUDAEMON_ROLE_MAX_TOKENS"])
-                except ValueError:
-                    pass
-            if effective_max_tokens is None:
-                effective_max_tokens = _default_max_tokens(schema)
-            if effective_max_tokens:
-                payload["max_tokens"] = effective_max_tokens
+            if cap["max_tokens"]:
+                payload["max_tokens"] = cap["max_tokens"]
 
             if streaming:
                 payload["stream_options"] = {"include_usage": True}
@@ -366,9 +407,28 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     on_reasoning(reasoning)
             content = message.get("content") or ""
             self._record_usage(curr_payload, raw, content)
+            # §P3: before blaming the JSON, ask whether there was room for any.
+            truncated = _hit_token_ceiling(raw, cap["max_tokens"])
             parsed, parse_error = extract_last_json_object(content, schema=schema)
             if parsed is None:
                 parsed, parse_error = _parse_json_object(content)
+            if parsed is None and truncated:
+                previous = cap["max_tokens"] or _default_max_tokens(schema)
+                cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
+                last_error = (
+                    f"response hit the output ceiling ({previous} tokens) before emitting "
+                    f"JSON; retrying at {cap['max_tokens']}"
+                )
+                if cap["max_tokens"] == previous:
+                    last_error = (
+                        f"response hit the output ceiling ({previous} tokens, the maximum) "
+                        "before emitting JSON"
+                    )
+                    break
+                # Retry the ORIGINAL messages at the larger cap. Appending a
+                # correction turn here would grow the prompt (1312 -> 5448 ->
+                # 9585 in the seed1 halt) while re-asking the same question.
+                continue
             if parsed is not None:
                 parsed = _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema)
                 schema_errors = validate(parsed, schema)
@@ -551,7 +611,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             raise ProviderHTTPError(
                 exc.code,
                 f"HTTP {exc.code} from provider"
-                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
                 retry_after=retry_after,
             ) from exc
@@ -560,7 +620,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             reason = getattr(exc, "reason", exc)
             raise ProviderError(
                 f"provider request failed"
-                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
             ) from exc
 
@@ -596,7 +656,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             raise ProviderHTTPError(
                 exc.code,
                 f"HTTP {exc.code} from provider"
-                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
                 retry_after=retry_after,
             ) from exc
@@ -605,7 +665,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             reason = getattr(exc, "reason", exc)
             raise ProviderError(
                 f"provider request failed"
-                f" [phase={self.phase} role={self.role} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
             ) from exc
 
@@ -706,5 +766,36 @@ def _parse_retry_after(value: str | None) -> float | None:
 def _first_choice_message(raw: dict[str, Any]) -> dict[str, Any]:
     choices = raw.get("choices") or [{}]
     return choices[0].get("message") or {}
+
+
+def _first_choice_finish_reason(raw: dict[str, Any]) -> str:
+    """``finish_reason`` for the first choice, "" when the host omits it."""
+    choices = raw.get("choices") or [{}]
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    return str(first.get("finish_reason") or first.get("stop_reason") or "")
+
+
+def _hit_token_ceiling(raw: dict[str, Any], cap: int | None) -> bool:
+    """Did this response stop because it ran out of output budget?
+
+    PLAN-SWEEP-REPAIR.md §P3. ``finish_reason == "length"`` is the direct
+    signal, but not every OpenAI-compatible host sets it, so a reported
+    ``completion_tokens`` that reached the cap counts too. Without this a
+    truncated response is indistinguishable from a broken one: 000-week armC
+    seed1's three review attempts each returned exactly 4096 completion
+    tokens and were reported as "invalid JSON: Expecting value: line 1
+    column 1 (char 0)", which halted a run whose document was already complete.
+    """
+    if _first_choice_finish_reason(raw).lower() in ("length", "max_tokens"):
+        return True
+    if not cap:
+        return False
+    usage = raw.get("usage")
+    if isinstance(usage, dict):
+        try:
+            return int(usage.get("completion_tokens", 0) or 0) >= cap
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
