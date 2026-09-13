@@ -296,6 +296,14 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument(
         "--benchmark", default="benchmark", help="Benchmark name (e.g. harness-bench)."
     )
+    bench_parser.add_argument(
+        "--artifact-delimiter",
+        default=None,
+        help="Unit delimiter of the expected deliverable (LongGenBench: '#*#'). Arm A "
+             "uses it to tell a finished document from narration when harvesting the "
+             "bare CLI's output (PLAN-SWEEP-REPAIR.md §Q1). Defaults to "
+             "$KUSUDAEMON_BENCH_ARTIFACT_DELIMITER.",
+    )
     bench_parser.add_argument("--task-id", default=None, help="Task ID.")
     bench_parser.add_argument("--seed", type=int, default=1, help="Run seed (default: 1).")
     bench_parser.add_argument(
@@ -824,6 +832,98 @@ def cmd_backend(argv: argparse.Namespace) -> int:
     return 0
 
 
+# PLAN-SWEEP-REPAIR.md §Q1. A unit of a LongGenBench answer is a 150-word-minimum
+# prose block (~900 chars). A blob far below that carries unit HEADERS without
+# their bodies -- a `grep "#*# Block 18"`, a `head -3` -- and crediting it would
+# award the arm blocks it never wrote. Deliberately well under one real unit so a
+# genuine partial document still qualifies.
+_MIN_CHARS_PER_UNIT = 400
+# Anything larger than this in a workspace is source material or a build
+# artifact, not the deliverable, and reading it would dwarf the real answer.
+_MAX_WORKSPACE_ARTIFACT_BYTES = 8 * 1024 * 1024
+
+
+def _unit_count(text: str, delimiter: str) -> int:
+    return text.count(delimiter) if delimiter else 0
+
+
+def _qualifies(text: str, delimiter: str) -> int:
+    """Unit count, or 0 when the blob is an excerpt rather than a document."""
+    units = _unit_count(text, delimiter)
+    if units <= 0:
+        return 0
+    if len(text) / units < _MIN_CHARS_PER_UNIT:
+        return 0
+    return units
+
+
+def _workspace_artifact(ws_path: Path, delimiter: str) -> tuple[str, int]:
+    """The most complete delimited document the agent left in its workspace."""
+    best, best_units = "", 0
+    try:
+        entries = sorted(q for q in ws_path.rglob("*") if q.is_file())
+    except OSError:
+        return "", 0
+    for path in entries:
+        try:
+            if path.stat().st_size > _MAX_WORKSPACE_ARTIFACT_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        units = _qualifies(text, delimiter)
+        if units > best_units:
+            best, best_units = text, units
+    return best, best_units
+
+
+def _richest_arm_a_artifact(
+    stdout_text: str,
+    *,
+    ws_path: Path,
+    backend: str,
+    combined_output: str,
+    delimiter: str,
+    session_ids_out: list[str],
+) -> tuple[str, str]:
+    """Pick arm A's deliverable from the richest channel that actually holds it.
+
+    Ranked by qualifying unit count: stdout (what the bare CLI printed), a file
+    the agent left in its workspace, and -- for opencode -- the session store,
+    where a document handed over through a tool result survives even though the
+    process never printed it. Ties keep the earlier, more conservative channel,
+    so a richer source wins only by holding strictly more of the document.
+    """
+    best_text, best_source = stdout_text, "stdout"
+    best_units = _qualifies(stdout_text, delimiter)
+
+    ws_text, ws_units = _workspace_artifact(ws_path, delimiter)
+    if ws_units > best_units:
+        best_text, best_source, best_units = ws_text, "workspace_file", ws_units
+
+    if backend == "opencode":
+        try:
+            from ..adapters.opencode_session import (
+                best_artifact,
+                session_ids_from_log,
+                session_ids_from_output,
+            )
+
+            sids = session_ids_from_output(combined_output)
+            if not sids:
+                sids = session_ids_from_log(ws_path)
+            session_ids_out.extend(sids)
+            cand = best_artifact(sids, delimiter=delimiter) if sids else None
+            if cand is not None and _qualifies(cand.text, delimiter) > best_units:
+                best_text = cand.text
+                best_source = cand.source
+                best_units = _qualifies(cand.text, delimiter)
+        except Exception:
+            pass
+
+    return best_text, best_source
+
+
 def _parse_opencode_usage(output: str) -> dict[str, int]:
     total_tokens = 0
     prompt_tokens = 0
@@ -1031,13 +1131,28 @@ def cmd_bench(
             cmd = [backend, goal]
 
         t0 = time.time()
+        # PLAN-SWEEP-REPAIR.md §Q2. `cwd=` changes the real working directory but
+        # leaves the inherited $PWD pointing at whatever launched the sweep --
+        # this repo. opencode 1.18.30 bootstraps one instance at the real cwd and
+        # then a second at the $PWD-derived project, and the agent runs in THAT
+        # one: every 2026-09-12 arm-A session recorded
+        # `path.cwd=/Users/carlliu/kusudaemon`, read this repo's AGENTS guidance,
+        # and wrote its deliverable into the checkout (300-block seed3's
+        # design.md, 301-block seed2's city_block_descriptions.txt, later rm'd),
+        # which is also why every arm-A workspace came out empty. Export a $PWD
+        # that matches cwd, and drop the stale $OLDPWD beside it.
+        bare_env = dict(os.environ)
+        bare_env["PWD"] = str(ws_path)
+        bare_env.pop("OLDPWD", None)
         runner_kwargs: dict[str, Any] = {
             "cwd": str(ws_path),
             "capture_output": True,
             "text": True,
+            "env": bare_env,
         }
         if runner is subprocess.run:
             runner_kwargs["stdin"] = subprocess.DEVNULL
+        res: Any = None
         try:
             res = runner(
                 cmd,
@@ -1047,6 +1162,8 @@ def cmd_bench(
             halt_reason = None if exit_code == 0 else f"bare process exited with code {exit_code}: {res.stderr[:200]}"
             resolved = (exit_code == 0)
         except Exception as exc:
+            # `res` stays None so the harvest below degrades to "no output"
+            # rather than raising UnboundLocalError over the real failure.
             exit_code = 1
             halt_reason = str(exc)
             resolved = False
@@ -1065,6 +1182,14 @@ def cmd_bench(
         # artifact. Arm C already exports one via --output-dir; without this,
         # the two arms are not comparable because arm A leaves nothing behind.
         arm_a_artifact: str | None = None
+        artifact_source = "stdout"
+        bare_session_ids: list[str] = []
+        bare_cwd_escaped_to: str | None = None
+        delimiter = (
+            getattr(argv, "artifact_delimiter", None)
+            or os.getenv("KUSUDAEMON_BENCH_ARTIFACT_DELIMITER")
+            or None
+        )
         out_dir_arg = getattr(argv, "output_dir", None)
         if out_dir_arg and hasattr(res, "stdout"):
             dest = Path(out_dir_arg).expanduser()
@@ -1081,10 +1206,45 @@ def cmd_bench(
                     clean = extract_visible_output(raw_out)
                     if clean.strip():
                         dest_text = clean
-                dest.write_text(dest_text, encoding="utf-8")
+                # §Q1: stdout is the WEAKEST channel, not the only one. A coding
+                # agent handed a generation prompt writes a script, runs it and
+                # reads the file back, so the document leaves through a file or a
+                # tool result while stdout keeps "Let me output the full
+                # document". Ranked by unit count, so a richer channel only wins
+                # when it actually holds more of the deliverable.
+                best_text, best_source = dest_text, "stdout"
+                if delimiter:
+                    best_text, best_source = _richest_arm_a_artifact(
+                        dest_text,
+                        ws_path=ws_path,
+                        backend=backend,
+                        combined_output=(res.stdout or "") + "\n" + (res.stderr or ""),
+                        delimiter=delimiter,
+                        session_ids_out=bare_session_ids,
+                    )
+                dest.write_text(best_text, encoding="utf-8")
                 arm_a_artifact = str(dest)
+                artifact_source = best_source
             except OSError as exc:
                 print(f"could not write arm A artifact to {dest}: {exc}", file=sys.stderr)
+
+        # §Q2: name the escape on the record. A cell whose agent ran somewhere
+        # else measured something else, and must never be pooled silently.
+        if backend == "opencode" and bare_session_ids:
+            try:
+                from ..adapters.opencode_session import session_directory
+                for sid in bare_session_ids:
+                    bound = session_directory(sid)
+                    if bound and Path(bound).resolve() != ws_path.resolve():
+                        bare_cwd_escaped_to = bound
+                        print(
+                            f"[WARNING] arm A ran in {bound}, not its workspace "
+                            f"{ws_path} -- the cell is not isolated (§Q2).",
+                            file=sys.stderr,
+                        )
+                        break
+            except Exception:
+                pass
 
 
         record = {
@@ -1112,6 +1272,9 @@ def cmd_bench(
             "halt_reason": halt_reason,
             "commit": commit,
             "artifact_path": arm_a_artifact,
+            "artifact_source": artifact_source,
+            "bare_session_ids": bare_session_ids or None,
+            "bare_cwd_escaped_to": bare_cwd_escaped_to,
         }
     else:
         from ..v6.work_object import measure_workspace, work_object_from_text

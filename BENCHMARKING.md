@@ -1165,10 +1165,19 @@ needs the judge (§4.1.4) and is not quoted here.
 
 | task | blocks | arm A (bare) | arm C (kusudaemon) | arm C config |
 |---|---|---|---|---|
-| `000-week` (idx 0) | 52 | 100 / **1.9** / 100 → **67.3 %** | 100 / 100 / 100 → **100 %** | T2, orchestrator, spine |
-| `100-floor` (idx 100) | 100 | 2 / 1 / 1 → **1.3 %** | 100 / 100 / 99 → **99.7 %** | T1/T2, deterministic |
-| `300-block` (idx 300) | 100 | 42 / 100 / 10 → **50.7 %** | 99 / 100 / 100 → **99.7 %** | T1, deterministic |
-| **all three** | | **39.8 %** (9 runs) | **99.8 %** (9 runs) | |
+| `000-week` (idx 0) | 52 | 100 / 100 / 100 → **100 %** | 100 / 100 / 100 → **100 %** | T2, orchestrator, spine |
+| `100-floor` (idx 100) | 100 | 100 / 1 / 100 → **67.0 %** | 100 / 100 / 99 → **99.7 %** | T1/T2, deterministic |
+| `300-block` (idx 300) | 100 | 42 / 100 / 40 → **60.7 %** | 99 / 100 / 100 → **99.7 %** | T1, deterministic |
+| `301-block` (idx 301) | 100 | 100 / 2† / 1† → **34.3 %** | 100 / 100 / — | T1, orchestrator |
+| **pooled** | | **65.5 %** (12 runs) | **99.8 %** (10 runs) | |
+
+† Not a score. Both cells produced a document that no longer exists anywhere
+readable: seed 2 wrote `city_block_descriptions.txt`, verified it, and `rm`'d it;
+seed 3 left `/tmp/city_descriptions.txt`, which its session only ever `grep`'d.
+The recorded 2 % / 1 % is what narration parses to. Re-run those two cells, or
+read the numbers as a floor. Every other arm-A number in this table is a
+**post-§Q** rescore of the same runs — see the §Q note below before comparing to
+anything recorded earlier.
 
 **The arm-C column mixes two pipeline configurations and four commits.** `000-week`
 ran at T2 with `dispatch_policy=orchestrator` and the output spine; the `100-floor`
@@ -1189,10 +1198,18 @@ were always there; `harvest_artifact` was reading one spine unit and
 recorded before 2026-09-12 as a lower bound, and re-derive it with `--score-only`
 before citing it.
 
-**`000-week` is the first clean arm-A-vs-arm-C delta.** Arm A seed 2 emitted zero
-`#*#` blocks and closed with a summary asserting "52 weekly entries … all
-requirements are met" — 909 bytes, empty workspace. That is the failure mode the
-benchmark exists to catch, and it is worth more than the mean.
+**§Q retracts the "clean arm-A-vs-arm-C delta" on `000-week`.** This section used
+to read: arm A seed 2 emitted zero `#*#` blocks and closed with a summary
+asserting "52 weekly entries … all requirements are met" — 909 bytes, empty
+workspace — "the failure mode the benchmark exists to catch". The summary was
+true. That run wrote a complete, contiguous 52-week document (98 758 chars,
+230-376 words per entry, `*** finished`) to `/tmp/diary_final.txt` and handed it
+over with `cat`; `opencode run` prints assistant text and not tool results, so
+the harness scored the narration around it. Arm A on `000-week` is 100 / 100 / 100.
+**Do not cite an arm-A completion number recorded before 2026-09-12 either**,
+and do not read a small arm-A artifact as an agent failure until
+`scripts/recover_arm_a_artifacts.py` has been run against the cell — the
+symmetric lesson to §P1, in the arm that was supposed to be the easy one.
 
 **Read the 2026-09-12 rescore before comparing to any earlier number.** The
 original sweep reported arm C at 1 of 3. Both "failures" were harness defects

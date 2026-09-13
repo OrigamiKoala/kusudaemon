@@ -48,7 +48,9 @@ UNIT_RANGE_RE = _re.compile(
 )
 
 
-def leaf_units_expected(brief: str, slice_units: list[SpineUnit]) -> tuple[int | None, str | None]:
+def leaf_units_expected(
+    brief: str, slice_units: list[SpineUnit], goal: str = ""
+) -> tuple[int | None, str | None]:
     """How many output units a leaf over ``slice_units`` must produce
     (PLAN-SWEEP-REPAIR.md §K2).
 
@@ -64,6 +66,17 @@ def leaf_units_expected(brief: str, slice_units: list[SpineUnit]) -> tuple[int |
        "append units 13-41" into another leaf's weeks.
     2. An explicit "<Nouns> N to M" range in the brief.
     3. ``expected_units_info`` over the brief, then any partial spine counts.
+    4. §R1: ``expected_units_info`` over the GOAL, and only when ``goal`` is
+       passed -- ``build_tree`` passes it for a leaf that covers the entire
+       spine, i.e. the only leaf in the tree. Without this the T2 path had no
+       route from "the goal declares 100 floors" to a gate at all: the count
+       came from the spine, and a structurally-chunked spine (the shape you get
+       when KUSUDAEMON_OUTPUT_SPINE is off and the goal is one short chunk) has
+       one unit labelled "Opening section" carrying units_expected=None. The T1
+       path (``v6/direct.build_single_node``) has always read the goal; the two
+       single-leaf paths now agree. A leaf that covers the whole spine is by
+       definition the only leaf, so this can never smear a whole-document count
+       across the leaves of a partitioned plan.
     """
     from ..tokens import expected_units_info
 
@@ -83,6 +96,11 @@ def leaf_units_expected(brief: str, slice_units: list[SpineUnit]) -> tuple[int |
     u_sum = sum(c for c in counts if isinstance(c, int) and c > 0)
     if u_sum > 0:
         return u_sum, "declared"
+
+    if goal:
+        g_info, g_src = expected_units_info(goal)
+        if g_info is not None and g_info > 0:
+            return g_info, g_src
     return None, None
 
 DEFAULT_DEPTH_CAP = 4
@@ -452,6 +470,7 @@ def build_tree(
     streaming: bool = False,
     code_tile_planner: bool = False,
     trust_estimated_calls: bool = True,
+    goal: str = "",
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
@@ -479,6 +498,10 @@ def build_tree(
     nodes: dict[str, TaskNode] = {}
     budget = _NodeBudget(node_cap)
     cap_event_emitted = False
+    # §R1: the goal's declared unit count is authority only for a leaf that
+    # covers the entire spine -- which is to say, only when the plan collapsed
+    # to one node.
+    spine_size = len(units)
 
     def emit(event: dict[str, Any]) -> None:
         if log is not None:
@@ -523,7 +546,10 @@ def build_tree(
         )
         from ..tokens import extract_unit_delimiter
 
-        units_expected, units_source = leaf_units_expected(candidate.brief, slice_units)
+        covers_whole_spine = bool(goal) and len(slice_units) == spine_size
+        units_expected, units_source = leaf_units_expected(
+            candidate.brief, slice_units, goal=goal if covers_whole_spine else ""
+        )
 
         delimiter = extract_unit_delimiter(candidate.brief)
         if not delimiter and slice_units:
@@ -531,6 +557,8 @@ def build_tree(
                 if getattr(u, "unit_delimiter", None):
                     delimiter = u.unit_delimiter
                     break
+        if not delimiter and covers_whole_spine:
+            delimiter = extract_unit_delimiter(goal)
 
         warn_gates: list[str] = []
         if units_expected and units_expected > 0:

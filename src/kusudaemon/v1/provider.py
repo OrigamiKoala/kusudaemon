@@ -412,23 +412,39 @@ class OpenAICompatibleProvider(RoleProviderBase):
             parsed, parse_error = extract_last_json_object(content, schema=schema)
             if parsed is None:
                 parsed, parse_error = _parse_json_object(content)
-            if parsed is None and truncated:
+            # §R1: the escalation used to be guarded by ``parsed is None and
+            # truncated``, so it only covered a response too short to hold any
+            # JSON at all. A response that stopped at the ceiling *mid-object*
+            # is just as truncated, and what comes back from it is worse than
+            # nothing: the scanner recovers some complete inner fragment and
+            # ``_repair_common_schema_omissions`` grows it into a schema-valid
+            # object made of defaults, which then returns as though the model
+            # had answered. finish_reason "length" is the endpoint telling us
+            # the content is incomplete -- believe it, whatever we managed to
+            # parse out of it. (longgen_137-floor_armC_seed3: one 4096-token
+            # classify call, no retry, an all-defaults estimate, T2, no unit
+            # gate, 5 of 100 floors scored 1.0.)
+            if truncated:
                 previous = cap["max_tokens"] or _default_max_tokens(schema)
                 cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
-                last_error = (
-                    f"response hit the output ceiling ({previous} tokens) before emitting "
-                    f"JSON; retrying at {cap['max_tokens']}"
-                )
-                if cap["max_tokens"] == previous:
+                if cap["max_tokens"] != previous:
                     last_error = (
-                        f"response hit the output ceiling ({previous} tokens, the maximum) "
-                        "before emitting JSON"
+                        f"response hit the output ceiling ({previous} tokens) before the "
+                        f"JSON was complete; retrying at {cap['max_tokens']}"
                     )
+                    # Retry the ORIGINAL messages at the larger cap. Appending a
+                    # correction turn here would grow the prompt (1312 -> 5448 ->
+                    # 9585 in the seed1 halt) while re-asking the same question.
+                    continue
+                # Cap is already at the maximum. A validated parse is still
+                # better than raising, but it is the last resort, not the
+                # happy path -- fall through to the normal validation below.
+                last_error = (
+                    f"response hit the output ceiling ({previous} tokens, the maximum) "
+                    "before the JSON was complete"
+                )
+                if parsed is None:
                     break
-                # Retry the ORIGINAL messages at the larger cap. Appending a
-                # correction turn here would grow the prompt (1312 -> 5448 ->
-                # 9585 in the seed1 halt) while re-asking the same question.
-                continue
             if parsed is not None:
                 parsed = _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema)
                 schema_errors = validate(parsed, schema)

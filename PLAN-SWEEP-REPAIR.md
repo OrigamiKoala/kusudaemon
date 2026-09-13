@@ -1247,3 +1247,263 @@ interrupted halfway is still stratified.
 Tests: `tests/test_sweep_repair_p.py` (23). Full suite 1428 tests, one
 pre-existing failure (`test_mcp_server_overrides`, the Python 3.10 `tomllib` gap
 in §9.2).
+
+## §Q — arm A was scored on its narration, in the wrong directory
+
+Diagnosed and landed 2026-09-12, during the `301-block` sweep. Arm A was
+reporting 1-2 % completion on documents that were complete and compliant. Both
+defects below are arm-A-only, and neither touches arm C, so every A-vs-C delta
+recorded before this section understates arm A.
+
+### §Q1 — `opencode run` does not print tool results, and stdout was the only channel
+
+`cmd_bench`'s arm-A branch wrote `res.stdout` to `raw/<cell>.txt` and scored that,
+on the reasoning that "a generation benchmark grades the produced text, so arm A's
+stdout *is* its artifact". That holds for a chat model. It does not hold for a
+coding agent: handed a LongGenBench prompt, `opencode` writes a generator script,
+runs it, reads the file back, and narrates. The document leaves the process
+through a *tool result*; `opencode run` prints assistant text parts only. So the
+scored artifact was
+
+    Looking at this request, I need to design a 10x10 city grid …
+    All 100 blocks have 150+ word descriptions. Let me output the full document.
+    The document is complete. Here's a summary of the generated city design: …
+
+1 972 chars, which the scorer reads as 1 of 100 blocks. `301-block` armA seed1 had
+in fact written a contiguous 100-block document, 174 582 chars, 209-236 words per
+block, ending `*** finished`.
+
+Three channels hold the truth, and all three have to be read:
+
+1. **assistant text parts** — where the answer is when the model replies inline
+   (`000-week` armA seeds 1 and 3, `300-block` seeds 1 and 2).
+2. **tool results** (`part.data.state.output`) — where a `cat`-style hand-off lands.
+3. **`tool-output/<id>`** — opencode truncates a large tool result in the session
+   row, leaving `...output truncated...` and `Full output saved to: <path>`, and
+   spools the full body to disk. seed1's final `cat` row held 50 969 chars covering
+   blocks 72-100; the spool held all 100. Reading (2) without resolving (3) loses
+   71 % of the document and *looks* like a partial answer rather than a truncated
+   read, which is the same failure shape as §P1.
+
+`adapters/opencode_session.py` reads all three read-only (`mode=ro`, never
+`immutable=1`), resolving the spool **relative to the database's own directory** —
+deriving it from `$HOME` silently disables truncation recovery when reading a
+mounted or archived store. Two guards keep the recovery honest:
+
+- **Assistant parts only.** The user turn is stored as a part too, and a
+  LongGenBench prompt ends with the first unit already filled in
+  (`*** started *** #*# Block 1 (0, 0):`), so echoing the prompt back would score
+  as a partial answer on a run that produced nothing.
+- **Density floor, `_MIN_CHARS_PER_UNIT = 400`.** A unit is a 150-word-minimum
+  prose block (~900+ chars). `301-block` seed3's best candidate is 10 unit
+  *headers* in 482 chars — a `grep "#*# Block 18"` — which would have scored 10 %
+  on a document the harness never captured. 48 chars/unit is an excerpt, not an
+  answer; the cell is reported as unrecovered instead.
+
+Live fix: `bench --artifact-delimiter` (LongGenBench passes `BLOCK_SEP`) lets arm A
+rank its channels — stdout, then a delimited file left in the workspace, then the
+session store — and records `artifact_source` on the cell. Ties keep the earlier,
+more conservative channel. Without a delimiter the behaviour is unchanged.
+
+Retrospective fix: `scripts/recover_arm_a_artifacts.py` (free, no model spend)
+rebuilds `raw/*.txt` from the session store, writes
+`raw/<cell>.provenance.json`, and only overwrites when the recovered text carries
+strictly more units. It maps cell → session from `opencode.log`, grouping by
+`run=` and matching the **first** `creating instance` directory — `session.directory`
+is useless here, because §Q2 makes it identical across cells.
+
+### §Q2 — `cwd=` does not move the bare CLI; `$PWD` does
+
+`subprocess.Popen(cwd=ws_path)` changes the real working directory but leaves the
+inherited `$PWD` naming whatever launched the sweep — this repo. opencode 1.18.30
+bootstraps one instance at the real cwd and then a second at the `$PWD`-derived
+project, and the agent runs in *that* one:
+
+    message="creating instance" directory=…/bench_workspaces/longgen/301-block_armA_seed1
+    message="creating instance" directory=/Users/carlliu/kusudaemon
+    message=created id=ses_… projectID=30538baa… directory=/Users/carlliu/kusudaemon
+
+Every 2026-09-12 arm-A assistant message carries
+`path.cwd=/Users/carlliu/kusudaemon`. Consequences: `301-block` seed3 opened with
+`ls /Users/carlliu/kusudaemon/` and `ls src/kusudaemon/` before starting work, so
+the cell was not isolated and the agent had this repo's guidance files in context;
+`300-block` seed3 wrote its deliverable to `<repo>/design.md` and `301-block` seed2
+to `<repo>/city_block_descriptions.txt`, then removed it; and every arm-A workspace
+came out empty, which is why a workspace-file harvest would have found nothing.
+Arm C is unaffected — its adapter runs through a shell, which recomputes `$PWD`.
+
+§K3 (workspaces root outside any git work tree) was necessary but not sufficient:
+it stops the walk *up* into a repo and does nothing about the `$PWD` hop. Fix:
+export `PWD = ws_path` and drop the stale `OLDPWD` for the bare subprocess, and
+record `bare_cwd_escaped_to` with a loud warning when the session's bound
+directory still is not the workspace, so a non-isolated cell is never pooled
+silently. The `$PWD` fix is not yet confirmed against a live `opencode` run — the
+recorded escape is; the assertion is what will catch it if 1.18.30 hops for some
+other reason.
+
+Also fixed here: a `subprocess_runner` that raised left `res` unbound, so the
+harvest crashed with `UnboundLocalError` on top of the real failure.
+
+### §Q results
+
+`--score-only` rescore of the same runs, no spend:
+
+| task | arm A before §Q | arm A after §Q |
+|---|---|---|
+| `000-week` | 100 / 1.9 / 100 → 67.3 % | 100 / 100 / 100 → **100 %** |
+| `100-floor` | 2 / 1 / 1 → 1.3 % | 100 / 1 / 100 → **67.0 %** |
+| `300-block` | 42 / 100 / 10 → 50.7 % | 42 / 100 / 40 → **60.7 %** |
+| `301-block` | 1 / 2 / 1 → 1.3 % | 100 / 2† / 1† → **34.3 %** |
+| pooled | 39.8 % | **65.5 %** |
+
+† unrecoverable, see §Q1. `100-floor` seed2 (1 block) is a real arm-A failure: its
+session holds no document in any channel.
+
+Tests: `tests/test_sweep_repair_q.py` (14). Full suite 1442, one pre-existing
+failure (`test_mcp_server_overrides`, the Python 3.10 `tomllib` gap in §9.2) and
+one environment-only error (`test_scan_trace_usage_and_cached_cost_totals_scratch_fallback`
+writes to a hardcoded `/tmp` path).
+
+## §R — a truncated classify call scored 5 of 100 floors as 1.0
+
+Diagnosed and landed 2026-09-13, on `longgen_137-floor_armC_seed3`. The cell
+recorded `completion_rate 5.0` alongside `score 1.0`, `resolved true`,
+`termination gates_satisfied`, `nodes_passed 1/1`. **This is a false success, not
+a halt** — nothing in the run reported a problem, and nothing in the record marks
+it suspect. Four defects in series, each individually survivable:
+
+### §R1 — `_repair_common_schema_omissions` fabricates an estimate from a non-estimate
+
+`roles/json_io.py`'s ESTIMATE_SCHEMA branch rewrites every field it does not like.
+That is the right behavior for a real-but-partial estimate. Handed an object that
+is *not* an estimate, it does not repair anything — it manufactures a complete,
+schema-valid estimate out of defaults (`files_touched "unknown"`,
+`answerable_without_exploration False`, `artifacts 1`, `work_kind "unknown"`,
+questions and objections emptied), `additionalProperties:false` strips the keys
+that would have given it away, and `validate()` passes.
+
+A non-estimate gets there by way of truncation: when the classify response stops
+mid-object the outer object never closes, so `extract_last_json_object` falls
+through to its `raw_decode` scan and picks up whatever complete inner object it
+can find — one `questions[]` entry, typically. seed3's `tier.json` estimate is the
+all-defaults object field for field:
+
+    {"ambiguities": [], "answerable_without_exploration": false, "artifacts": 1,
+     "files_touched": "unknown", "objections": [], "work_kind": "unknown"}
+
+Reproduced offline: a truncated response whose JSON literally reads
+`files_touched "1"`, `answerable_without_exploration true`, `work_kind "document"`
+came back as the object above. The model's answer was in the buffer and was
+discarded in favor of the maximally-escalating default.
+
+Fix: `_looks_like_estimate` gates the branch — repair an object carrying at least
+one of the estimate's own fields (an empty dict still counts: "nothing to report"
+is a real answer and the defaults are its right reading), and return anything else
+untouched so it fails `validate()` and the caller retries. FULL_SCOPE_SCHEMA
+carries `questions`/`objections` as well, so the estimate branch now returns
+unconditionally rather than falling through to the INTAKE branch, which would
+otherwise have answered `{"questions": [], "objections": []}`.
+
+### §R2 — the §P3 ceiling escalation did not cover a partial parse
+
+`v1/provider.complete_json` guarded the escalation with `parsed is None and
+truncated`, so it only covered a response too short to hold any JSON at all. A
+response truncated *mid-object* never escalated and never retried. seed3's classify
+was a single call of exactly 4 096 completion tokens — which is
+`_default_max_tokens(FULL_SCOPE_SCHEMA)`, since the schema carries
+questions/objections. Compare the seeds that landed T1: seed1 returned 3 388
+tokens and parsed; seed2 went 4 096 → 8 192 → 8 927 and parsed.
+
+Fix: escalate on `truncated` alone. `finish_reason: "length"` is the endpoint
+saying the content is incomplete — believe it regardless of what the scanner
+managed to recover. At the maximum cap a validated parse is still preferred to
+raising, but it is the last resort rather than the happy path.
+
+### §R3 — the T2 planner never derived a unit count from the goal
+
+`v2/planner.leaf_units_expected` takes its count from the spine slice, from a
+`"<Nouns> N to M"` range in the brief, or from `expected_units_info(brief)` —
+never from the goal. A structurally chunked spine over a short prompt is one unit
+labelled "Opening section" with `units_expected=None`, and the forced-leaf brief
+is "Produce the artifact for Opening section (single unit, cannot split further)".
+So the leaf shipped `gates: ["nonempty", "max_tokens:50000"]` — **no `units_min`**
+— and `nonempty` is the only thing standing between a 5-floor artifact and
+`gates_satisfied`. `v6/direct.build_single_node` (the T1 path) has read
+`expected_units_info(goal)` since §I3; the two single-leaf paths disagreed.
+
+Fix: `build_tree` takes `goal` and passes it to `leaf_units_expected` as a
+last-resort authority, but **only for a leaf that covers the entire spine** — which
+is to say only when the plan collapsed to one node, so a whole-document count can
+never smear across the leaves of a partitioned plan. The delimiter falls back to
+`extract_unit_delimiter(goal)` on the same condition. `pipeline/driver.py` threads
+`self.options.goal` in.
+
+The writer, for its part, did exactly as briefed. Its promotion note reads:
+"The Opening section establishes the document's format … Downstream nodes should
+maintain consistency in floor description format … allowing each agent autonomy
+over their assigned floor range." There were no downstream nodes.
+
+### §R4 — `KUSUDAEMON_OUTPUT_SPINE` defaulted off
+
+`synthesize_output_spine` — which turns a goal declaring N ≥ 8 output units into
+⌈N/units_per_leaf⌉ leaves, each with its own `units_expected` and delimiter — was
+behind a flag defaulting to `"0"`, and `scripts/run_longgen_bench.py` never set it.
+The 000-week and 100-floor sweeps that ran with `KUSUDAEMON_OUTPUT_SPINE=1` got
+3-4 gated leaves; this sweep got one ungated node. The structural surveyor cannot
+see an output-bound task at all: it chunks the *prompt*, and a short prompt is one
+chunk.
+
+Fix: default flipped to `"1"`. `KUSUDAEMON_OUTPUT_SPINE=0` restores the old
+behavior.
+
+### §R5 — the tier is not a coin-flip
+
+`longgen_seed3_tier_coinflip` recorded T1-vs-T2 as model nondeterminism. It is
+not. Across the sweep the correlation is exact: **every classify whose final call
+stopped at the output ceiling landed `files_touched="unknown"` → T2; every classify
+that got a genuine under-cap parse landed T1.** The deterministic `Signals` are
+identical across all three 137-floor seeds (`work_tokens 431`, `work_files 1`,
+`breadth_markers 6`, `output_markers 1`, `output_targets 2`). §R1 and §R2 remove
+the mechanism.
+
+`KUSUDAEMON_TIER_TRUST_SIGNALS=1` is not a workaround here: `_measured_small`
+requires `breadth_markers == 0 and output_markers == 0 and not has_target`, and a
+LongGenBench prompt fails all three by construction. That is deliberate (§R1 of
+PLAN-WORKSPACE-MODE) — a numeric output target is exactly what should *not* be
+called small — which is why the gate, not the tier, has to be the backstop.
+
+### §R6 — gate audit of the sweep
+
+`tree.json` `units_min` gates per run dir, before the fix:
+
+| run | tier | `files_touched` | nodes | `units_min` gates |
+|---|---|---|---|---|
+| `000-week` armC 1/2/3 | T2 + OUTPUT_SPINE=1 | unknown | 3 | 3 |
+| `100-floor` armC 1/2 | T2 + OUTPUT_SPINE=1 | unknown | 4 | 4 |
+| `100-floor` armC 3 | T1 | 1 | 1 | 1 |
+| `137-floor` armC 1/2 | T1 | 1 | 1 | 1 |
+| `301-block` armC 2 | T1 | 1 | 1 | 1 |
+| **`137-floor` armC 3** | **T2, no spine** | **unknown** | **1** | **0** |
+| **`301-block` armC 1/3** | **T2, no spine** | **unknown** | **1** | **0** |
+
+`301-block` seeds 1 and 3 produced 100 blocks anyway (they ended
+`attempts_exhausted`, score 0.0), so only `137-floor` seed3 shows the damage — but
+all three ran with nothing checking the unit count. **An arm-C score is not
+evidence of completion unless its `tree.json` carries a `units_min` gate.** Check
+before citing any pre-§R T2 number; this extends §P's "treat every arm-C
+completion number recorded before 2026-09-12 as a lower bound".
+
+### §R7 — status
+
+Tests: `tests/test_sweep_repair_r.py` (16). The pre-`§R` seed3 artifacts are
+archived at `bench_results/longgen/archive/pre-R-137floor-seed3/` and its run dir
+at `~/.kusudaemon/runs/longgen_137-floor_armC_seed3.pre-R-fix`; the cell is queued
+for a re-run. Verification was per-file against a `git archive HEAD` copy (the
+suite has ordering-dependent hangs on live-provider tests under a restricted
+network): identical pass/fail counts on all 52 files that completed and on all 24
+files touching the changed modules — `test_v2_planner` 26, `test_v2_survey` 26,
+`test_v6_tiering` 51+16, `test_output_spine` 5, `test_sweep_repair_p` 23,
+`test_provider_transport_retry` 14, `test_pipeline_prompts` 34, `test_bench_cli` 17,
+`test_v1_gates_c1` 23, `test_layer1_gate_soundness` 1+100,
+`test_layer1_planner_coverage` 6+8 — with `test_suite_reachable` moving 88 → 90
+subtests for the new file.

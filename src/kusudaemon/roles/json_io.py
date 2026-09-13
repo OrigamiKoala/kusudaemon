@@ -50,6 +50,40 @@ def _unwrap_schema_echo(cand: Any, schema: dict[str, Any] | None = None) -> Any:
     return cand
 
 
+# PLAN-SWEEP-REPAIR.md §R1. The ESTIMATE_SCHEMA repair branch below rewrites
+# every field it does not like, so handed an object that is not an estimate at
+# all it does not repair anything -- it FABRICATES a complete, schema-valid
+# estimate out of defaults (files_touched "unknown", answerable_without_-
+# exploration False). That is the maximally-escalating answer, and it validates,
+# so complete_json returns it as if the model had said it.
+#
+# How a non-estimate gets here: on a truncated classify response the outer
+# object never closes, so extract_last_json_object's scanner falls through to
+# raw_decode and picks up whatever complete inner object it can find -- a single
+# `questions[]` entry, say. Observed live on longgen_137-floor_armC_seed3
+# (2026-09-13): a response whose JSON literally read files_touched "1",
+# answerable true, work_kind "document" came back as the all-defaults object,
+# forcing T2, whose spine path attached no units_min gate, and the run reported
+# score 1.0 on 5 of 100 floors.
+#
+# So: repair an object that is recognizably an estimate, and leave anything else
+# alone. Returned unchanged it fails validate(), which is what arms complete_json's
+# ceiling escalation and retry instead of silently accepting a fiction.
+_ESTIMATE_KEYS = frozenset(
+    {"files_touched", "artifacts", "answerable_without_exploration", "work_kind"}
+)
+
+
+def _looks_like_estimate(cand: dict[str, Any], props: dict[str, Any]) -> bool:
+    """True when ``cand`` carries at least one of the estimate's own scalar
+    fields. An empty dict counts (the model answered "nothing to report" and
+    the defaults are the right reading); a dict carrying only foreign keys
+    does not."""
+    if not cand:
+        return True
+    return bool(_ESTIMATE_KEYS.intersection(cand) & set(props))
+
+
 def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = None) -> Any:
     """Auto-repair obvious schema omissions like missing 'pass' boolean on defect items, single item review dicts, missing verdict, extra keys."""
     if schema is None or not isinstance(schema, dict):
@@ -117,7 +151,7 @@ def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = N
 
     # Case: schema expects {"files_touched", "artifacts", "answerable_without_exploration"} (ESTIMATE_SCHEMA)
     if "files_touched" in props and "artifacts" in props:
-        if isinstance(cand, dict):
+        if isinstance(cand, dict) and _looks_like_estimate(cand, props):
             cand = dict(cand)
             ft = cand.get("files_touched")
             if isinstance(ft, int):
@@ -172,6 +206,13 @@ def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = N
             if schema.get("additionalProperties") is False:
                 cand = {k: v for k, v in cand.items() if k in props}
             return cand
+        # §R1: an estimate schema that also carries questions/objections
+        # (FULL_SCOPE_SCHEMA) must not fall through to the INTAKE branch below,
+        # which would fabricate {"questions": [], "objections": []} and drop the
+        # required estimate fields on the floor. Declining to repair is the
+        # point: the object goes back unchanged, fails validate(), and the
+        # caller retries.
+        return cand
 
     # Case: schema expects {"questions", "objections"} (INTAKE_SCHEMA)
     if "questions" in props and "objections" in props:

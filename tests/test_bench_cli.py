@@ -135,7 +135,7 @@ class TestBenchCLI(unittest.TestCase):
     def test_arm_a_bare_execution(self) -> None:
         executed_cmds = []
 
-        def fake_runner(cmd, cwd, capture_output, text):
+        def fake_runner(cmd, cwd, capture_output, text, **kwargs):
             executed_cmds.append((cmd, cwd))
             stdout_data = json.dumps({"usage": {"input_tokens": 120, "output_tokens": 45}}) + "\n"
             return DummyCompletedProcess(returncode=0, stdout=stdout_data)
@@ -313,7 +313,7 @@ class TestBenchCLI(unittest.TestCase):
         """Run arm A with a fake runner and return the command it built."""
         executed: list[list[str]] = []
 
-        def fake_runner(cmd, cwd, capture_output, text):
+        def fake_runner(cmd, cwd, capture_output, text, **kwargs):
             executed.append(cmd)
             return DummyCompletedProcess(returncode=0)
 
@@ -362,7 +362,7 @@ class TestBenchCLI(unittest.TestCase):
     def test_arm_a_record_carries_session_and_round(self) -> None:
         executed: list[list[str]] = []
 
-        def fake_runner(cmd, cwd, capture_output, text):
+        def fake_runner(cmd, cwd, capture_output, text, **kwargs):
             executed.append(cmd)
             return DummyCompletedProcess(returncode=0)
 

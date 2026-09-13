@@ -1416,7 +1416,13 @@ class RecursiveDriver:
             return
 
         source = source_path(self.run_dir).read_text(encoding="utf-8").strip() if source_path(self.run_dir).is_file() else ""
-        if os.getenv("KUSUDAEMON_OUTPUT_SPINE", "0") == "1":
+        # §R1: default flipped to "1". A goal that declares N >= 8 output units
+        # is exactly the case the structural surveyor cannot see -- it chunks the
+        # *prompt*, and a short prompt is one chunk, so the spine comes back as a
+        # single "Opening section" unit with no unit count and the writer is
+        # briefed to produce an opening rather than the document. Set
+        # KUSUDAEMON_OUTPUT_SPINE=0 to restore the old structural-only behavior.
+        if os.getenv("KUSUDAEMON_OUTPUT_SPINE", "1") == "1":
             from ..v2.survey import synthesize_output_spine
             from ..tokens import expected_units
             goal_text = (self.options.goal or "").strip() or source
@@ -1843,6 +1849,9 @@ class RecursiveDriver:
                 streaming=True,
                 code_tile_planner=self.options.code_tile_planner,
                 trust_estimated_calls=self.options.trust_estimated_calls,
+                # §R1: authority for a units_min gate when the plan collapses
+                # to a single whole-spine leaf.
+                goal=(self.options.goal or "").strip(),
             )
             if not tree.nodes:
                 goal = (self.options.goal or "").strip() or "Execute task"

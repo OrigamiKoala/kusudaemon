@@ -54,6 +54,7 @@ from bench_common import (
     read_records_jsonl,
 )
 from longgen_common import (  # noqa: E402
+    BLOCK_SEP,
     build_prediction_record,
     calculate_completion_rate,
     load_dataset,
@@ -316,6 +317,11 @@ def build_bench_cmd(
     ]
     if run_id:
         cmd += ["--run-id", run_id]
+    if arm == "A":
+        # PLAN-SWEEP-REPAIR.md §Q1: tell the bare arm what a finished unit looks
+        # like, so its artifact can be harvested from whichever channel actually
+        # carries the document instead of from stdout narration.
+        cmd += ["--artifact-delimiter", BLOCK_SEP]
     if model:
         cmd += ["--model", model]
     if runs_root:
