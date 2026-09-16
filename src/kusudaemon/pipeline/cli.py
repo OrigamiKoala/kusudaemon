@@ -1005,6 +1005,30 @@ def _derive_termination(resolved: bool, halt_reason: str | None, tree: Any = Non
     return "attempts_exhausted"
 
 
+def _bench_resolved(
+    resolved: bool,
+    nodes_passed: int,
+    nodes_total: int,
+    artifact_path: str | None,
+) -> tuple[bool, float, int]:
+    """PLAN-REVIEW-READ-LOOP.md §O2: execute is done only when every leaf is
+    passed — a run stopped at its round budget with nodes still pending is
+    escalated, not resolved. `resolved` additionally requires a non-empty
+    artifact, so a 0-byte "completion" can never record score 1.0.
+
+    Returns (resolved, score, exit_code). Pure: unit-testable without a run dir.
+    """
+    has_nonempty_artifact = bool(
+        artifact_path
+        and Path(artifact_path).is_file()
+        and Path(artifact_path).stat().st_size > 0
+    )
+    if resolved and nodes_total > 0:
+        if nodes_passed < nodes_total or not has_nonempty_artifact:
+            return False, 0.0, 1
+    return (resolved, 1.0 if resolved else 0.0, 0 if resolved else 1)
+
+
 def cmd_bench(
     argv: argparse.Namespace,
     *,
@@ -1341,7 +1365,12 @@ def cmd_bench(
         options = RunOptions(
             goal=goal,
             backend=backend,
-            model=model,
+            # PLAN-REVIEW-READ-LOOP.md §R6.4: run.spec.json records the
+            # single-prefixed model id (the doubled nvidia/nvidia/... form is
+            # OpenCode-CLI-only syntax). The doubled local `model` above stays
+            # for the arm-A CLI invocation; the harness compares, persists,
+            # and dials the single form.
+            model=(model.removeprefix("nvidia/") if model and model.startswith("nvidia/nvidia/") else model),
             provider=getattr(argv, "provider", None),
             work_object=work_obj,
             source_text=source_text,
@@ -1562,6 +1591,21 @@ def cmd_bench(
             except Exception:
                 pass
 
+        # PLAN-REVIEW-READ-LOOP.md §O2: resolved requires nodes_passed == nodes_total and non-empty artifact
+        resolved, score, exit_code = _bench_resolved(resolved, nodes_passed, nodes_total, artifact_path)
+
+        # PLAN-REVIEW-READ-LOOP.md §R2.3: count reviews_unavailable
+        reviews_unavailable = 0
+        audit_dir = run_dir / "audit"
+        if audit_dir.is_dir():
+            for af in audit_dir.glob("*.json"):
+                try:
+                    adata = json.loads(af.read_text(encoding="utf-8"))
+                    if adata.get("review_status") == "unavailable" or adata.get("verdict") == "unavailable":
+                        reviews_unavailable += 1
+                except Exception:
+                    pass
+
         termination = _derive_termination(resolved, halt_reason, loaded_tree_for_term)
 
         record = {
@@ -1569,11 +1613,15 @@ def cmd_bench(
             "task_id": task_id,
             "arm": arm,
             "seed": seed,
-            "model": model,
+            # PLAN-REVIEW-READ-LOOP.md §R6.4: the single-prefixed harness model
+            # id (what run.spec.json carries and the role-provider comparison
+            # uses), not the doubled OpenCode-CLI spelling in `model`.
+            "model": options.model,
             "backend": backend,
             "artifact_path": artifact_path,
             "score": score,
             "resolved": resolved,
+            "reviews_unavailable": reviews_unavailable,
             "termination": termination,
             "token_unit": "tokenizer-v1",
             "max_parallel": max_parallel_req,

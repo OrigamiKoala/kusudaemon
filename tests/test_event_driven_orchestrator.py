@@ -167,20 +167,25 @@ def wait(*ids: str, reason: str = "hold") -> dict[str, Any]:
 
 
 class EventDrivenLoopTest(unittest.TestCase):
-    def test_called_on_every_completion_and_its_choice_is_used(self) -> None:
+    def test_choice_is_used_and_forced_choice_skips_call(self) -> None:
         # It picks the LAST dispatchable node each time: reverse document order.
+        # The first two decisions each have ≥2 dispatchable nodes (real calls);
+        # the last decision is a forced choice (single node, single slot) and
+        # spends no call (§O3 skip).
         orch = ScriptedOrchestrator(lambda n, p: dispatch(section(p, "dispatchable now")[-1]))
         with tempfile.TemporaryDirectory() as td:
-            _, tree, tl, _ = _run(
+            _, tree, tl, events = _run(
                 Path(td), [{"id": "a"}, {"id": "b"}, {"id": "c"}],
                 {k: [(0.0, OK)] for k in "abc"}, orch, max_parallel=1,
             )
         self.assertEqual(tl.order, ["c", "b", "a"])
         self.assertTrue(all(tree.nodes[k].status == "passed" for k in "abc"))
-        self.assertEqual(len(orch.prompts), 3)
+        self.assertEqual(len(orch.prompts), 2)
         self.assertIn("execution is starting", orch.prompts[0])
         self.assertIn("- c PASSED", orch.prompts[1])
-        self.assertIn("- b PASSED", orch.prompts[2])
+        self.assertEqual(
+            len([e for e in events if e["type"] == "orchestrator_call_skipped"]), 1
+        )
 
     def test_wait_holds_work_until_the_named_node_finishes(self) -> None:
         def decide(n: int, p: str) -> dict[str, Any]:
@@ -236,7 +241,9 @@ class EventDrivenLoopTest(unittest.TestCase):
             _, tree, tl, events = _run(Path(td), [{"id": "bad"}], {"bad": [(0.0, "")]}, orch, max_parallel=1)
         self.assertEqual(tree.nodes["bad"].status, "blocked")
         self.assertEqual(len(tl.starts["bad"]), 3)
-        self.assertEqual(len(orch.prompts), 3)  # start + two failures; the cap is not asked
+        # Every redispatch is a forced choice (single node, single slot), so
+        # no call is ever spent; the cap is still not asked.
+        self.assertEqual(len(orch.prompts), 0)
         self.assertTrue(any(e["type"] == "run_escalated" for e in events))
 
     def test_no_call_when_the_only_possible_answer_is_wait(self) -> None:
@@ -253,10 +260,16 @@ class EventDrivenLoopTest(unittest.TestCase):
         self.assertIn("- b waits on a (", orch.prompts[0])
 
     def test_wait_with_nothing_running_is_corrected_to_a_dispatch(self) -> None:
+        # Two dispatchable nodes so a real call is spent; the wait-on-ghost
+        # answer is corrected to a dispatch. (A single node would take the §O3
+        # forced-choice skip and never call.)
         orch = ScriptedOrchestrator(lambda n, p: wait("ghost"))
         with tempfile.TemporaryDirectory() as td:
-            _, tree, _, events = _run(Path(td), [{"id": "a"}], {"a": [(0.0, OK)]}, orch, max_parallel=1)
-        self.assertEqual(tree.nodes["a"].status, "passed")
+            _, tree, _, events = _run(
+                Path(td), [{"id": "a"}, {"id": "b"}],
+                {k: [(0.0, OK)] for k in "ab"}, orch, max_parallel=1,
+            )
+        self.assertTrue(all(tree.nodes[k].status == "passed" for k in "ab"))
         decision = next(e for e in events if e["type"] == "orchestrator_decision")
         self.assertEqual(decision["action"], "dispatch")
         self.assertTrue(any("never wake" in c for c in decision["corrections"]))
@@ -300,9 +313,16 @@ class RegressionFixesTest(unittest.TestCase):
     def test_call_is_scoped_to_orchestrator_role_and_bounded_tokens(self) -> None:
         import os
         os.environ["KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS"] = "700"
+        # Two nodes: the first decision has two dispatchable nodes, so a real
+        # call is spent (and scoped). The second decision is a forced choice
+        # (§O3 skip) and spends none.
         orch = ScriptedOrchestrator(lambda n, p: dispatch(*section(p, "dispatchable now")))
         with tempfile.TemporaryDirectory() as td:
-            _run(Path(td), [{"id": "a"}], {"a": [(0.0, OK)]}, orch, max_parallel=1)
+            _, tree, _, _ = _run(
+                Path(td), [{"id": "a"}, {"id": "b"}],
+                {k: [(0.0, OK)] for k in "ab"}, orch, max_parallel=1,
+            )
+        self.assertTrue(all(tree.nodes[k].status == "passed" for k in "ab"))
         self.assertEqual(orch.scopes, [("orchestrator", 700)])
         # The scope is thread-local and closed: this thread sees nothing.
         self.assertIsNone(provider_mod._scoped_max_tokens())
@@ -351,11 +371,10 @@ class RegressionFixesTest(unittest.TestCase):
                 max_parallel=1, allow_fallback=True,
             )
         self.assertEqual(tl.order, ["a", "b"])
-        self.assertEqual(slow.calls, 1)  # b's decision did not start a second call
+        self.assertEqual(slow.calls, 1)  # b's decision is a forced-choice skip, not a second call
         failed = [e for e in events if e["type"] == "orchestrator_call_failed"]
-        self.assertEqual(len(failed), 2)
+        self.assertEqual(len(failed), 1)
         self.assertIn("no answer within", failed[0]["detail"])
-        self.assertIn("still running", failed[1]["detail"])
         # a was dispatched ~0.3 s in, not after the 1.5 s call.
         self.assertLess(tl.starts["a"][0], 1.0)
 
@@ -365,10 +384,14 @@ class RegressionFixesTest(unittest.TestCase):
                 raise KeyError("choices")
 
         with tempfile.TemporaryDirectory() as td:
+            # Two nodes: the first decision has two dispatchable nodes (a real
+            # call, which explodes into the fallback); the second is a forced
+            # choice skip.
             _, tree, _, events = _run(
-                Path(td), [{"id": "a"}], {"a": [(0.0, OK)]}, Broken(), max_parallel=1, allow_fallback=True,
+                Path(td), [{"id": "a"}, {"id": "b"}],
+                {"a": [(0.0, OK)], "b": [(0.0, OK)]}, Broken(), max_parallel=1, allow_fallback=True,
             )
-        self.assertEqual(tree.nodes["a"].status, "passed")
+        self.assertTrue(all(tree.nodes[k].status == "passed" for k in "ab"))
         self.assertIn("KeyError", next(e for e in events if e["type"] == "orchestrator_call_failed")["detail"])
 
     def test_loop_error_drains_writers_instead_of_cancelling_them(self) -> None:
@@ -445,6 +468,65 @@ class RegressionFixesTest(unittest.TestCase):
         self.assertEqual(first["node_ids"], ["a", "b", "c"])
         self.assertTrue(any("filled them in document order" in c for c in first["corrections"]))
         self.assertLess(tl.starts["c"][0], tl.ends["a"][0])
+
+
+class ForcedChoiceSkipTest(unittest.TestCase):
+    """PLAN-REVIEW-READ-LOOP.md §O3 (operator decision 2026-09-16): a forced
+    choice — one dispatchable node, one free slot, nothing in flight — spends
+    no orchestrator call."""
+
+    def tearDown(self) -> None:
+        import os
+        os.environ.pop("KUSUDAEMON_ORCHESTRATOR_SKIP_FORCED", None)
+
+    def test_single_node_run_spends_no_call(self) -> None:
+        class RefusingOrchestrator:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete_json(self, messages, schema, **kwargs):
+                self.calls += 1
+                raise AssertionError("no call is spendable on a forced choice")
+
+        orch = RefusingOrchestrator()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir, tree, _, events = _run(
+                Path(td), [{"id": "a"}], {"a": [(0.0, OK)]}, orch, max_parallel=1,
+            )
+        self.assertEqual(tree.nodes["a"].status, "passed")
+        self.assertEqual(orch.calls, 0)
+        skipped = [e for e in events if e["type"] == "orchestrator_call_skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], "forced choice: single dispatchable node and slot")
+        decided = [e for e in events if e["type"] == "node_dispatch_decided"]
+        self.assertEqual([e["node_id"] for e in decided], ["a"])
+
+    def test_second_decision_skipped_once_field_narrows_to_one(self) -> None:
+        # Two nodes, one slot: the first decision has two dispatchable nodes
+        # (a real call), the second is forced (skipped).
+        orch = ScriptedOrchestrator(lambda n, p: dispatch(*section(p, "dispatchable now")))
+        with tempfile.TemporaryDirectory() as td:
+            _, tree, _, events = _run(
+                Path(td), [{"id": "a"}, {"id": "b"}],
+                {k: [(0.0, OK)] for k in "ab"}, orch, max_parallel=1,
+            )
+        self.assertTrue(all(tree.nodes[k].status == "passed" for k in "ab"))
+        self.assertEqual(len(orch.prompts), 1)
+        self.assertEqual(
+            len([e for e in events if e["type"] == "orchestrator_call_skipped"]), 1
+        )
+
+    def test_skip_opt_out_restores_call_on_every_completion(self) -> None:
+        import os
+        os.environ["KUSUDAEMON_ORCHESTRATOR_SKIP_FORCED"] = "0"
+        orch = ScriptedOrchestrator(lambda n, p: dispatch(*section(p, "dispatchable now")))
+        with tempfile.TemporaryDirectory() as td:
+            _, tree, _, events = _run(
+                Path(td), [{"id": "a"}], {"a": [(0.0, OK)]}, orch, max_parallel=1,
+            )
+        self.assertEqual(tree.nodes["a"].status, "passed")
+        self.assertEqual(len(orch.prompts), 1)
+        self.assertFalse(any(e["type"] == "orchestrator_call_skipped" for e in events))
 
 
 class ParseDecisionTest(unittest.TestCase):

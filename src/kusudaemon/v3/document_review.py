@@ -499,7 +499,7 @@ def run_document_review(
                     },
                     {"role": "user", "content": context},
                 ],
-                VERDICT_SCHEMA,
+                DOC_REVIEW_SCHEMA,
                 on_reasoning=on_reasoning,
                 streaming=streaming,
             )

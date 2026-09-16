@@ -414,6 +414,20 @@ async def review_and_transition_node(
                             pass
         declared_inputs_str = "\n\n".join(declared_inputs_parts)
 
+        def _review_sink(text: str) -> None:
+            # PLAN-REVIEW-READ-LOOP.md §R1.1: reviewer/triage reasoning
+            # streams live into scratch/<node>/review-trace.jsonl the way
+            # phase-classify streams into its trace file.
+            if not text:
+                return
+            try:
+                trace_path = run_dir / "scratch" / node.id / "review-trace.jsonl"
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                with trace_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"role": "thinking", "text": text}) + "\n")
+            except Exception:
+                pass
+
         async def _do_review() -> ReviewVerdict:
             kwargs: dict[str, Any] = dict(
                 contract_text=contract_text,
@@ -422,11 +436,36 @@ async def review_and_transition_node(
                 triage_provider=triage_provider,
                 cached_sections=cached_sections,
                 judgment_classification=getattr(node, "judgment_classification", None),
+                on_reasoning=_review_sink,
+                on_event=log.append,
+                run_dir=run_dir,
             )
+
+            def _call_with_containment() -> ReviewVerdict:
+                from .provider import ProviderError, call_scope
+
+                try:
+                    with call_scope(role="reviewer", node=node.id):
+                        return review_node(node, artifact_text, provider, **kwargs)
+                except ProviderError as exc:
+                    return ReviewVerdict(
+                        node_id=node.id,
+                        items=[],
+                        verdict="unavailable",
+                        skip_reason=f"provider: {exc}",
+                    )
+                except Exception as exc:
+                    return ReviewVerdict(
+                        node_id=node.id,
+                        items=[],
+                        verdict="unavailable",
+                        skip_reason=f"provider: {exc}",
+                    )
+
             if provider_semaphore is not None:
                 async with provider_semaphore:
-                    return await asyncio.to_thread(review_node, node, artifact_text, provider, **kwargs)
-            return await asyncio.to_thread(review_node, node, artifact_text, provider, **kwargs)
+                    return await asyncio.to_thread(_call_with_containment)
+            return await asyncio.to_thread(_call_with_containment)
 
         review_task = asyncio.create_task(_do_review())
         while not review_task.done():
@@ -485,16 +524,35 @@ async def review_and_transition_node(
     if not disable_review and verdict.verdict == "pass" and review_sample_rate > 0.0 and node.judgment:
         import random
         if random.random() < review_sample_rate:
-            sampled = review_node(
-                node,
-                artifact_text,
-                provider,
-                contract_text=contract_text,
-                declared_inputs=declared_inputs_str if 'declared_inputs_str' in locals() else "",
-                brief=node.brief,
-                temperature=0.7,
-            )
-            if sampled.verdict != "pass":
+            def _sampled_call() -> ReviewVerdict:
+                from .provider import ProviderError, call_scope
+
+                try:
+                    with call_scope(role="reviewer", node=node.id):
+                        return review_node(
+                            node,
+                            artifact_text,
+                            provider,
+                            contract_text=contract_text,
+                            declared_inputs=declared_inputs_str if 'declared_inputs_str' in locals() else "",
+                            brief=node.brief,
+                            temperature=0.7,
+                            on_reasoning=_review_sink,
+                            on_event=log.append,
+                            run_dir=run_dir,
+                        )
+                except ProviderError as exc:
+                    return ReviewVerdict(node_id=node.id, items=[], verdict="unavailable", skip_reason=f"provider: {exc}")
+                except Exception as exc:
+                    return ReviewVerdict(node_id=node.id, items=[], verdict="unavailable", skip_reason=f"provider: {exc}")
+
+            if provider_semaphore is not None:
+                async with provider_semaphore:
+                    sampled = await asyncio.to_thread(_sampled_call)
+            else:
+                sampled = await asyncio.to_thread(_sampled_call)
+
+            if sampled.verdict not in ("pass", "unavailable"):
                 sampled_disagreement = True
                 log.append({
                     "node_id": node.id,
@@ -515,7 +573,7 @@ async def review_and_transition_node(
             pass
 
     await _transition_after_review(
-        node, tree, tree_path, verdict, max_attempts, log, tree_lock=tree_lock
+        node, tree, tree_path, verdict, max_attempts, log, tree_lock=tree_lock, run_dir=run_dir
     )
     if node.status == "passed" and on_node_passed is not None:
         # PLAN.md §A8.3: this node may be the last outstanding child of a
@@ -703,7 +761,12 @@ async def run_round_loop(
             return max(1, min(max_parallel, admission.current_wave_cap))
 
         def halted() -> bool:
-            return stopping or (should_halt is not None and should_halt())
+            if stopping or (should_halt is not None and should_halt()):
+                return True
+            for n in tree.nodes.values():
+                if "provider unavailable" in getattr(n, "last_defect", ""):
+                    return True
+            return False
 
         async def after_attempt(node: TaskNode) -> None:
             # §B7.3 AIMD, per finished attempt rather than per wave.
@@ -714,6 +777,9 @@ async def run_round_loop(
 
         async def node_job(node: TaskNode, start: str) -> None:
             if start == "dispatch":
+                if getattr(node, "non_attempts", 0) > 0:
+                    backoff = min(600.0, 30.0 * (2 ** (node.non_attempts - 1)))
+                    await asyncio.sleep(backoff)
                 await dispatch(node)
                 await after_attempt(node)
             if node.status == "awaiting_review":
@@ -721,6 +787,8 @@ async def run_round_loop(
             # §11.10.5 in-place retry, unchanged except that it no longer
             # waits for the rest of the wave.
             while node.status == "pending" and node.attempts < max_attempts:
+                if getattr(node, "non_attempts", 0) >= int(os.getenv("KUSUDAEMON_MAX_NON_ATTEMPTS", "6")):
+                    break
                 if is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id):
                     node.status = "awaiting_review"
                     await _save_tree_locked(tree, tree_path, tree_lock)
@@ -729,10 +797,13 @@ async def run_round_loop(
                 # §E15 (c)
                 if halted():
                     break
-                if node.attempts > 0:
+                if getattr(node, "non_attempts", 0) > 0:
+                    backoff = min(600.0, 30.0 * (2 ** (node.non_attempts - 1)))
+                    await asyncio.sleep(backoff)
+                elif node.attempts > 0:
                     await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
-                    if halted():
-                        break
+                if halted():
+                    break
                 node.status = "dispatched"
                 await _save_tree_locked(tree, tree_path, tree_lock)
                 await dispatch(node)
@@ -945,7 +1016,10 @@ async def run_round_loop(
                     node.status = "awaiting_review"
                     await _save_tree_locked(tree, tree_path, tree_lock)
                 else:
-                    if node.attempts > 0:
+                    if getattr(node, "non_attempts", 0) > 0:
+                        backoff = min(600.0, 30.0 * (2 ** (node.non_attempts - 1)))
+                        await asyncio.sleep(backoff)
+                    elif node.attempts > 0:
                         # Transient-failure spacing, as the in-place retry had.
                         await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
                     await dispatch(node)
@@ -978,7 +1052,10 @@ async def run_round_loop(
 
                 if not stopping and not no_new_work and not resume_queue and news:
                     # §E15 (a)
-                    if should_halt is not None and should_halt():
+                    if (should_halt is not None and should_halt()) or any(
+                        "provider unavailable" in getattr(n, "last_defect", "")
+                        for n in tree.nodes.values()
+                    ):
                         no_new_work = True
                     else:
                         claimed = claimed_ids()
@@ -1003,29 +1080,90 @@ async def run_round_loop(
                                     )
                                 break
                             messages = None
+                            forced_dispatch_id: str | None = None
                             if ready and free > 0:
-                                now = time.monotonic()
-                                previous = None
-                                if last_decision is not None:
-                                    previous = dict(last_decision)
-                                    if isinstance(previous.get("ts"), (int, float)):
-                                        previous["age_s"] = max(0.0, time.time() - previous["ts"])
-                                messages = build_orchestrator_messages(
-                                    tree,
-                                    events=events,
-                                    ready=ready,
-                                    in_flight=[
-                                        (n.id, now - started_at.get(n.id, now)) for n in running.values()
+                                if (
+                                    len(ready) == 1
+                                    and free == 1
+                                    and not running
+                                    and os.getenv("KUSUDAEMON_ORCHESTRATOR_SKIP_FORCED", "1") != "0"
+                                ):
+                                    # PLAN-REVIEW-READ-LOOP.md §O3 (operator decision
+                                    # 2026-09-16): forced choice — exactly one
+                                    # dispatchable node, one free slot, nothing in
+                                    # flight. The only possible answer is that node,
+                                    # so no model call is spent.
+                                    forced_dispatch_id = ready[0]
+                                else:
+                                    now = time.monotonic()
+                                    previous = None
+                                    if last_decision is not None:
+                                        previous = dict(last_decision)
+                                        if isinstance(previous.get("ts"), (int, float)):
+                                            previous["age_s"] = max(0.0, time.time() - previous["ts"])
+                                    RubricOrch = build_orchestrator_messages(
+                                        tree,
+                                        events=events,
+                                        ready=ready,
+                                        in_flight=[
+                                            (n.id, now - started_at.get(n.id, now)) for n in running.values()
+                                        ],
+                                        free_slots=free,
+                                        max_slots=max_parallel,
+                                        max_attempts=max_attempts,
+                                        manifest_path=str(manifest),
+                                        decision_index=first_round + calls,
+                                        first_call=(calls == 0),
+                                        previous_decision=previous,
+                                    )
+                                    messages = RubricOrch
+                        if forced_dispatch_id is not None:
+                            node = tree.nodes[forced_dispatch_id]
+                            round_index = first_round + calls
+                            calls += 1
+                            told = events
+                            events = []
+                            news = False
+                            last_decision = {
+                                "round": round_index,
+                                "action": "dispatch",
+                                "node_ids": [node.id],
+                                "wait_on": [],
+                                "reason": "forced choice: single dispatchable node and slot",
+                                "corrections": [],
+                                "ts": time.time(),
+                            }
+                            log.append(
+                                {
+                                    "node_id": node.id,
+                                    "role": "orchestrator",
+                                    "round": round_index,
+                                    "type": "orchestrator_call_skipped",
+                                    "reason": "forced choice: single dispatchable node and slot",
+                                    "events": [
+                                        {"node_id": e.node_id, "outcome": e.outcome, "attempts": e.attempts}
+                                        for e in told
                                     ],
-                                    free_slots=free,
-                                    max_slots=max_parallel,
-                                    max_attempts=max_attempts,
-                                    manifest_path=str(manifest),
-                                    decision_index=first_round + calls,
-                                    first_call=(calls == 0),
-                                    previous_decision=previous,
-                                )
-                        if messages is None:
+                                }
+                            )
+                            node.status = "dispatched"
+                            await _save_tree_locked(tree, tree_path, tree_lock)
+                            log.append(
+                                {
+                                    "node_id": node.id,
+                                    "role": "orchestrator",
+                                    "round": round_index,
+                                    "type": "node_dispatch_decided",
+                                    "reason": "forced choice: single dispatchable node and slot",
+                                    "redispatch": node.attempts > 0,
+                                }
+                            )
+                            if node.attempts == 0:
+                                fresh_rounds += 1
+                            start_job(node, "dispatch")
+                            if fresh_rounds >= max_rounds:
+                                no_new_work = True
+                        elif messages is None:
                             # Nothing dispatchable, or no free slot: the only
                             # possible answer is "wait", so no call is spent.
                             # The events stay queued for the next real decision.
@@ -1050,7 +1188,7 @@ async def run_round_loop(
                                     # "orchestrator" — thread-local, so the shared
                                     # provider's other callers are unaffected.
                                     with call_scope(role="orchestrator", max_tokens=cap_tokens):
-                                        return provider.complete_json(msgs, ORCHESTRATOR_SCHEMA)
+                                        return provider.complete_json(msgs, ORCHESTRATOR_SCHEMA, streaming=True)
 
                                 call_task = asyncio.ensure_future(asyncio.to_thread(_call))
                                 call_task.add_done_callback(
@@ -1459,6 +1597,7 @@ async def _transition_after_writer(
             pass
 
     if episode_ok and (gates_passed or bypassed):
+        node.non_attempts = 0
         node.status = "awaiting_review"
         node.last_defect = ""
         if not gates_passed and bypassed:
@@ -1472,23 +1611,37 @@ async def _transition_after_writer(
                     "unmet": [result.gate for result in gate_results if not result.passed],
                 }
             )
-    elif result_status == "throttled":
-        # PLAN-CONCURRENCY-AND-SHARED-STATE.md §B7.1: Throttling is classified as
-        # a non-attempt. Node returns to pending without incrementing attempts,
-        # recorded as a node_throttled event.
-        node.status = "pending"
-        node.last_defect = "throttled: rate limit / 429 from provider"
-        log.append(
-            {
-                "node_id": node.id,
-                "role": "harness",
-                "round": 0,
-                "type": "node_throttled",
-                "attempts": node.attempts,
-                "episode_ok": False,
-                "detail": "rate limit / 429 from provider",
-            }
-        )
+    elif result_status in ("throttled", "transport"):
+        node.non_attempts = getattr(node, "non_attempts", 0) + 1
+        max_non_attempts = int(os.getenv("KUSUDAEMON_MAX_NON_ATTEMPTS", "6"))
+        if node.non_attempts >= max_non_attempts:
+            node.status = "blocked"
+            node.last_defect = f"provider unavailable: hit {node.non_attempts} consecutive non-attempts ({result_status})"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "run_halted",
+                    "reason": "provider unavailable",
+                    "detail": node.last_defect,
+                }
+            )
+        else:
+            node.status = "pending"
+            node.last_defect = f"{result_status}: rate limit / provider error (non-attempt {node.non_attempts}/{max_non_attempts})"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": f"node_{result_status}",
+                    "attempts": node.attempts,
+                    "non_attempts": node.non_attempts,
+                    "episode_ok": False,
+                    "detail": f"{result_status} from provider",
+                }
+            )
     elif regressed_accidental:
         # §L4: Do not count proven-accidental loss against max_attempts
         node.status = "pending"
@@ -1554,6 +1707,7 @@ async def _transition_after_review(
     max_attempts: int,
     log: EventLog,
     tree_lock: asyncio.Lock | None = None,
+    run_dir: str | Path | None = None,
 ) -> None:
     if verdict.verdict == "pass":
         # PLAN.md invariant 1: only the harness writes "passed", and only
@@ -1561,6 +1715,39 @@ async def _transition_after_review(
         # (checked here) both agree.
         node.status = "passed"
         node.last_defect = ""
+    elif verdict.verdict == "unavailable":
+        if os.getenv("KUSUDAEMON_REVIEW_UNAVAILABLE") == "retry":
+            node.status = "awaiting_review"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_review_unavailable_retry",
+                    "detail": "reviewer unavailable; queued for retry",
+                }
+            )
+        else:
+            node.status = "passed"
+            node.last_defect = ""
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_review_unavailable",
+                    "detail": f"reviewer unavailable ({getattr(verdict, 'skip_reason', '')}); passing node on gates",
+                }
+            )
+            if run_dir:
+                try:
+                    audit_p = ensure_audit_path(Path(run_dir), node.id)
+                    if audit_p.is_file():
+                        ad = json.loads(audit_p.read_text(encoding="utf-8"))
+                        ad["review_status"] = "unavailable"
+                        audit_p.write_text(json.dumps(ad, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
     else:
         node.attempts += 1
         node.status = "blocked" if node.attempts >= max_attempts else "pending"
@@ -1639,35 +1826,32 @@ def _sync_tree_from_disk(
             mem_node.last_defect = disk_node.last_defect
         elif disk_node.status == "passed" and mem_node.status != "passed":
             mem_node.status = "passed"
-            mem_node.attempts = disk_node.attempts
+            mem_node.last_defect = ""
+        elif disk_node.status == "blocked" and mem_node.status != "blocked":
+            mem_node.status = "blocked"
             mem_node.last_defect = disk_node.last_defect
 
 
 @contextmanager
 def _claimed_read_as_dispatched(tree: TaskTree, claimed: set[str]) -> Iterator[None]:
-    """Within the block, nodes a live job owns read as ``dispatched``.
-
-    A job between attempts (retry backoff, or awaiting the tree lock right
-    after its review transition) is ``pending``, which ``ready_nodes`` and
-    both dispatch policies would hand out again. The block must contain no
-    ``await`` — it relies on the event loop not switching tasks inside it.
-    Statuses are restored on exit, so nothing masked is ever saved.
-    """
-    masked: dict[str, str] = {}
+    """Expose the tree to the orchestrator with live-job nodes reading dispatched."""
+    prev: dict[str, NodeStatus] = {}
     for node_id in claimed:
         node = tree.nodes.get(node_id)
-        if node is not None and node.status not in ("dispatched", "awaiting_review"):
-            masked[node_id] = node.status
+        if node is not None and node.status != "dispatched":
+            prev[node_id] = node.status
             node.status = "dispatched"
     try:
         yield
     finally:
-        for node_id, status in masked.items():
-            tree.nodes[node_id].status = status
+        for node_id, status in prev.items():
+            node = tree.nodes.get(node_id)
+            if node is not None:
+                node.status = status
 
 
 async def _save_tree_locked(
-    tree: TaskTree, tree_path: str | Path, tree_lock: asyncio.Lock | None
+    tree: TaskTree, tree_path: str | Path, tree_lock: asyncio.Lock | None = None
 ) -> None:
     """PLAN.md §C2's "single-writer discipline for tree.json": every
     writer of the shared tree serializes its ``save`` through one lock.
@@ -1692,11 +1876,16 @@ def _defect_from_verdict(verdict: ReviewVerdict) -> str:
     """Located, scoped feedback (PLAN-zeromem.md §9) rather than a bare
     "fail" — the same join v3/revalidate.py already does for repair
     prompts, applied one layer earlier so an ordinary retry gets it too."""
-    lines = [
-        f"{item.get('id', '?')}: {item.get('defect', '')}".rstrip(": ")
-        for item in verdict.items
-        if not item.get("pass", True)
-    ]
+    lines = []
+    for item in verdict.items:
+        if not item.get("pass", True):
+            id_ = item.get("id", "?")
+            defect = item.get("defect", "")
+            unit = item.get("unit")
+            if unit is not None:
+                lines.append(f"unit {unit} — {id_}: {defect}".rstrip(": "))
+            else:
+                lines.append(f"{id_}: {defect}".rstrip(": "))
     return "\n".join(lines) if lines else "reviewer verdict: fail"
 
 
@@ -1735,6 +1924,8 @@ def _write_audit(
             "skip_reason": getattr(verdict, "skip_reason", None),
         }
     )
+    if getattr(verdict, "verdict", None) == "unavailable" or getattr(verdict, "review_status", None) == "unavailable":
+        existing["review_status"] = "unavailable"
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

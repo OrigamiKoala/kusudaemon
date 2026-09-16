@@ -184,14 +184,19 @@ def _budget_seconds(node: TaskNode, remaining_budget_s: float | None = None) -> 
     """Wall-clock ceiling for one node's episode, proportional to
     ``node.budget.tokens`` with a floor and a ceiling (PLAN-zeromem.md §5.2c').
     Clamped against remaining_budget_s if a wall-clock budget is active.
-
-    ``NodeBudget.calls`` stays deliberately unwired: gptme has no lever that
-    would enforce a tool-call limit, so inventing one here would be fake
-    enforcement — the docs (and ``v2/planner.py``'s leaf_gate) already note
-    that calls is a plan-time estimate only.
+    Scales with expected output tokens and measured TPS (PLAN-REVIEW-READ-LOOP.md §O7).
     """
     tokens = node.budget.tokens or _REFERENCE_BUDGET_TOKENS
     seconds = round(tokens / _REFERENCE_BUDGET_TOKENS * _REFERENCE_DURATION_SECONDS)
+
+    # PLAN-REVIEW-READ-LOOP.md §O7: Scale budget with expected output tokens / measured decode tps
+    measured_tps = float(os.getenv("KUSUDAEMON_MEASURED_TPS", "35.0"))
+    units_exp = node.budget.units_expected if node.budget else None
+    if units_exp and units_exp > 0:
+        expected_output_tokens = units_exp * 400
+        output_seconds = int(expected_output_tokens * 2 / max(1.0, measured_tps))
+        seconds = max(seconds, output_seconds)
+
     bounded = max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
     if remaining_budget_s is not None:
         bounded = min(bounded, max(1, int(remaining_budget_s)))
@@ -1891,6 +1896,13 @@ class RecursiveDriver:
         # its absolute form). The glossary itself is written once, right
         # after the tree is saved, from the templates the tree resolved to.
         merge_template_into_tree(tree, glossary_path=glossary_path(self.run_dir))
+        # PLAN-REVIEW-READ-LOOP.md §O5: T1→T2 size-defect escalation lands here
+        # on the next loop iteration (_phase_execute escalates and returns None,
+        # then run() re-enters _phase_plan which builds the new T2 tree). The
+        # new spine's ranges only exist after that rebuild, so the slice of the
+        # old T1 single.md into out/unit-NN.md happens here, not inside
+        # _escalate_tier. No-op when there is no single.md (fresh runs).
+        self._slice_single_artifact_to_leaves(tree)
         tree.save(tree_path(self.run_dir))
         if write_tree_glossary(self.run_dir, tree):
             self._log(
@@ -2311,12 +2323,25 @@ class RecursiveDriver:
                 self._archive_t2_contract_before_pilot()
                 self._escalate_tier("split_accepted", node_id=split_parents[0])
                 return None
-        if tree.is_blocked():
-            # §2026-08-13: parked (no auto-recovery applies — non-size
-            # defect at T1, or a T2/T3 tree whose blocked nodes aren't a
-            # promotion trigger). Log the actionable summary before the
-            # phase reports "escalated".
-            self._log_blocked_tree(tree)
+        if not tree.is_complete():
+            if tree.is_blocked():
+                # §2026-08-13: parked (no auto-recovery applies — non-size
+                # defect at T1, or a T2/T3 tree whose blocked nodes aren't a
+                # promotion trigger). Log the actionable summary before the
+                # phase reports "escalated".
+                self._log_blocked_tree(tree)
+            else:
+                passed_count = sum(1 for n in tree.nodes.values() if n.status == "passed")
+                total_count = len([n for n in tree.nodes.values() if n.status != "split"])
+                reason = f"round budget exhausted ({passed_count} of {total_count} nodes passed)"
+                self._set_phase("execute", "escalated", detail=reason)
+                self._log({
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "run_escalated",
+                    "reason": reason,
+                })
             return False
         return None
 
@@ -2400,6 +2425,97 @@ class RecursiveDriver:
             return
         archive = path.with_name(f"contract.md.pre-t2-escalation-{int(time.time())}")
         path.rename(archive)
+
+    def _slice_single_artifact_to_leaves(self, tree: TaskTree) -> None:
+        """PLAN-REVIEW-READ-LOOP.md §O5: When escalating from T1 to T2, split existing
+        single.md by the new spine's ranges using unit_matches(), write each slice to
+        out/unit-NN.md, and start each leaf with continuation framing ("resume at unit K").
+        A leaf whose range is already complete starts in awaiting_review.
+        """
+        single_candidates = [
+            self.run_dir / "out" / "single.md",
+            self.run_dir / "single.md",
+        ]
+        single_path = next((p for p in single_candidates if p.exists() and p.stat().st_size > 0), None)
+        if not single_path:
+            return
+
+        single_text = single_path.read_text(encoding="utf-8")
+        from ..tokens import extract_unit_delimiter
+        from ..v1.gates import unit_matches
+        from ..v2.planner import UNIT_RANGE_RE
+
+        delim = extract_unit_delimiter(single_text)
+        if not delim:
+            delim = "#*#"
+
+        matches = list(unit_matches(single_text, delim))
+        if not matches:
+            return
+
+        unit_slices: dict[int, str] = {}
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(single_text)
+            ord_str = m.group("ord") if "ord" in m.groupdict() and m.group("ord") else None
+            try:
+                ord_val = int(ord_str) if ord_str is not None else i + 1
+            except ValueError:
+                ord_val = i + 1
+            unit_slices[ord_val] = single_text[start:end]
+
+        for node in tree.nodes.values():
+            if node.status == "split":
+                continue
+            lo, hi = None, None
+            for g in list(node.gates) + list(node.warn_gates):
+                if g.startswith("units_range:"):
+                    spec = g.partition(":")[2].partition("@")[0]
+                    slo, _, shi = spec.partition("-")
+                    try:
+                        lo, hi = int(slo), int(shi)
+                        break
+                    except ValueError:
+                        pass
+            if lo is None or hi is None:
+                m_range = UNIT_RANGE_RE.search(node.brief)
+                if m_range:
+                    try:
+                        lo, hi = int(m_range.group(2)), int(m_range.group(3))
+                    except ValueError:
+                        pass
+
+            if lo is None or hi is None:
+                continue
+
+            node_units = [ord_val for ord_val in sorted(unit_slices.keys()) if lo <= ord_val <= hi]
+            if not node_units:
+                continue
+
+            art_path = self.run_dir / node.artifact
+            art_path.parent.mkdir(parents=True, exist_ok=True)
+            assembled = "".join(unit_slices[u] for u in node_units)
+            art_path.write_text(assembled, encoding="utf-8")
+
+            expected_count = hi - lo + 1
+            if len(node_units) >= expected_count:
+                node.status = "awaiting_review"
+                node.last_defect = ""
+            else:
+                next_unit = max(node_units) + 1
+                node.status = "pending"
+                node.last_defect = f"resume at unit {next_unit}"
+
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "single_sliced_to_leaves",
+                "units_sliced": len(unit_slices),
+                "source": str(single_path),
+            }
+        )
 
     async def _phase_verify(self) -> None:
         """T0's dedicated finalize step (PLAN.md §A4.3: T0's phase list is
@@ -2523,7 +2639,22 @@ class RecursiveDriver:
         if tree.is_blocked():
             return False
         if self._current_tier() == "T2":
-            review = await self._document_review_cached_pass(tree, keep_depth_pass=False)
+            try:
+                review = await self._document_review_cached_pass(tree, keep_depth_pass=False)
+            except ProviderError as exc:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "reviewer",
+                        "round": 0,
+                        "type": "document_review_unavailable",
+                        "detail": f"provider error: {exc}",
+                    }
+                )
+                audit_file = self._document_review_cache_path()
+                audit_file.parent.mkdir(parents=True, exist_ok=True)
+                audit_file.write_text(json.dumps({"document_review": "unavailable", "detail": str(exc)}, indent=2), encoding="utf-8")
+                return None
             if review.escalated:
                 return False
             await self._handle_document_review_triage(
@@ -2908,8 +3039,16 @@ class RecursiveDriver:
         # than merely slower to fail (§F3).
         timeout = 45.0 if role in ("reviewer", "triage") else 300.0
         http_timeout = _role_http_timeout() if role in ("reviewer", "triage") else 300.0
-        if not role_model or role_model == getattr(self.provider, "model", None):
+        def _norm_model(m: str | None) -> str | None:
+            if not m:
+                return None
+            if m.startswith("nvidia/nvidia/"):
+                return m.removeprefix("nvidia/")
+            return m
+
+        if not role_model or _norm_model(role_model) == _norm_model(getattr(self.provider, "model", None)):
             return self.provider
+        admission_controller = getattr(self.provider, "admission_controller", None)
         return make_role_provider(
             options=self.options,
             model=role_model,
@@ -2919,6 +3058,10 @@ class RecursiveDriver:
             http_timeout=http_timeout,
             role=role,
             phase=_read_phase(self.run_dir).get("phase", "unknown"),
+            cost_ledger=self.cost_ledger,
+            on_backoff=getattr(self.provider, "_on_backoff", None),
+            should_abort=self._halted,
+            admission_controller=admission_controller,
         )
 
     def _generate_resumption_brief(self) -> None:

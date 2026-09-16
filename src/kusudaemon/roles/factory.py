@@ -182,6 +182,9 @@ def make_role_provider(
     provider_cls: Any = None,
     role: str | None = None,
     phase: str | None = None,
+    cost_ledger: Any = None,
+    should_abort: Callable[[], bool] | None = None,
+    admission_controller: Any | None = None,
 ) -> RoleProvider:
     """Build a RoleProvider instance for reasoning/role calls.
 
@@ -228,6 +231,9 @@ def make_role_provider(
                 timeout=300.0 if effective_timeout is None else effective_timeout,
                 role=role or "unknown",
                 phase=phase or "unknown",
+                cost_ledger=cost_ledger,
+                should_abort=should_abort,
+                admission_controller=admission_controller,
             )
 
         target_dir = Path(run_dir) if run_dir is not None else Path.cwd()

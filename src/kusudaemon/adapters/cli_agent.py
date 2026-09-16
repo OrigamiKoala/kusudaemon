@@ -95,6 +95,42 @@ def extract_tokens_from_actions_log(
     }
 
 
+def classify_cli_failure(output: str) -> str:
+    """Classify non-zero exit from CLI agent (PLAN-REVIEW-READ-LOOP.md §O1)."""
+    low = output.lower()
+    transport_patterns = (
+        "cannot connect",
+        "socket connection was closed",
+        "connection refused",
+        "connection reset",
+        "connection error",
+        "network error",
+        "failed to connect",
+        "econnrefused",
+        "econnreset",
+    )
+    if any(p in low for p in transport_patterns):
+        return "transport"
+
+    rate_limit_patterns = (
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "quota exceeded",
+    )
+    if any(p in low for p in rate_limit_patterns):
+        return "throttled"
+
+    status_429_pattern = re.compile(
+        r"(?:status(?:_code)?|http|code|error)[=:\s]+429\b|status\s+429\b|\b429\s+too many requests\b",
+        re.IGNORECASE,
+    )
+    if status_429_pattern.search(output):
+        return "throttled"
+
+    return "error"
+
+
 class CommandAgentAdapter:
     # Overridden True by adapters that can continue a prior run rather than
     # starting over (see ClaudeCodeAdapter). v0's runner falls back to a fresh
@@ -197,16 +233,13 @@ class CommandAgentAdapter:
             await env.exec(f"rm -f {shlex.quote(prompt_path)}", timeout=60)
         except Exception:
             pass
+
         duration_ms = int((time.monotonic() - start) * 1000)
         if result.termination_reason == "timeout":
             status = "timeout"
         elif result.exit_code != 0:
             combined = (result.stderr or "") + "\n" + (result.stdout or "")
-            low = combined.lower()
-            if any(p in low for p in ("rate limit", "429", "too many requests", "quota exceeded", "ai_apicallerror")):
-                status = "throttled"
-            else:
-                status = "error"
+            status = classify_cli_failure(combined)
         else:
             status = "done"
         stdout_log = result.stdout

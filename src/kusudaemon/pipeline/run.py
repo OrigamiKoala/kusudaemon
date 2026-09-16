@@ -183,17 +183,19 @@ def _log_rate_limit_backoff_for(run_dir: Path) -> Callable[[int, float], None]:
     once built it's reused across the run's retries."""
     log: list[EventLog] = []  # one-slot cache so the EventLog is created at most once
 
-    def _on_backoff(attempt: int, delay_s: float) -> None:
+    def _on_backoff(attempt: int, delay_s: float, reason: str = "rate_limit") -> None:
         if not log:
             log.append(EventLog(events_path(run_dir)))
+        event_type = "transport_backoff" if reason == "transport" else "rate_limit_backoff"
         log[0].append(
             {
                 "node_id": "-",
                 "role": "harness",
                 "round": 0,
-                "type": "rate_limit_backoff",
+                "type": event_type,
                 "attempt": attempt,
                 "delay_s": delay_s,
+                "reason": reason,
                 "rungs": len(RATE_LIMIT_BACKOFFS),
             }
         )

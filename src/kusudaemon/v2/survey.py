@@ -600,6 +600,54 @@ def _extract_constraints_for_range(goal: str, start: int, end: int, noun: str) -
     return matched
 
 
+def extract_spine_unit_noun(goal: str, delim: str = "") -> str:
+    r"""PLAN-REVIEW-READ-LOOP.md §O4: extract the spine unit noun.
+    1. Read words between delimiter and first ordinal from delimiter exemplar (e.g. '#*# Menu Week 1').
+    2. Try 'N <nouns>' or 'one for each <noun>'.
+    3. Use OUTPUT_UNIT_NOUNS tuple, but only followed by an ordinal (r'\b<noun>\s+\d').
+    """
+    effective_delim = delim
+    if not effective_delim:
+        from ..tokens import extract_unit_delimiter
+        effective_delim = extract_unit_delimiter(goal)
+
+    candidates = [effective_delim] if effective_delim else []
+    candidates.extend(["#*#", "===+", "---+", "#{1,6}"])
+    for d in candidates:
+        if not d:
+            continue
+        pat = rf"(?:{re.escape(d)}|{d})\s*([A-Za-z][A-Za-z\s_-]*?)\s+\d+\b"
+        m = re.search(pat, goal)
+        if m:
+            cand = m.group(1).strip()
+            if cand and not re.search(r"^(?:example|input|output|test)$", cand, re.IGNORECASE):
+                return " ".join(cand.split())
+
+    m_n = re.search(r"\b(?:one\s+for\s+each|each|every)\s+([A-Za-z][A-Za-z\s_-]*?)\b", goal, re.IGNORECASE)
+    if m_n:
+        cand = m_n.group(1).strip()
+        for u in OUTPUT_UNIT_NOUNS:
+            if re.search(rf"\b{u}\b", cand, re.IGNORECASE):
+                return " ".join(cand.split())
+
+    m_count = re.search(r"\b\d+\s+([A-Za-z][A-Za-z\s_-]*?)(?:s|\b)", goal, re.IGNORECASE)
+    if m_count:
+        cand = m_count.group(1).strip()
+        for u in OUTPUT_UNIT_NOUNS:
+            if re.search(rf"\b{u}\b", cand, re.IGNORECASE):
+                return " ".join(cand.split())
+
+    for cand in OUTPUT_UNIT_NOUNS:
+        if re.search(rf"\b{cand}s?\s+\d+\b", goal, re.IGNORECASE):
+            return cand
+
+    for cand in OUTPUT_UNIT_NOUNS:
+        if re.search(rf"\b{cand}s?\b", goal, re.IGNORECASE):
+            return cand
+
+    return "unit"
+
+
 def synthesize_output_spine(
     goal: str,
     *,
@@ -615,12 +663,7 @@ def synthesize_output_spine(
         return [], []
 
     delim = extract_unit_delimiter(goal)
-
-    noun = "unit"
-    for cand in OUTPUT_UNIT_NOUNS:
-        if re.search(rf"\b{cand}s?\b", goal, re.IGNORECASE):
-            noun = cand
-            break
+    noun = extract_spine_unit_noun(goal, delim)
 
     m_words = re.search(r"(?:at least|around|about|approximately|minimum of)?\s*(\d+)\s*words\s*(?:per|for each|each|in each)\b", goal, re.IGNORECASE)
     if not m_words:
@@ -645,7 +688,7 @@ def synthesize_output_spine(
         end_idx = min(n, (i + 1) * units_per_leaf)
         count_in_leaf = end_idx - start_idx + 1
 
-        nouns_label = pluralize_unit_noun(noun).capitalize()
+        nouns_label = " ".join(w.capitalize() for w in pluralize_unit_noun(noun).split())
         label = f"{nouns_label} {start_idx} to {end_idx}"
         unit_id = f"unit-{i + 1:02d}"
 

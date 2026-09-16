@@ -260,7 +260,12 @@ class LeafUnitsExpectedTest(unittest.TestCase):
         self.assertEqual(pluralize_unit_noun("floor"), "floors")
 
     def test_spine_label_is_spelled_entries(self) -> None:
-        chunks, units = synthesize_output_spine(_WEEK_GOAL)
+        goal = (
+            "Generate a diary for Sophia, 52 entries in total.\n"
+            "Each entry should be at least 200 words.\n"
+            "Use '#*#' to separate each entry (e.g. #*# Entry 1: ...).\n"
+        )
+        chunks, units = synthesize_output_spine(goal)
         self.assertTrue(all(u.label.startswith("Entries ") for u in units))
         self.assertNotIn("Entrys", chunks[0].text)
 

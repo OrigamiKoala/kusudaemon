@@ -147,10 +147,48 @@ def _gate_max_tokens(gate: str, arg: str, text: str) -> GateResult:
         limit = int(arg)
     except ValueError:
         return GateResult(gate=gate, passed=False, detail=f"malformed limit {arg!r}")
-    tokens = estimate_tokens(text)
+    from ..tokens import count_tokens_with_backend
+
+    tokens, backend = count_tokens_with_backend(text)
     passed = tokens <= limit
-    detail = "" if passed else f"~{tokens} tokens, limit {limit}"
+    detail = f"tokenizer={backend}" if passed else f"~{tokens} tokens, limit {limit} (tokenizer={backend})"
     return GateResult(gate=gate, passed=passed, detail=detail)
+
+
+def _gate_units_range(gate: str, arg: str, text: str) -> GateResult:
+    """PLAN-REVIEW-READ-LOOP.md §O6: units_range:<lo>-<hi>@<delim>.
+    Fails on any ordinal outside the leaf's range or any duplicate ordinal."""
+    delim = ""
+    if "@" in arg:
+        range_part, _, delim = arg.partition("@")
+    else:
+        range_part = arg
+    if "-" not in range_part:
+        return GateResult(gate=gate, passed=False, detail=f"malformed range {arg!r}")
+    lo_str, _, hi_str = range_part.partition("-")
+    try:
+        lo = int(lo_str)
+        hi = int(hi_str)
+    except ValueError:
+        return GateResult(gate=gate, passed=False, detail=f"malformed range {arg!r}")
+
+    matches = unit_matches(text, delim)
+    seen_ordinals: set[int] = set()
+    for match in matches:
+        line_end = text.find("\n", match.start())
+        line = text[match.start(): line_end if line_end != -1 else len(text)]
+        ord_match = _UNIT_ORDINAL_RE.search(line)
+        if ord_match:
+            try:
+                val = int(ord_match.group(0))
+            except ValueError:
+                continue
+            if val in seen_ordinals:
+                return GateResult(gate=gate, passed=False, detail=f"duplicate unit ordinal {val}")
+            seen_ordinals.add(val)
+            if val < lo or val > hi:
+                return GateResult(gate=gate, passed=False, detail=f"unit ordinal {val} outside expected range {lo}-{hi}")
+    return GateResult(gate=gate, passed=True)
 
 
 def _gate_contains(gate: str, arg: str, text: str) -> GateResult:
@@ -560,6 +598,7 @@ _HANDLERS = {
     "max_tokens": _gate_max_tokens,
     "contains": _gate_contains,
     "units_min": _gate_units_min,
+    "units_range": _gate_units_range,
     # §C1 (warn severity first): node-type template gates — registered
     # here so they evaluate when present on `node.warn_gates`, but a
     # failure never blocks a node (``all_passed`` looks at `gates` only;

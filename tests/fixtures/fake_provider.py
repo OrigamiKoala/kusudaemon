@@ -38,6 +38,10 @@ class FakeProvider:
                 f"FakeProvider ran out of canned responses (call #{len(self.calls)})"
             )
         response = self._responses.pop(0)
+        if isinstance(response, dict) and "items" in response and isinstance(response["items"], list):
+            for it in response["items"]:
+                if isinstance(it, dict) and "defect" not in it and it.get("pass"):
+                    it["defect"] = "none"
         errors = validate(response, schema)
         assert not errors, f"canned response {response!r} does not match schema: {errors}"
         return response

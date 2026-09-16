@@ -73,16 +73,16 @@ def _get_tiktoken_encoding() -> Any | None:
     return _TIKTOKEN_ENCODING
 
 
-def count_tokens(text: str, model: str | None = None) -> int:
-    """PLAN-TOKEN-ACCOUNTING.md §A2: count tokens using exact HF tokenizer -> tiktoken -> len//4."""
+def count_tokens_with_backend(text: str, model: str | None = None) -> tuple[int, str]:
+    """PLAN-REVIEW-READ-LOOP.md §O10: return (count, backend_name). Backend is 'hf', 'tiktoken', or 'len//4'."""
     if not text:
-        return 0
+        return 0, "empty"
 
     # 1. Exact HF tokenizer
     hf_tok = _get_hf_tokenizer(model)
     if hf_tok is not None:
         try:
-            return len(hf_tok.encode(text).ids)
+            return len(hf_tok.encode(text).ids), "hf"
         except Exception:
             pass
 
@@ -90,12 +90,18 @@ def count_tokens(text: str, model: str | None = None) -> int:
     enc = _get_tiktoken_encoding()
     if enc is not None:
         try:
-            return len(enc.encode(text, disallowed_special=()))
+            return len(enc.encode(text, disallowed_special=())), "tiktoken"
         except Exception:
             pass
 
     # 3. chars/4 fallback (stdlib only, ~22% error)
-    return max(1, len(text) // 4)
+    return max(1, len(text) // 4), "len//4"
+
+
+def count_tokens(text: str, model: str | None = None) -> int:
+    """PLAN-TOKEN-ACCOUNTING.md §A2: count tokens using exact HF tokenizer -> tiktoken -> len//4."""
+    count, _ = count_tokens_with_backend(text, model)
+    return count
 
 
 def count_file_tokens(path: str | Path, model: str | None = None) -> int:

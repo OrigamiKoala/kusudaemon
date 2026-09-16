@@ -43,7 +43,7 @@ _RANGE_NOUNS = sorted(
     reverse=True,
 )
 UNIT_RANGE_RE = _re.compile(
-    r"\b(?:" + "|".join(_RANGE_NOUNS) + r")s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
+    r"\b(?:[A-Za-z]+\s+)*(?:" + "|".join(_RANGE_NOUNS) + r")s?\s+(\d+)\s*(?:-|–|to)\s*(\d+)\b",
     _re.IGNORECASE,
 )
 
@@ -567,6 +567,16 @@ def build_tree(
                 gates.append(units_gate)
             else:
                 warn_gates.append(units_gate)
+
+            m_range = UNIT_RANGE_RE.search(candidate.brief or "")
+            if m_range:
+                r_lo, r_hi = int(m_range.group(1)), int(m_range.group(2))
+                if r_hi >= r_lo:
+                    range_gate = f"units_range:{r_lo}-{r_hi}@{delimiter}" if delimiter else f"units_range:{r_lo}-{r_hi}"
+                    if units_source == "declared":
+                        gates.append(range_gate)
+                    else:
+                        warn_gates.append(range_gate)
 
         node = TaskNode(
             id=node_id,

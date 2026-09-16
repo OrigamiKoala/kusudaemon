@@ -17,6 +17,7 @@ _TRANSPORT_PATTERNS = (
     "connection", "billing", "quota", "auth", "unauthorized",
     "forbidden", "api key", "rate limit", "overloaded",
     "kusudaemon_role_timeout", "role timeout", "remoteprotocolerror",
+    "provider unavailable",
 )
 
 _BUDGET_PATTERNS = (
@@ -40,7 +41,10 @@ def classify_halt(halt_reason: str | None) -> HaltCategory:
         return "ok"
     if "no detail" in low:
         return "unknown"
-    if any(p in low for p in _BUDGET_PATTERNS):
+    if any(p in low for p in _BUDGET_PATTERNS) or (
+        re.search(r"\btimeout after \d+s", low)
+        and not any(tp in low for tp in ("socket", "read", "http", "cell"))
+    ):
         return "budget"
     if _STATUS_CODE_RE.search(low) or any(p in low for p in _TRANSPORT_PATTERNS):
         return "transport"

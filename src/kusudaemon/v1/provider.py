@@ -45,18 +45,30 @@ _CALL_SCOPE = threading.local()
 
 
 @contextmanager
-def call_scope(*, role: str | None = None, max_tokens: int | None = None) -> Iterator[None]:
-    """Within the block, calls on this thread record ``role`` and default to ``max_tokens``."""
-    prev = (getattr(_CALL_SCOPE, "role", None), getattr(_CALL_SCOPE, "max_tokens", None))
-    _CALL_SCOPE.role, _CALL_SCOPE.max_tokens = role, max_tokens
+def call_scope(
+    *, role: str | None = None, max_tokens: int | None = None, node: str | None = None
+) -> Iterator[None]:
+    """Within the block, calls on this thread record ``role``, ``node``, and default to ``max_tokens``."""
+    prev = (
+        getattr(_CALL_SCOPE, "role", None),
+        getattr(_CALL_SCOPE, "max_tokens", None),
+        getattr(_CALL_SCOPE, "node", None),
+    )
+    _CALL_SCOPE.role = role if role is not None else prev[0]
+    _CALL_SCOPE.max_tokens = max_tokens if max_tokens is not None else prev[1]
+    _CALL_SCOPE.node = node if node is not None else prev[2]
     try:
         yield
     finally:
-        _CALL_SCOPE.role, _CALL_SCOPE.max_tokens = prev
+        _CALL_SCOPE.role, _CALL_SCOPE.max_tokens, _CALL_SCOPE.node = prev
 
 
 def _scoped_role(default: str | None) -> str | None:
     return getattr(_CALL_SCOPE, "role", None) or default
+
+
+def _scoped_node(default: str | None) -> str | None:
+    return getattr(_CALL_SCOPE, "node", None) or default
 
 
 def _scoped_max_tokens() -> int | None:
@@ -90,6 +102,11 @@ RATE_LIMIT_BACKOFFS = (60.0, 300.0, 1800.0, 3600.0, 10800.0, 18000.0)
 
 
 class ProviderError(RuntimeError):
+    pass
+
+
+class ProviderDeadlineError(ProviderError):
+    """SSE stream wall-clock deadline exceeded (PLAN-REVIEW-READ-LOOP.md §R1)."""
     pass
 
 
@@ -150,7 +167,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             dict[str, Any],
         ]
         | None = None,
-        timeout: float = 300.0,
+        timeout: float = 120.0,
         max_http_retries: int = _DEFAULT_HTTP_RETRIES,
         base_retry_delay: float = 1.0,
         concurrency: int = _DEFAULT_CONCURRENCY,
@@ -237,7 +254,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             self.cost_ledger.record(
                 role=_scoped_role(self.role),
                 phase=self.phase,
-                node=self.node_id,
+                node=_scoped_node(self.node_id),
                 model=self.model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
@@ -375,14 +392,46 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # every later complete_json call skips the field outright instead of
         # re-learning the rejection on its first request.
         use_format = self._response_format_ok is not False
-        for _attempt in range(retries + 1):
+        current_role = _scoped_role(self.role)
+        is_verdict_role = current_role in ("reviewer", "triage")
+
+        validation_attempts = 0
+        cap_escalations = 0
+        empty_retries = 0
+        verdict_deadline_retried = False
+
+        while validation_attempts <= retries:
             curr_payload = make_payload(with_format=use_format)
+            min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
+            current_cap = cap["max_tokens"] or _default_max_tokens(schema)
+            deadline_s = max(300.0, current_cap / min_tps)
             try:
                 raw = self._call(
                     curr_payload,
                     stream=streaming,
                     on_reasoning=on_reasoning,
+                    deadline_s=deadline_s,
                 )
+            except ProviderDeadlineError as pde:
+                if is_verdict_role and not verdict_deadline_retried:
+                    verdict_deadline_retried = True
+                    last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
+                    base_messages = [
+                        *base_messages,
+                        {
+                            "role": "user",
+                            "content": "Stop deliberating. Emit the JSON verdict now.",
+                        },
+                    ]
+                    continue
+                elif not is_verdict_role and cap_escalations < 4:
+                    previous = cap["max_tokens"] or _default_max_tokens(schema)
+                    cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
+                    if cap["max_tokens"] != previous:
+                        cap_escalations += 1
+                        last_error = f"response hit deadline ({previous} tokens); retrying at {cap['max_tokens']}"
+                        continue
+                raise
             except ProviderHTTPError as exc:
                 # §12's fallback must be reachable when the *endpoint* (not
                 # the model) rejects structured output: some OpenAI-compatible
@@ -395,11 +444,33 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 self._response_format_ok = False
                 use_format = False
                 curr_payload = make_payload(with_format=False)
-                raw = self._call(
-                    curr_payload,
-                    stream=streaming,
-                    on_reasoning=on_reasoning,
-                )
+                try:
+                    raw = self._call(
+                        curr_payload,
+                        stream=streaming,
+                        on_reasoning=on_reasoning,
+                        deadline_s=deadline_s,
+                    )
+                except ProviderDeadlineError as pde:
+                    if is_verdict_role and not verdict_deadline_retried:
+                        verdict_deadline_retried = True
+                        last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
+                        base_messages = [
+                            *base_messages,
+                            {
+                                "role": "user",
+                                "content": "Stop deliberating. Emit the JSON verdict now.",
+                            },
+                        ]
+                        continue
+                    elif not is_verdict_role and cap_escalations < 4:
+                        previous = cap["max_tokens"] or _default_max_tokens(schema)
+                        cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
+                        if cap["max_tokens"] != previous:
+                            cap_escalations += 1
+                            last_error = f"response hit deadline ({previous} tokens); retrying at {cap['max_tokens']}"
+                            continue
+                    raise
             message = _first_choice_message(raw)
             if not streaming and on_reasoning is not None:
                 reasoning = message.get("reasoning_content")
@@ -407,44 +478,55 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     on_reasoning(reasoning)
             content = message.get("content") or ""
             self._record_usage(curr_payload, raw, content)
+
+            # PLAN-REVIEW-READ-LOOP.md §R1.6: Treat completion with completion_tokens <= 1 and empty content as transient transport failure
+            usage = raw.get("usage") if isinstance(raw, dict) else {}
+            comp_tokens = int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0
+            if comp_tokens <= 1 and not content.strip() and empty_retries < 3:
+                empty_retries += 1
+                last_error = f"transient empty completion ({comp_tokens} tokens)"
+                continue
+
             # §P3: before blaming the JSON, ask whether there was room for any.
             truncated = _hit_token_ceiling(raw, cap["max_tokens"])
             parsed, parse_error = extract_last_json_object(content, schema=schema)
             if parsed is None:
                 parsed, parse_error = _parse_json_object(content)
-            # §R1: the escalation used to be guarded by ``parsed is None and
-            # truncated``, so it only covered a response too short to hold any
-            # JSON at all. A response that stopped at the ceiling *mid-object*
-            # is just as truncated, and what comes back from it is worse than
-            # nothing: the scanner recovers some complete inner fragment and
-            # ``_repair_common_schema_omissions`` grows it into a schema-valid
-            # object made of defaults, which then returns as though the model
-            # had answered. finish_reason "length" is the endpoint telling us
-            # the content is incomplete -- believe it, whatever we managed to
-            # parse out of it. (longgen_137-floor_armC_seed3: one 4096-token
-            # classify call, no retry, an all-defaults estimate, T2, no unit
-            # gate, 5 of 100 floors scored 1.0.)
+
+            # PLAN-REVIEW-READ-LOOP.md §R1.4: verdict roles retry at same cap with emit prompt; planner/classify double cap
             if truncated:
-                previous = cap["max_tokens"] or _default_max_tokens(schema)
-                cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
-                if cap["max_tokens"] != previous:
+                if is_verdict_role:
+                    if not verdict_deadline_retried:
+                        verdict_deadline_retried = True
+                        last_error = "response truncated at ceiling; retrying with emit instruction"
+                        base_messages = [
+                            *base_messages,
+                            {
+                                "role": "user",
+                                "content": "Stop deliberating. Emit the JSON verdict now.",
+                            },
+                        ]
+                        continue
+                    last_error = f"response hit output ceiling ({cap['max_tokens']} tokens, the maximum) before JSON was complete"
+                    if parsed is None:
+                        break
+                else:
+                    previous = cap["max_tokens"] or _default_max_tokens(schema)
+                    cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
+                    if cap["max_tokens"] != previous:
+                        cap_escalations += 1
+                        last_error = (
+                            f"response hit the output ceiling ({previous} tokens) before the "
+                            f"JSON was complete; retrying at {cap['max_tokens']}"
+                        )
+                        continue
                     last_error = (
-                        f"response hit the output ceiling ({previous} tokens) before the "
-                        f"JSON was complete; retrying at {cap['max_tokens']}"
+                        f"response hit the output ceiling ({previous} tokens, the maximum) "
+                        "before the JSON was complete"
                     )
-                    # Retry the ORIGINAL messages at the larger cap. Appending a
-                    # correction turn here would grow the prompt (1312 -> 5448 ->
-                    # 9585 in the seed1 halt) while re-asking the same question.
-                    continue
-                # Cap is already at the maximum. A validated parse is still
-                # better than raising, but it is the last resort, not the
-                # happy path -- fall through to the normal validation below.
-                last_error = (
-                    f"response hit the output ceiling ({previous} tokens, the maximum) "
-                    "before the JSON was complete"
-                )
-                if parsed is None:
-                    break
+                    if parsed is None:
+                        break
+
             if parsed is not None:
                 parsed = _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema)
                 schema_errors = validate(parsed, schema)
@@ -457,6 +539,10 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 last_error = "; ".join(schema_errors)
             else:
                 last_error = parse_error
+
+            validation_attempts += 1
+            if validation_attempts > retries:
+                break
 
             base_messages = [
                 *base_messages,
@@ -476,6 +562,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         *,
         stream: bool = False,
         on_reasoning: Callable[[str], None] | None = None,
+        deadline_s: float | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json", "User-Agent": "kusudaemon/1.0 (Python)"}
         if self.api_key:
@@ -499,10 +586,27 @@ class OpenAICompatibleProvider(RoleProviderBase):
             try:
                 with self._throttle:
                     if stream:
+                        import inspect
+
+                        sig = inspect.signature(self._stream_transport_impl)
+                        if "deadline_s" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        ):
+                            return self._stream_transport_impl(
+                                f"{self.base_url}/chat/completions",
+                                payload,
+                                headers,
+                                on_reasoning,
+                                deadline_s=deadline_s,
+                            )
                         return self._stream_transport_impl(
                             f"{self.base_url}/chat/completions", payload, headers, on_reasoning
                         )
                     return self._transport(f"{self.base_url}/chat/completions", payload, headers)
+            except ProviderDeadlineError:
+                # PLAN-REVIEW-READ-LOOP.md §R1.3: ProviderDeadlineError is not retried by transport branch
+                raise
             except ProviderHTTPError as exc:
                 if exc.status == 400 or (exc.status < 500 and exc.status != 429):
                     raise
@@ -544,7 +648,10 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     if exc.retry_after is not None:
                         delay = max(delay, min(exc.retry_after, RATE_LIMIT_BACKOFFS[-1]))
                     if self._on_backoff is not None:
-                        self._on_backoff(attempt + 1, delay)
+                        try:
+                            self._on_backoff(attempt + 1, delay, reason="rate_limit")
+                        except TypeError:
+                            self._on_backoff(attempt + 1, delay)
 
                     # §E16: sliced interruptible sleep
                     total_sleep = delay * random.uniform(0.8, 1.2)
@@ -589,7 +696,10 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     self._base_retry_delay * (2 ** transport_attempt) * random.uniform(0.8, 1.2)
                 )
                 if self._on_backoff is not None:
-                    self._on_backoff(transport_attempt + 1, delay)
+                    try:
+                        self._on_backoff(transport_attempt + 1, delay, reason="transport")
+                    except TypeError:
+                        self._on_backoff(transport_attempt + 1, delay)
                 # §E16: sliced interruptible sleep, so a halt signal is not
                 # held for the length of the backoff.
                 if self._should_abort is not None:
@@ -627,7 +737,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             raise ProviderHTTPError(
                 exc.code,
                 f"HTTP {exc.code} from provider"
-                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={_scoped_node(self.node_id)}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
                 retry_after=retry_after,
             ) from exc
@@ -636,7 +746,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             reason = getattr(exc, "reason", exc)
             raise ProviderError(
                 f"provider request failed"
-                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={_scoped_node(self.node_id)}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
             ) from exc
 
@@ -647,6 +757,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         payload: dict[str, Any],
         headers: dict[str, str],
         on_reasoning: Callable[[str], None] | None,
+        deadline_s: float | None = None,
     ) -> dict[str, Any]:
         """B3-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the streaming twin of
         ``_http_transport``. Consumes the SSE delta stream, accumulates
@@ -661,10 +772,17 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # PLAN-SWEEP-REPAIR.md §F2: same phase/role/elapsed context as
         # _http_transport for the streaming twin.
         t0 = time.time()
+        effective_deadline = deadline_s
+        if effective_deadline is None:
+            min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
+            cap_tok = payload.get("max_tokens") or 4096
+            effective_deadline = max(300.0, cap_tok / min_tps)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 lines = (line.decode("utf-8", errors="replace").rstrip("\n") for line in response)
-                return _consume_sse_lines(lines, on_reasoning)
+                return _consume_sse_lines(lines, on_reasoning, deadline_s=effective_deadline, t0=t0)
+        except ProviderDeadlineError:
+            raise
         except urllib.error.HTTPError as exc:
             elapsed = time.time() - t0
             detail = exc.read().decode("utf-8", errors="replace")
@@ -672,7 +790,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
             raise ProviderHTTPError(
                 exc.code,
                 f"HTTP {exc.code} from provider"
-                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={_scoped_node(self.node_id)}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {detail[:500]}",
                 retry_after=retry_after,
             ) from exc
@@ -681,13 +799,16 @@ class OpenAICompatibleProvider(RoleProviderBase):
             reason = getattr(exc, "reason", exc)
             raise ProviderError(
                 f"provider request failed"
-                f" [phase={self.phase} role={_scoped_role(self.role)} node={self.node_id}"
+                f" [phase={self.phase} role={_scoped_role(self.role)} node={_scoped_node(self.node_id)}"
                 f" elapsed={elapsed:.1f}s timeout={self.timeout}s]: {reason}"
             ) from exc
 
 
 def _consume_sse_lines(
-    lines: Iterable[str], on_reasoning: Callable[[str], None] | None
+    lines: Iterable[str],
+    on_reasoning: Callable[[str], None] | None,
+    deadline_s: float | None = None,
+    t0: float | None = None,
 ) -> dict[str, Any]:
     """B3-1: parse one SSE response body into the synthetic
     ``{choices: [{message: ...}]}`` shape ``_first_choice_message`` reads.
@@ -706,7 +827,12 @@ def _consume_sse_lines(
     raw_parts: list[str] = []
     usage_parts: dict[str, Any] = {}
     saw_sse = False
+    start_time = t0 if t0 is not None else time.time()
     for line in lines:
+        if deadline_s is not None and (time.time() - start_time) > deadline_s:
+            raise ProviderDeadlineError(
+                f"SSE stream wall-clock deadline exceeded ({time.time() - start_time:.1f}s > {deadline_s:.1f}s)"
+            )
         raw_parts.append(line)
         if not line.startswith("data:"):
             if line == "" and event_lines:

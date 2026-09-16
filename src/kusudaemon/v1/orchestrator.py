@@ -284,7 +284,11 @@ def orchestrator_max_tokens() -> int:
 def orchestrator_deadline_s() -> float:
     """§L.2: how long a free slot may wait on one decision before the harness
     dispatches in document order instead. ``<= 0`` disables the deadline."""
-    return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 90.0)
+    if _os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
+        return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 90.0)
+    cap = orchestrator_max_tokens()
+    min_tps = float(_os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
+    return max(90.0, cap / min_tps)
 
 
 def orchestrator_max_listed() -> int:

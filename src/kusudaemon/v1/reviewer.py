@@ -22,13 +22,16 @@ reviewer recursion is explicitly rejected").
 from __future__ import annotations
 
 import copy
+import json
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from ..roles.protocol import RoleProvider
 from .gates import estimate_tokens
-from .provider import ProviderError
+from .provider import ProviderDeadlineError, ProviderError
 from .tree import TaskNode
 
 # §11.10.13: the reviewer's input side gets the §8 "small outputs
@@ -69,20 +72,45 @@ VERDICT_SCHEMA: dict[str, Any] = {
             "maxItems": 12,
             "items": {
                 "type": "object",
-                "required": ["id", "pass"],
+                "required": ["id", "pass", "defect"],
                 "additionalProperties": False,
                 "properties": {
                     "id": {"type": "string"},
                     "pass": {"type": "boolean"},
                     "defect": {"type": "string", "maxLength": DEFECT_MAXLENGTH},
+                    "unit": {"type": ["integer", "null"]},
                     "class": {"type": "string", "enum": ["patchable", "regenerate"]},
-                    "node_ids": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
         "verdict": {"type": "string", "enum": ["pass", "fail"]},
     },
 }
+
+
+def make_verdict_schema(
+    effective_judgment: list[str] | None = None,
+    defect_maxlength: int = DEFECT_MAXLENGTH,
+) -> dict[str, Any]:
+    """PLAN-REVIEW-READ-LOOP.md §R4.1: verdict schema with effective rubric ids and defect length."""
+    schema = copy.deepcopy(VERDICT_SCHEMA)
+    item_props = schema["properties"]["items"]["items"]["properties"]
+    item_props["defect"]["maxLength"] = defect_maxlength
+    if effective_judgment:
+        item_props["id"] = {"type": "string", "enum": list(effective_judgment)}
+    return schema
+
+
+def is_malformed_defect(item_id: str, defect: Any) -> bool:
+    """PLAN-REVIEW-READ-LOOP.md §R4.2: detect empty, none, or id-repeating defect text."""
+    if not isinstance(defect, str):
+        return True
+    d = defect.strip()
+    if not d or d.lower() in ("none", "n/a", "no defect", "null", "false", "undefined"):
+        return True
+    if d == item_id or d.strip("'\"") == item_id or d.lower() == item_id.lower():
+        return True
+    return False
 
 # Provenance is stated in the system prompt and again here, adjacent to the
 # thing being judged. Exported so tests assert against the constant rather
@@ -410,6 +438,45 @@ def _group_sections(sections: list[str], max_groups: int) -> list[str]:
 import concurrent.futures
 
 
+def generate_document_outline(text: str, delim: str = "") -> str:
+    """PLAN-REVIEW-READ-LOOP.md §R3 / §R5: build an outline of units or headings."""
+    from .gates import unit_matches
+
+    if delim:
+        matches = list(unit_matches(text, delim))
+        if matches:
+            lines = []
+            for i, m in enumerate(matches):
+                start = m.start()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                chunk = text[start:end]
+                words = len(chunk.split())
+                first_line = chunk.strip().splitlines()[0][:80] if chunk.strip() else ""
+                ord_val = m.group("ord") if "ord" in m.groupdict() else str(i + 1)
+                flags = []
+                if words < 20:
+                    flags.append(f"short({words}w)")
+                flag_str = f" [{', '.join(flags)}]" if flags else ""
+                lines.append(f"unit {ord_val} | {first_line} | {words} words{flag_str}")
+            return "\n".join(lines)
+
+    # Fallback to markdown headings
+    headings = list(_MD_HEADING_RE.finditer(text))
+    if headings:
+        lines = []
+        for i, m in enumerate(headings):
+            start = m.start()
+            end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+            chunk = text[start:end]
+            words = len(chunk.split())
+            heading_line = m.group(0).strip()[:80]
+            lines.append(f"{heading_line} | {words} words")
+        return "\n".join(lines)
+
+    words = len(text.split())
+    return f"(no unit delimiters or headings detected; total {words} words)"
+
+
 def _call_reviewer(
     rubric_lines: str,
     artifact_text: str,
@@ -420,6 +487,7 @@ def _call_reviewer(
     brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
+    effective_judgment: list[str] | None = None,
 ) -> dict[str, Any]:
     content_parts = [f"Rubric:\n{rubric_lines}"]
     if contract_text:
@@ -436,30 +504,78 @@ def _call_reviewer(
             "content": "\n\n".join(content_parts),
         },
     ]
+    schema = make_verdict_schema(effective_judgment)
     try:
-        return provider.complete_json(
+        payload = provider.complete_json(
             messages,
-            VERDICT_SCHEMA,
+            schema,
             temperature=temperature,
             on_reasoning=on_reasoning,
+            streaming=True,
         )
     except ProviderError as exc:
         if "maxLength" not in str(exc):
             raise
-        relaxed = copy.deepcopy(VERDICT_SCHEMA)
-        defect = relaxed["properties"]["items"]["items"]["properties"]["defect"]
-        defect["maxLength"] = RELAXED_DEFECT_MAXLENGTH
-        return provider.complete_json(
+        relaxed = make_verdict_schema(effective_judgment, defect_maxlength=RELAXED_DEFECT_MAXLENGTH)
+        payload = provider.complete_json(
             messages,
             relaxed,
             temperature=temperature,
             on_reasoning=on_reasoning,
+            streaming=True,
         )
+
+    # PLAN-REVIEW-READ-LOOP.md §R4.2: Malformed defect text handling
+    if isinstance(payload, dict) and payload.get("verdict") == "fail":
+        malformed = [
+            it for it in payload.get("items", [])
+            if isinstance(it, dict) and not it.get("pass", True) and is_malformed_defect(str(it.get("id", "")), it.get("defect"))
+        ]
+        if malformed:
+            target_id = str(malformed[0].get("id", ""))
+            reask_prompt = (
+                f"The rubric item '{target_id}' failed but the defect description is insufficient. "
+                "State the specific defect: what is wrong and where (e.g. section, unit, or line)."
+            )
+            reask_messages = list(messages) + [
+                {"role": "assistant", "content": json.dumps(payload)},
+                {"role": "user", "content": reask_prompt},
+            ]
+            try:
+                second = provider.complete_json(
+                    reask_messages,
+                    schema,
+                    temperature=temperature,
+                    on_reasoning=on_reasoning,
+                    streaming=True,
+                )
+            except Exception:
+                second = None
+
+            if (
+                not isinstance(second, dict)
+                or second.get("verdict") != "fail"
+                or any(
+                    is_malformed_defect(str(it.get("id", "")), it.get("defect"))
+                    for it in second.get("items", [])
+                    if isinstance(it, dict) and not it.get("pass", True)
+                )
+            ):
+                return {
+                    "verdict": "unavailable",
+                    "items": [],
+                    "skip_reason": "malformed_defect",
+                }
+            payload = second
+
+    return payload
 
 
 def _call_triage(
+    outline: str,
+    gate_results_str: str,
+    word_count: int,
     rubric_lines: str,
-    artifact_text: str,
     provider: RoleProvider,
     *,
     contract_text: str = "",
@@ -468,14 +584,22 @@ def _call_triage(
     on_reasoning: Callable[[str], None] | None = None,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
-    content_parts = [f"Rubric:\n{rubric_lines}"]
+    content_parts = [
+        f"Document Outline:\n{outline}",
+        f"Total Words: {word_count}",
+    ]
+    if gate_results_str:
+        content_parts.append(f"Gate Results:\n{gate_results_str}")
+    content_parts.append(f"Rubric:\n{rubric_lines}")
     if contract_text:
         content_parts.append(f"Contract:\n{contract_text}")
     if declared_inputs:
         content_parts.append(f"Declared Inputs:\n{declared_inputs}")
     if brief:
         content_parts.append(f"Brief:\n{brief}")
-    content_parts.append(f"{ARTIFACT_LABEL}:\n{artifact_text}")
+    content_parts.append(
+        "Given the document outline and gate checks, are there structural red flags that warrant deep review?"
+    )
     messages = [
         {"role": "system", "content": _TRIAGE_SYSTEM_PROMPT},
         {
@@ -488,6 +612,7 @@ def _call_triage(
         TRIAGE_SCHEMA,
         temperature=temperature,
         on_reasoning=on_reasoning,
+        streaming=True,
     )
 
 
@@ -530,6 +655,8 @@ def _review_node_judged(
     judgment_classification: dict[str, str] | None = None,
     parallel: bool = True,
     unit_delimiter: str | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    run_dir: str | Path | None = None,
 ) -> ReviewVerdict:
     """PLAN-REVIEW-LATENCY.md: Grounded, delta-cached, parallel review."""
     brief_text = brief
@@ -578,11 +705,23 @@ def _review_node_judged(
     )
 
     # T1-2: Stage 1 Triage call if triage_provider is supplied
-    if triage_provider is not None:
+    # T1-2: Stage 1 Triage call if triage_provider is supplied and not disabled (§R5)
+    effective_delim = unit_delimiter if unit_delimiter is not None else _unit_delimiter_from_gates(node)
+    if triage_provider is not None and os.getenv("KUSUDAEMON_TRIAGE", "1") != "0":
+        outline = generate_document_outline(artifact_text, effective_delim)
+        word_count = len(artifact_text.split())
+        gate_summary = ""
+        if gate_results is not None:
+            gate_summary = "\n".join(
+                f"- {k}: {'PASS' if (isinstance(v, dict) and v.get('passed', False)) else 'FAIL'}"
+                for k, v in gate_results.items()
+            )
         try:
             triage_res = _call_triage(
+                outline,
+                gate_summary,
+                word_count,
                 rubric_lines,
-                artifact_text,
                 triage_provider,
                 contract_text=contract_text,
                 declared_inputs=declared_inputs,
@@ -593,12 +732,53 @@ def _review_node_judged(
             if not triage_res.get("suspect", True):
                 return ReviewVerdict(
                     node_id=node.id,
-                    items=[{"id": j, "pass": True} for j in effective_judgment],
+                    items=[{"id": j, "pass": True, "defect": "none"} for j in effective_judgment],
                     verdict="pass",
                     truncated=False,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"triage_failed: {exc}; proceeding to full review", UserWarning, stacklevel=2)
+            if on_event is not None:
+                try:
+                    on_event(
+                        {
+                            "node_id": node.id,
+                            "role": "harness",
+                            "round": 0,
+                            "type": "triage_failed",
+                            "detail": f"{exc}; proceeding to full review",
+                        }
+                    )
+                except Exception:
+                    pass
+
+    # PLAN-REVIEW-READ-LOOP.md §R3: Goal-Directed Read Loop for large documents
+    review_mode = os.getenv("KUSUDAEMON_REVIEW_MODE", "").lower()
+    readloop_min = int(os.getenv("KUSUDAEMON_REVIEW_READLOOP_MIN", "8000"))
+    token_est = estimate_tokens(artifact_text)
+    is_fake_canned = hasattr(provider, "_responses")
+    use_readloop = (review_mode == "readloop") or (
+        review_mode not in ("oneshot", "fanout") and token_est > readloop_min and not is_fake_canned
+    )
+    if use_readloop:
+        from .review_loop import run_review_read_loop
+
+        return run_review_read_loop(
+            node,
+            artifact_text,
+            provider,
+            effective_judgment=effective_judgment,
+            rubric_lines=rubric_lines,
+            unit_delimiter=effective_delim,
+            contract_text=contract_text,
+            declared_inputs=declared_inputs,
+            brief=brief_text,
+            gate_results=gate_results,
+            on_reasoning=on_reasoning,
+            temperature=temperature,
+            run_dir=run_dir,
+        )
 
     cached_map: dict[str, dict[str, Any]] = {}
     if cached_sections:
@@ -627,7 +807,15 @@ def _review_node_judged(
             brief=brief_text,
             on_reasoning=on_reasoning,
             temperature=temperature,
+            effective_judgment=effective_judgment,
         )
+        if payload.get("verdict") == "unavailable":
+            return ReviewVerdict(
+                node_id=node.id,
+                items=[],
+                verdict="unavailable",
+                skip_reason=payload.get("skip_reason", "malformed_defect"),
+            )
         items = list(payload.get("items", []))
         verdict_str = str(payload.get("verdict", "fail"))
         return ReviewVerdict(
@@ -697,6 +885,7 @@ def _review_node_judged(
             brief=brief_text,
             on_reasoning=on_reasoning,
             temperature=temperature,
+            effective_judgment=effective_judgment,
         )
         return sec_idx, payload, sec_digest
 
@@ -782,6 +971,8 @@ def review_node(
     judgment_classification: dict[str, str] | None = None,
     parallel: bool = True,
     unit_delimiter: str | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    run_dir: str | Path | None = None,
 ) -> ReviewVerdict:
     """Per-node review (PLAN-REVIEW-LATENCY.md), with PLAN-SWEEP-REPAIR.md §F5's
     vacuous-pass rule applied to grounding judgments.
@@ -815,6 +1006,8 @@ def review_node(
         judgment_classification=judgment_classification,
         parallel=parallel,
         unit_delimiter=unit_delimiter,
+        on_event=on_event,
+        run_dir=run_dir,
     )
     vacuous = ungroundable_judgments(
         effective_judgment_for(node, judgment_classification),
