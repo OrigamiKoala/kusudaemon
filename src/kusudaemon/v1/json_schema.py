@@ -4,7 +4,7 @@ The repo takes no runtime dependency beyond ``packaging``/``tomli`` (see
 pyproject.toml), and PLAN.md §12 explicitly wants the provider layer kept to
 one small, un-abstracted module rather than growing a dependency footprint
 for it. This covers exactly the subset v1's own schemas use: ``type``,
-``enum``, ``required``, ``properties``/``additionalProperties``, ``items``,
+``enum``, ``required``, union ``type`` lists, ``properties``/``additionalProperties``, ``items``,
 ``minItems``, ``minimum``/``maximum``, ``minLength``/``maxLength``. It is
 not a general JSON Schema implementation — reach for a real library if v2+
 needs `$ref`, `oneOf`, or similar.
@@ -22,6 +22,7 @@ _TYPE_MAP: dict[str, Any] = {
     "boolean": bool,
     "array": list,
     "object": dict,
+    "null": type(None),
 }
 
 
@@ -30,6 +31,17 @@ def validate(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str
     errors: list[str] = []
 
     expected_type = schema.get("type")
+    if isinstance(expected_type, list):
+        # Union type (e.g. ``["integer", "null"]``). This used to fall through
+        # to ``_TYPE_MAP.get(<list>)`` and raise ``TypeError: unhashable type``,
+        # which crashed every read-loop turn (READ_LOOP_ACTION_SCHEMA uses
+        # unions) and turned every large-artifact review into `unavailable`.
+        if not any(not validate(instance, {"type": t}, path) for t in expected_type):
+            errors.append(
+                f"{path}: expected one of {expected_type}, got {type(instance).__name__}"
+            )
+            return errors
+        expected_type = None
     if expected_type is not None:
         if expected_type in ("integer", "number") and isinstance(instance, bool):
             # bool is a subclass of int in Python; JSON schema treats it as

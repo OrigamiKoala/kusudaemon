@@ -266,29 +266,16 @@ def _env_float(name: str, default: float) -> float:
 
 
 def orchestrator_max_tokens() -> int:
-    """§L.2 output cap. ``provider._default_max_tokens`` gives any schema with a
-    non-scalar property 4096; the legacy scalar dispatch schema got 1024.
-
-    §P3: raised 1024 -> 4096 to match that peer value. ORCHESTRATOR_SCHEMA has
-    arrays, so 1024 was never the right bucket for it, and on a reasoning model
-    the cap covers the thinking trace too: every orchestrator call in the
-    2026-09-12 000-week sweep returned exactly 1024 completion tokens and no
-    parseable decision, surfacing as "no answer within 90s" and a document-order
-    fallback in all three seeds. ``complete_json`` escalates from here if a
-    response still stops at the ceiling; the deadline
-    (KUSUDAEMON_ORCHESTRATOR_DEADLINE_S, 90s) bounds the wall clock either way.
-    """
-    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", 4096)
+    """§L.2 output cap. C2: tighten to 1024 to minimize deliberation overhead."""
+    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", 1024)
 
 
 def orchestrator_deadline_s() -> float:
     """§L.2: how long a free slot may wait on one decision before the harness
-    dispatches in document order instead. ``<= 0`` disables the deadline."""
+    dispatches in document order instead. C2: tighten to 60s."""
     if _os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
-        return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 90.0)
-    cap = orchestrator_max_tokens()
-    min_tps = float(_os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
-    return max(90.0, cap / min_tps)
+        return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 60.0)
+    return 60.0
 
 
 def orchestrator_max_listed() -> int:

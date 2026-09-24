@@ -167,12 +167,13 @@ def restore_attempt_snapshot(run_dir: str | Path, node_id: str, snap: Path) -> N
     if snap.is_dir():
         parts_d = node_parts_dir(run_dir_p, node_id)
         parts_d.mkdir(parents=True, exist_ok=True)
-        for existing in list(parts_d.glob("*.md")):
-            with contextlib.suppress(OSError):
-                existing.unlink()
+        # A2: Union, don't overwrite. For each unit file, keep non-empty current;
+        # if current is missing or empty, take snapshot's.
         for src in sorted(snap.glob("*.md")):
-            if src.is_file():
-                shutil.copy2(src, parts_d / src.name)
+            if src.is_file() and src.stat().st_size > 0:
+                dst = parts_d / src.name
+                if not dst.exists() or dst.stat().st_size == 0:
+                    shutil.copy2(src, dst)
         # The single file is shadowed by any non-empty parts dir — remove it
         # so the restored parts are what the next read resolves to.
         with contextlib.suppress(OSError):

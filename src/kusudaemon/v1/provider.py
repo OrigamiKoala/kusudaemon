@@ -79,6 +79,28 @@ def _scoped_max_tokens() -> int | None:
 _DEFAULT_STRUCTURED_RETRIES = 2
 # §P3: upper bound for the cap-escalation ladder in ``complete_json``.
 _MAX_STRUCTURED_TOKENS = 32768
+
+# A deadline and a truncation are different failures with different remedies,
+# and until 2026-09-18 both were answered by doubling the output cap.
+# Truncation genuinely needs more room. A deadline does not: the response was
+# not cut off, the model simply spent the wall clock deliberating -- and since
+# ``deadline_s`` is derived from the cap (``max(300, cap / min_tps)``), each
+# doubling hands the next attempt a LONGER deadline to deliberate into. On a
+# reasoning model that ladder ran 300 -> 300 -> 546 -> 1092 -> 2185s, which is
+# how a bounded classify call (one small fixed JSON object) came to take
+# 1751s of a 5400s run budget. Verdict roles already had the right remedy for
+# a deadline -- tell the model to stop and emit -- so every role uses it now,
+# and the cap is escalated only by truncation, which is the signal that
+# actually means "needs more room".
+_EMIT_NOW_NUDGE = "Stop deliberating. Emit the JSON now."
+
+
+def _deadline_retry_budget() -> int:
+    """Deadline retries allowed per ``complete_json`` for a non-verdict role."""
+    try:
+        return max(0, int(os.getenv("KUSUDAEMON_ROLE_DEADLINE_RETRIES", "1")))
+    except ValueError:
+        return 1
 _DEFAULT_HTTP_RETRIES = 3
 _DEFAULT_CONCURRENCY = 4
 
@@ -336,13 +358,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
             ]
 
         def _default_max_tokens(sch: dict[str, Any]) -> int:
-            # §P3: these were 1024 / 2048 / 4096. On a reasoning model the cap
-            # covers the thinking trace as well as the JSON, so the small-schema
-            # budget was spent before the object was ever emitted — every
-            # orchestrator call in the 000-week sweep returned exactly 1024
-            # tokens and no parseable decision ("no answer within 90s"), and
-            # every reviewer call exactly 4096. Doubling the floors costs
-            # nothing when the model stops early; `_escalate` covers the rest.
+            current_role = _scoped_role(self.role)
+            if current_role == "orchestrator":
+                return 1024
             props = sch.get("properties") or {}
             if len(props) <= 4 and all(
                 isinstance(p, dict) and p.get("type") in ("string", "integer", "number", "boolean")
@@ -397,6 +415,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
 
         validation_attempts = 0
         cap_escalations = 0
+        deadline_retries = 0
         empty_retries = 0
         verdict_deadline_retried = False
 
@@ -404,7 +423,12 @@ class OpenAICompatibleProvider(RoleProviderBase):
             curr_payload = make_payload(with_format=use_format)
             min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
             current_cap = cap["max_tokens"] or _default_max_tokens(schema)
-            deadline_s = max(300.0, current_cap / min_tps)
+            if current_role == "orchestrator":
+                deadline_s = float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "60.0"))
+            elif current_role in ("reviewer", "triage"):
+                deadline_s = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
+            else:
+                deadline_s = max(300.0, current_cap / min_tps)
             try:
                 raw = self._call(
                     curr_payload,
@@ -424,13 +448,14 @@ class OpenAICompatibleProvider(RoleProviderBase):
                         },
                     ]
                     continue
-                elif not is_verdict_role and cap_escalations < 4:
-                    previous = cap["max_tokens"] or _default_max_tokens(schema)
-                    cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
-                    if cap["max_tokens"] != previous:
-                        cap_escalations += 1
-                        last_error = f"response hit deadline ({previous} tokens); retrying at {cap['max_tokens']}"
-                        continue
+                elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
+                    deadline_retries += 1
+                    last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
+                    base_messages = [
+                        *base_messages,
+                        {"role": "user", "content": _EMIT_NOW_NUDGE},
+                    ]
+                    continue
                 raise
             except ProviderHTTPError as exc:
                 # §12's fallback must be reachable when the *endpoint* (not
@@ -463,13 +488,14 @@ class OpenAICompatibleProvider(RoleProviderBase):
                             },
                         ]
                         continue
-                    elif not is_verdict_role and cap_escalations < 4:
-                        previous = cap["max_tokens"] or _default_max_tokens(schema)
-                        cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
-                        if cap["max_tokens"] != previous:
-                            cap_escalations += 1
-                            last_error = f"response hit deadline ({previous} tokens); retrying at {cap['max_tokens']}"
-                            continue
+                    elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
+                        deadline_retries += 1
+                        last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
+                        base_messages = [
+                            *base_messages,
+                            {"role": "user", "content": _EMIT_NOW_NUDGE},
+                        ]
+                        continue
                     raise
             message = _first_choice_message(raw)
             if not streaming and on_reasoning is not None:
@@ -772,11 +798,16 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # PLAN-SWEEP-REPAIR.md §F2: same phase/role/elapsed context as
         # _http_transport for the streaming twin.
         t0 = time.time()
-        effective_deadline = deadline_s
         if effective_deadline is None:
-            min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
-            cap_tok = payload.get("max_tokens") or 4096
-            effective_deadline = max(300.0, cap_tok / min_tps)
+            cur_role = _scoped_role(self.role)
+            if cur_role == "orchestrator":
+                effective_deadline = float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "60.0"))
+            elif cur_role in ("reviewer", "triage"):
+                effective_deadline = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
+            else:
+                min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
+                cap_tok = payload.get("max_tokens") or 4096
+                effective_deadline = max(300.0, cap_tok / min_tps)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 lines = (line.decode("utf-8", errors="replace").rstrip("\n") for line in response)

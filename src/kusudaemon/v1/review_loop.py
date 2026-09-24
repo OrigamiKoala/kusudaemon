@@ -31,6 +31,7 @@ from .reviewer import (
 from .tree import TaskNode
 
 DEFAULT_READ_TOKENS = 6000
+DEFAULT_READ_TURN_MAX_TOKENS = 8192
 
 READ_LOOP_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -242,6 +243,7 @@ def run_review_read_loop(
 ) -> ReviewVerdict:
     """Execute the goal-directed read loop over the artifact."""
     read_cap = int(os.getenv("KUSUDAEMON_REVIEW_READ_TOKENS", str(DEFAULT_READ_TOKENS)))
+    read_turn_cap = int(os.getenv("KUSUDAEMON_REVIEW_READ_MAX_TOKENS", str(DEFAULT_READ_TURN_MAX_TOKENS)))
     total_tokens = estimate_tokens(artifact_text)
     turn_budget = math.ceil(total_tokens / max(1, read_cap)) + 4
 
@@ -328,10 +330,13 @@ def run_review_read_loop(
         ]
 
         try:
-            # §R3.6: read turns use a small output cap (4096, no escalation —
+            # §R3.6: read turns use a fixed output cap (no escalation —
             # findings are ≤8 items). Threaded via call_scope so it applies on
-            # the HTTP path without changing the RoleProvider protocol.
-            with call_scope(max_tokens=4096):
+            # the HTTP path without changing the RoleProvider protocol. The cap
+            # covers the reasoning trace too, so it defaults to 8192 rather
+            # than 4096 (triage hit its 2048 cap on every call, see
+            # reviewer._call_triage).
+            with call_scope(max_tokens=read_turn_cap):
                 action_obj = provider.complete_json(
                     messages,
                     schema,
@@ -409,7 +414,7 @@ def run_review_read_loop(
                         {"role": "user", "content": reask_prompt},
                     ]
                     try:
-                        with call_scope(max_tokens=4096):
+                        with call_scope(max_tokens=read_turn_cap):
                             second = provider.complete_json(
                                 reask_messages,
                                 schema,

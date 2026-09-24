@@ -1349,18 +1349,18 @@ def cmd_bench(
         max_attempts = getattr(argv, "max_attempts", 3)
         from ..types import EpisodeBudget
         max_duration_seconds = EpisodeBudget.max_duration_seconds
-        if wall_clock_budget is not None and max_attempts * max_duration_seconds >= wall_clock_budget:
+        if wall_clock_budget is not None:
             headroom = min(300.0, float(wall_clock_budget) * 0.1)
-            clamped = int((float(wall_clock_budget) - headroom) / max(1, max_attempts))
+            clamped = int(float(wall_clock_budget) - headroom)
             if clamped < 60:
                 print(
-                    f"error: run configuration invalid: max_attempts ({max_attempts}) * "
-                    f"max_duration_seconds ({max_duration_seconds}s) >= wall_clock_budget ({wall_clock_budget}s), "
-                    f"and clamped episode duration {clamped}s is below 60s",
+                    f"error: run configuration invalid: wall_clock_budget ({wall_clock_budget}s) "
+                    f"after headroom is below 60s",
                     file=sys.stderr,
                 )
                 return 1
-            EpisodeBudget.max_duration_seconds = clamped
+            if clamped < max_duration_seconds:
+                EpisodeBudget.max_duration_seconds = clamped
 
         options = RunOptions(
             goal=goal,

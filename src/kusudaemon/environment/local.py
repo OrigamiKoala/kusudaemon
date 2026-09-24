@@ -143,8 +143,16 @@ class LocalEnvironment:
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
         activity_ref: list[float] = [start]
+        # Liveness grace for an episode that is still genuinely working when
+        # its budget expires -- enough for an in-flight generation or tool call
+        # to land, not enough to matter at run scale. The 1800s it defaulted to
+        # was the latter: a writer that had emitted 1 of 100 units kept the CPU
+        # and socket checks happy and ran 3376s against a 2285s budget, 30 of
+        # those minutes bought purely by this extension, out of a 5400s run.
+        # A stalled episode should reach its defect handler while the run still
+        # has budget left to act on it.
         soft_ext = (
-            int(os.getenv("KUSUDAEMON_SOFT_TIMEOUT_EXTENSION", "1800"))
+            int(os.getenv("KUSUDAEMON_SOFT_TIMEOUT_EXTENSION", "300"))
             if grace_period is None
             else grace_period
         )

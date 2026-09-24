@@ -246,9 +246,12 @@ def _artifact_instruction(
         # ~80k context, the exact place this model's output degenerates. Name
         # the parts as the deliverable and forbid the merge.
         try:
-            existing_parts = sorted(f.name for f in parts_dir.glob("*.md"))
+            part_files = sorted(p for p in parts_dir.glob("*.md") if p.is_file())
+            existing_parts = [p.name for p in part_files]
+            empty_stubs = [p.name for p in part_files if p.stat().st_size == 0]
+            filled_parts = [p.name for p in part_files if p.stat().st_size > 0]
         except OSError:
-            existing_parts = []
+            part_files, existing_parts, empty_stubs, filled_parts = [], [], [], []
         ascii_clause = (
             "Use plain ASCII punctuation throughout — straight quotes (' and \"), "
             "hyphens, and \"...\" rather than curly quotes, en/em dashes or a single-"
@@ -256,7 +259,30 @@ def _artifact_instruction(
             "typographic character you cannot reproduce byte-for-byte later makes "
             "every edit that targets that line fail (PLAN-SWEEP-REPAIR.md \u00a7F6)."
         )
-        if existing_parts:
+        if empty_stubs:
+            empty_list = ", ".join(f"`{name}`" for name in empty_stubs)
+            filled_note = ""
+            if filled_parts:
+                filled_list = ", ".join(f"`{name}`" for name in filled_parts)
+                filled_note = (
+                    f"Parts already finished ({len(filled_parts)}): {filled_list}. "
+                    "Forbid rewriting or touching any file that already holds a unit — "
+                    "a write over finished content loses work and is a defect.\n"
+                )
+            instruction = (
+                f"Your artifact is the set of unit files in `{parts_dir}`. "
+                "The harness concatenates them in filename order, and that concatenation is "
+                "the deliverable — it is what the gates count and what gets assembled.\n"
+                "Do not merge, concatenate or copy them into one file, and do not write "
+                f"`{absolute_path}` — the parts directory takes precedence over it, so "
+                "anything written there is ignored.\n"
+                f"{filled_note}"
+                f"Write each unit as its own new file into its designated stub, then move on:\n"
+                f"Empty unit files to fill ({len(empty_stubs)}): {empty_list}.\n"
+                "Never rewrite a file that already holds a unit.\n"
+                + ascii_clause
+            )
+        elif existing_parts:
             listed = ", ".join(f"`{name}`" for name in existing_parts)
             instruction = (
                 f"Your artifact is the set of part files in `{parts_dir}`, which "
@@ -286,16 +312,9 @@ def _artifact_instruction(
                 "layouts you choose is the deliverable; nothing else you write "
                 "or say is. Do not do both: a non-empty parts directory "
                 "shadows the single file.\n"
-                # PLAN-SWEEP-REPAIR.md §E1/§E2: every "do not rewrite" sentence in
-                # this harness used to live on a retry-only path (`_PATCH_RETRY_
-                # INSTRUCTION`, `runner.py`'s continuation framing), so a first
-                # attempt — the one that writes the whole 34 KB — was told nothing.
-                # Observed consequence: a writer fixed one duplicated heading by
-                # re-emitting the entire file ("Let me fix this by rewriting the
-                # file properly"), and fixed one stray brace in its handoff note by
-                # rewriting the note. State the rule on the first pass instead.
-                "Build the artifact incrementally: create it once, then extend it by "
-                "appending, and change what is already written with targeted edits. "
+                # PLAN-SWEEP-REPAIR.md §E1/§E2: state the rule on the first pass
+                "Build the artifact incrementally: create it once, write each unit as its "
+                "own file or make targeted edits, and change what is already written with targeted edits. "
                 "Do not re-emit the whole file to change part of it — a whole-file "
                 "write over existing content risks losing finished work, and is a "
                 "defect rather than a fix. If an edit fails to match, re-read the "
@@ -579,20 +598,38 @@ def segments(
 
                     units_found = count_units(prior_artifact, unit_delimiter_from_gates(node))
                     units_exp = node.budget.units_expected if node.budget else None
-                    if prior_artifact.startswith("[ARTIFACT EXCEEDS INLINE CAP:"):
+                    parts_dir = Path(run_dir) / "out" / node.id
+                    empty_stubs = [p.name for p in parts_dir.glob("u*.md") if p.is_file() and p.stat().st_size == 0] if parts_dir.is_dir() else []
+                    filled_stubs = sorted([p for p in parts_dir.glob("u*.md") if p.is_file() and p.stat().st_size > 0], key=lambda p: p.name) if parts_dir.is_dir() else []
+                    if empty_stubs:
+                        continuity_lines = []
+                        for fp in filled_stubs[-2:]:
+                            try:
+                                t = fp.read_text(encoding="utf-8").strip()
+                                if t:
+                                    continuity_lines.append(f"--- {fp.name} ---\n{t[-1000:]}")
+                            except OSError:
+                                pass
+                        continuity_text = ("\n\nRecent finished units for continuity:\n" + "\n\n".join(continuity_lines)) if continuity_lines else ""
+                        retry_block += (
+                            f"\n\nContinuation: write only the remaining {len(empty_stubs)} empty unit files ({', '.join(f'`{s}`' for s in empty_stubs)}). "
+                            "Do not rewrite finished units.\n"
+                            f"{continuity_text}"
+                        )
+                    elif prior_artifact.startswith("[ARTIFACT EXCEEDS INLINE CAP:"):
                         retry_block += (
                             f"\n\n{prior_artifact}\n\n"
-                            "Do not rewrite earlier units. Open the file or parts on disk and append the remaining units."
+                            "Do not rewrite earlier units. Open the file or parts on disk and write the remaining units."
                         )
                     elif units_found > 1 and units_exp and units_found < units_exp:
-                        # PLAN-TOKEN-ACCOUNTING.md §L1: append framing
+                        # PLAN-TOKEN-ACCOUNTING.md §L1: continuation framing
                         retry_block += (
                             f"\n\nYour artifact currently contains units 1–{units_found} of {units_exp}. Do not rewrite them. "
-                            f"Append units {units_found + 1}–{units_exp} to the end of the file using your editing tools, then stop."
+                            f"Append units {units_found + 1}–{units_exp} using your file tools, then stop."
                         )
                     else:
                         retry_block += (
-                            "\n\nYour previous artifact (fix it in place; update or append to it using your file tools):\n\n"
+                            "\n\nYour previous artifact (fix it in place; update using your file tools):\n\n"
                             f"{prior_artifact}"
                         )
             add("retry", retry_block)

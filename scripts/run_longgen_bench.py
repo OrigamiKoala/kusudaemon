@@ -301,6 +301,7 @@ def build_bench_cmd(
     runs_root: str | None,
     run_id: str | None = None,
     max_parallel: int = 1,
+    wall_clock_budget: float | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable, "-m", "kusudaemon.cli", "bench",
@@ -341,6 +342,8 @@ def build_bench_cmd(
             cmd += ["--budget-tokens", str(budget_tokens)]
         if max_rounds is not None:
             cmd += ["--max-rounds", str(max_rounds)]
+        if wall_clock_budget is not None and wall_clock_budget > 0:
+            cmd += ["--wall-clock-budget", str(int(wall_clock_budget))]
     return cmd
 
 
@@ -394,8 +397,9 @@ def harvest_artifact(
     root = runs_root or (Path.home() / ".kusudaemon" / "runs")
     if root.is_dir():
         if run_id:
-            pattern = f"*{run_id}*"
-            run_dirs = sorted(root.glob(pattern), reverse=True)
+            # Exact id only. The old `*{run_id}*` glob, reverse-sorted, put a
+            # parked sibling such as `<run_id>.pre-R-fix` ahead of the live run.
+            run_dirs = [root / run_id] if (root / run_id).is_dir() else []
             for rdir in run_dirs:
                 out_dir = rdir / "out"
                 if out_dir.is_dir():
@@ -504,6 +508,46 @@ def harvest_artifact(
     return ""
 
 
+def archive_stale_cell(
+    *,
+    run_dir: Path,
+    artifact_path: Path,
+    record_path: Path,
+    ws_dir: Path | None,
+    archive_dir: Path,
+) -> list[str]:
+    """Move a previous attempt's run dir, raw artifact, record and workspace
+    aside so this invocation measures a fresh run.
+
+    ``--run-id`` is deterministic (``longgen_<stem>``) and ``kusudaemon bench``
+    resumes any run dir already at that id. Re-running a cell whose record
+    was deleted therefore used to *continue* the old run — inheriting nodes
+    that had already spent their attempts — and stamp the result with the new
+    commit. Every arm-C cell of the 2026-09-16 rerun was such a resume
+    (113-floor seed 2 escalated in 300 s on three leaves exhausted two days
+    earlier). Returns the moved paths; ``--continue-runs`` skips this.
+    """
+    moved: list[str] = []
+    stamp = time.strftime("%Y-%m-%d")
+    for src, dest_root in (
+        (run_dir, run_dir.parent / f"_archived_{stamp}"),
+        (artifact_path, archive_dir / f"stale_{stamp}" / "raw"),
+        (record_path, archive_dir / f"stale_{stamp}" / "bench"),
+        (ws_dir, ws_dir.parent / f"_archived_{stamp}" if ws_dir else None),
+    ):
+        if src is None or dest_root is None or not src.exists():
+            continue
+        dest_root.mkdir(parents=True, exist_ok=True)
+        dest = dest_root / src.name
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = dest_root / f"{src.name}.{n}"
+        src.rename(dest)
+        moved.append(str(dest))
+    return moved
+
+
 def run_one(
     *,
     index: int,
@@ -564,7 +608,27 @@ def run_one(
             runs_root=args.runs_root,
             run_id=run_id,
             max_parallel=int(getattr(args, "max_parallel", 1) or 1),
+            wall_clock_budget=max(300, int((getattr(args, "timeout_sec", 2100) or 2100) - 300)),
         )
+
+    stale_archived: list[str] = []
+    if not args.dry_run and not score_only and not getattr(args, "continue_runs", False):
+        runs_root_path = (
+            Path(args.runs_root).expanduser().resolve()
+            if getattr(args, "runs_root", None)
+            else Path.home() / ".kusudaemon" / "runs"
+        )
+        stale_archived = archive_stale_cell(
+            run_dir=runs_root_path / run_id,
+            artifact_path=artifact_path,
+            record_path=record_path,
+            ws_dir=ws_dir if arm == "A" else None,
+            archive_dir=results_dir / "archive",
+        )
+        for moved in stale_archived:
+            print(f"  archived stale {moved}", flush=True)
+        if arm == "A":
+            ws_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
         if cmd:
@@ -639,7 +703,46 @@ def run_one(
         print(stderr[-2000:], file=sys.stderr)
 
     record: dict[str, Any] = {}
-    if record_path.is_file():
+    if not record_path.is_file() and not score_only and not args.dry_run:
+        # D2: Graceful partial record on timeout / kill
+        runs_root_path = (
+            Path(args.runs_root).expanduser().resolve()
+            if getattr(args, "runs_root", None)
+            else Path.home() / ".kusudaemon" / "runs"
+        )
+        cell_run_dir = runs_root_path / run_id
+        t_json = cell_run_dir / "tree.json"
+        passed_nodes = []
+        if t_json.is_file():
+            try:
+                tree_data = json.loads(t_json.read_text(encoding="utf-8"))
+                if isinstance(tree_data, list):
+                    for n_data in tree_data:
+                        if isinstance(n_data, dict) and n_data.get("status") == "passed":
+                            n_id = n_data.get("id")
+                            if n_id:
+                                passed_nodes.append(str(n_id))
+                elif isinstance(tree_data, dict):
+                    for n_id, n_data in tree_data.get("nodes", {}).items():
+                        if isinstance(n_data, dict) and n_data.get("status") == "passed":
+                            passed_nodes.append(str(n_id))
+            except Exception:
+                pass
+        record = {
+            "benchmark": "longgenbench",
+            "task_id": task_id,
+            "arm": arm,
+            "seed": seed,
+            "partial": True,
+            "timed_out": timed_out,
+            "passed_nodes": passed_nodes,
+            "halt_reason": f"timeout after {args.timeout_sec}s" if timed_out else (stderr[-300:] if returncode != 0 else "incomplete"),
+        }
+        try:
+            record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    elif record_path.is_file():
         try:
             record = json.loads(record_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -709,6 +812,7 @@ def run_one(
         "max_parallel_derived": record.get("max_parallel_derived"),
         "dispatch_policy": record.get("dispatch_policy"),
         "commit": record.get("commit"),
+        "stale_archived": stale_archived,
     }
 
 
@@ -935,6 +1039,10 @@ def build_parser() -> argparse.ArgumentParser:
                         f"work tree (default {DEFAULT_WORKSPACES_ROOT}).")
     p.add_argument("--resume", action="store_true",
                    help="Skip a cell whose bench record already exists.")
+    p.add_argument("--continue-runs", action="store_true",
+                   help="Continue an existing run dir for a cell instead of archiving it "
+                        "and starting fresh (the default). Results are then not a clean "
+                        "measurement of the current commit.")
     p.add_argument("--per-type", type=int, default=None,
                    help="Run N instances of EACH scenario type, spread across the "
                         "constraint-count distribution (min/Q1/median/Q3/max at N=5). "

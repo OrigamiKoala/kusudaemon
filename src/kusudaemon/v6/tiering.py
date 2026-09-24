@@ -442,12 +442,61 @@ def _files_touched_from_signals(signals: Signals) -> str:
     return "many"
 
 
-def _classify_raw_inner(signals: Signals, estimate: ScopeEstimate) -> Tier:
+def output_capacity(goal: str) -> tuple[int | None, int | None]:
+    """Declared output volume vs. what one leaf holds: ``(declared, per_leaf)``.
+
+    Both halves are measured, never estimated. ``declared`` is
+    ``tokens.expected_units`` -- a regex over the goal's own text.
+    ``per_leaf`` is ``v2/survey.units_per_leaf_capacity`` -- leaf token budget
+    divided by the goal's own declared unit size. Neither costs a model call
+    or a file read, which is what lets the tier table use them (§A4.1's rule
+    that signals are free; only ``estimate_scope`` may cost a call).
+
+    Returns ``(None, None)`` when the goal declares no unit count, which
+    leaves every caller's behaviour exactly as it was before this existed."""
+    declared = _declared_target_count(goal)
+    if not declared:
+        return None, None
+    from ..v2.survey import units_per_leaf_capacity
+
+    return declared, units_per_leaf_capacity(goal)
+
+
+def _output_fits_one_leaf(goal: str) -> bool:
+    """Whether a single node could hold this goal's whole declared output."""
+    declared, per_leaf = output_capacity(goal)
+    if declared is None or per_leaf is None:
+        return True
+    return declared <= per_leaf
+
+
+def _classify_raw_inner(
+    signals: Signals, estimate: ScopeEstimate, goal: str = ""
+) -> Tier:
+    # §A4.3's table has always had an INPUT-volume axis (``work_tokens``
+    # against ``_T2_WORK_TOKENS_CEILING``) and, until 2026-09-18, no OUTPUT
+    # one. That asymmetry is what put every "write 100 floors" run on the
+    # single-node path: ``files_touched`` and ``artifacts`` describe the
+    # SHAPE of the output (one file, one artifact) and are silent about its
+    # VOLUME, so a goal asking for 100 units in one file read identically to
+    # one asking for a paragraph in one file. The T0/T1 rows now carry the
+    # same conjunct the §E28 comment below states for input: a single node
+    # may only be chosen when a single node could actually hold the work.
+    #
+    # This is deliberately NOT a floor bolted on top of the table, and not a
+    # threshold on the unit count. A floor would override the table with a
+    # policy; a threshold would need a magic number. Both are answered by
+    # arithmetic the harness already does -- ``output_capacity`` divides the
+    # leaf token budget by the goal's own declared unit size, and the tiler
+    # in ``v2/survey`` tiles with the identical number. "Write 8 sections"
+    # still classifies T1 because 8 sections genuinely fit one leaf.
+    fits_one_leaf = _output_fits_one_leaf(goal)
     if (
         estimate.artifacts == 1
         and estimate.files_touched == "1"
         and signals.work_tokens < _T2_WORK_TOKENS_CEILING
         and signals.breadth_markers == 0
+        and fits_one_leaf
         and not estimate.ambiguities
         and not estimate.objections
     ):
@@ -456,6 +505,7 @@ def _classify_raw_inner(signals: Signals, estimate: ScopeEstimate) -> Tier:
         estimate.artifacts == 1
         and estimate.files_touched in ("1", "few")
         and signals.work_tokens < _T2_WORK_TOKENS_CEILING
+        and fits_one_leaf
     ):
         return "T1"
     if estimate.artifacts <= 8 and signals.work_tokens < _T2_WORK_TOKENS_CEILING:
@@ -466,18 +516,14 @@ def _classify_raw_inner(signals: Signals, estimate: ScopeEstimate) -> Tier:
 def _classify_raw(signals: Signals, estimate: ScopeEstimate, goal: str = "") -> Tier:
     """PLAN.md §A4.3's table, first match wins.
 
-    PLAN-BENCH-INTEGRITY.md §1.4a: A single output FILE is not a single unit of WORK.
-    When KUSUDAEMON_TIER_OUTPUT_SIGNALS is enabled, declared output targets >= 8
-    floor at T2 so recursive decomposition is exercised.
+    PLAN-BENCH-INTEGRITY.md §1.4a: A single output FILE is not a single unit
+    of WORK. The output-volume conjunct in ``_classify_raw_inner`` is the
+    durable form of that rule; ``KUSUDAEMON_TIER_OUTPUT_SIGNALS=0`` is its
+    kill switch, for isolating the axis in a sweep.
     """
-    raw = _classify_raw_inner(signals, estimate)
-    if (
-        os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "0") == "1"
-        and signals.output_targets > 0
-        and _declared_target_count(goal) >= _PLAN_MIN_OUTPUT_UNITS
-    ):
-        return tier_max(raw, "T2")
-    return raw
+    if os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "1") != "1":
+        return _classify_raw_inner(signals, estimate)
+    return _classify_raw_inner(signals, estimate, goal=goal)
 
 
 def classify(
@@ -533,7 +579,39 @@ def classify(
         tier = _classify_raw(signals, estimate, goal=goal)
         return _apply_work_kind_floor(tier_max(tier, "T2"), estimate, on_event)
 
-    return _apply_work_kind_floor(_classify_raw(signals, estimate, goal=goal), estimate, on_event)
+    tier = _classify_raw(signals, estimate, goal=goal)
+    _emit_output_capacity(signals, estimate, goal, tier, on_event)
+    return _apply_work_kind_floor(tier, estimate, on_event)
+
+
+def _emit_output_capacity(
+    signals: Signals,
+    estimate: ScopeEstimate,
+    goal: str,
+    tier: Tier,
+    on_event: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    """Record the output-volume axis whenever it moved the answer, so a run
+    that decomposed can be told apart from one that decomposed *because the
+    declared output did not fit a leaf* without re-deriving the arithmetic."""
+    if on_event is None:
+        return
+    declared, per_leaf = output_capacity(goal)
+    if declared is None or per_leaf is None or declared <= per_leaf:
+        return
+    without = _classify_raw_inner(signals, estimate)
+    if without == tier:
+        return
+    on_event(
+        {
+            "type": "tier_output_capacity",
+            "declared_units": declared,
+            "units_per_leaf": per_leaf,
+            "leaves_implied": -(-declared // per_leaf),
+            "tier_without_axis": without,
+            "tier": tier,
+        }
+    )
 
 
 def _apply_work_kind_floor(

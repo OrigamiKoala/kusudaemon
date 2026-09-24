@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -186,8 +187,8 @@ def _continuation_prompt(
             "usable survived the prior attempt)."
         )
         overwrite_rule = (
-            "Write incrementally and append as you go so a later "
-            "interruption never loses finished sections."
+            "Write incrementally: write each unit as its own new file and move on "
+            "so a later interruption never loses finished sections."
         )
     return (
         f"{prompt}\n\n[Harness notice — CONTINUATION, not a fresh task]\n"
@@ -242,8 +243,13 @@ async def run_node(
 
     resume_session_id: str | None = None
     dispatch_reason = "dispatched"
+    parts_d = Path(run_dir) / "out" / node_id
+    has_unit_stubs = parts_d.is_dir() and any(parts_d.glob("u*.md"))
     if session is not None and session.get("session_id"):
-        if supports_resume:
+        # armc-wall-clock-brainstorm §A4: On retries of unit-based leaves,
+        # dispatch a fresh session briefed only on the missing ordinals
+        # rather than resuming a degenerated session.
+        if supports_resume and not has_unit_stubs and os.getenv("KUSUDAEMON_WRITER_FRESH_RETRY", "0") != "1":
             resume_session_id = session.get("session_id")
             dispatch_reason = "resumed_session"
             log.append(
@@ -256,18 +262,16 @@ async def run_node(
                 }
             )
         else:
-            # A session id was captured last time but this adapter (e.g.
-            # Codex today) has no continuation mechanism. Falling back to a
-            # fresh redispatch is the documented behavior rather than an
-            # error — see ClaudeCodeAdapter.supports_session_resume.
-            dispatch_reason = "resume_unsupported"
+            # A session id was captured last time but fresh redispatch or
+            # unit continuation requested / resume unsupported.
+            dispatch_reason = "resume_unsupported" if not supports_resume else "fresh_session_continuation"
             log.append(
                 {
                     "node_id": node_id,
                     "role": "writer",
                     "round": 0,
                     "type": "node_redispatched",
-                    "reason": "resume_unsupported",
+                    "reason": dispatch_reason,
                 }
             )
     elif dispatched is not None:

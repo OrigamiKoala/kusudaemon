@@ -193,9 +193,14 @@ def _budget_seconds(node: TaskNode, remaining_budget_s: float | None = None) -> 
     measured_tps = float(os.getenv("KUSUDAEMON_MEASURED_TPS", "35.0"))
     units_exp = node.budget.units_expected if node.budget else None
     if units_exp and units_exp > 0:
+        # B3: Calibrate _budget_seconds with pacing and safety headroom
+        s_per_unit = float(os.getenv("KUSUDAEMON_SECONDS_PER_UNIT", "50.0"))
+        output_sec = int(units_exp * s_per_unit)
         expected_output_tokens = units_exp * 400
         output_seconds = int(expected_output_tokens * 2 / max(1.0, measured_tps))
-        seconds = max(seconds, output_seconds)
+        seconds = max(seconds, int(output_sec * 1.3), output_seconds, 600)
+    elif node.gates and any(g.startswith("units_min:") for g in node.gates):
+        seconds = max(seconds, 600)
 
     bounded = max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
     if remaining_budget_s is not None:
@@ -999,11 +1004,15 @@ class RecursiveDriver:
         tier_degraded = False
         override = (self.options.tier_override or "").upper() or None
         intake_disabled = self.options.no_intake
-        if override == "T3" or (override in ("T0", "T1") and intake_disabled) or (intake_disabled and signals.work_tokens >= 150_000):
+        from ..tokens import expected_units, extract_unit_delimiter
+        exp_units = expected_units(goal)
+        unit_delim = extract_unit_delimiter(goal)
+        is_declared_multi_unit = bool(exp_units and exp_units >= 8 and unit_delim and signals.work_tokens < 2000)
+        if override == "T3" or (override in ("T0", "T1") and intake_disabled) or (intake_disabled and signals.work_tokens >= 150_000) or is_declared_multi_unit:
             estimate = ScopeEstimate(
-                files_touched="1" if override == "T0" else "few" if override == "T1" else "unknown",
-                artifacts=1 if override in ("T0", "T1") else 1,
-                answerable_without_exploration=bool(override in ("T0", "T1")),
+                files_touched="many" if is_declared_multi_unit else ("1" if override == "T0" else "few" if override == "T1" else "unknown"),
+                artifacts=exp_units if is_declared_multi_unit else (1 if override in ("T0", "T1") else 1),
+                answerable_without_exploration=bool(override in ("T0", "T1") or is_declared_multi_unit),
             )
             question_set = QuestionSet()
             measured: Tier = (
@@ -1016,7 +1025,17 @@ class RecursiveDriver:
                     goal=goal,
                 )
             )
-            if override in ("T0", "T1") and intake_disabled:
+            if is_declared_multi_unit:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "scope_estimate_skipped",
+                        "reason": f"deterministic classify fast path: declared {exp_units} units with delimiter and small work corpus ({signals.work_tokens} tokens)",
+                    }
+                )
+            elif override in ("T0", "T1") and intake_disabled:
                 self._log(
                     {
                         "node_id": "-",
@@ -3170,7 +3189,21 @@ class RecursiveDriver:
             )
 
     def _halted(self) -> bool:
-        return halt_path(self.run_dir).exists()
+        if halt_path(self.run_dir).exists():
+            return True
+        rem = self._remaining_budget_seconds()
+        if rem is not None and rem < 180.0:
+            # D1: Wall-clock budget aware — reserve 180s for endgame (assembly/harvest)
+            self._log({
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "wall_clock_endgame",
+                "remaining_seconds": rem,
+                "detail": f"remaining wall-clock budget ({rem:.1f}s) < 180s; halting to enter endgame",
+            })
+            return True
+        return False
 
     def _load_tree(self) -> TaskTree:
         """§11.6: a tree.json that exists but cannot be parsed is a corrupt

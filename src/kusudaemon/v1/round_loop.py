@@ -100,7 +100,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
-from ..v0.run_dir import write_text_atomic
+from ..v0.run_dir import ensure_leaf_unit_stubs, write_text_atomic
 from .gates import (
     GateResult,
     all_passed,
@@ -189,6 +189,10 @@ async def dispatch_node(
         adapter = writer_adapter_factory(node)
         if wt_dir is not None and hasattr(adapter, "workspace_path"):
             adapter.workspace_path = str(wt_dir)
+        # A1: Pre-create unit stubs before prompt generation so writer knows exact file targets
+        ensure_leaf_unit_stubs(run_dir, node)
+        if wt_dir is not None:
+            ensure_leaf_unit_stubs(wt_dir, node)
         result, promotion = await run_writer_node(
             run_dir, node, prompt_for_node(node), adapter, env, budget
         )
@@ -775,7 +779,9 @@ async def run_round_loop(
             if throttled:
                 await asyncio.sleep(min(5.0, admission.remaining_closed_seconds() or 2.0))
 
-        async def node_job(node: TaskNode, start: str) -> None:
+        async def node_job(node: TaskNode, start: str, delay: float = 0.0) -> None:
+            if delay > 0:
+                await asyncio.sleep(delay)
             if start == "dispatch":
                 if getattr(node, "non_attempts", 0) > 0:
                     backoff = min(600.0, 30.0 * (2 ** (node.non_attempts - 1)))
@@ -811,8 +817,10 @@ async def run_round_loop(
                 if node.status == "awaiting_review":
                     await review(node)
 
-        def start_job(node: TaskNode, start: str) -> None:
-            running[asyncio.ensure_future(node_job(node, start))] = node
+        def start_job(node: TaskNode, start: str, stagger_idx: int = 0) -> None:
+            stagger_base = float(os.getenv("KUSUDAEMON_BOOT_STAGGER_S", "0.0"))
+            delay = stagger_idx * stagger_base if start == "dispatch" else 0.0
+            running[asyncio.ensure_future(node_job(node, start, delay=delay))] = node
 
         # §C2 resume scan: nodes a crash left mid-flight become jobs first,
         # admitted through the same slots as everything else.
@@ -905,7 +913,7 @@ async def run_round_loop(
                         f"two in-flight nodes share an artifact path: {in_flight_artifacts}"
                     )
 
-                    for node in wave:
+                    for i, node in enumerate(wave):
                         node.status = "dispatched"
                         await _save_tree_locked(tree, tree_path, tree_lock)
                         log.append(
@@ -921,7 +929,7 @@ async def run_round_loop(
                                 ),
                             }
                         )
-                        start_job(node, "dispatch")
+                        start_job(node, "dispatch", stagger_idx=i)
                     if admission_refused:
                         break
 
@@ -1540,8 +1548,16 @@ async def _transition_after_writer(
     # written; resume at unit 1" over a file holding 60 floors, and
     # ``prompts.py`` handed that resume point straight to the writer.
     _u_delim = unit_delimiter_from_gates(node)
-    current_units = count_units(current_text, _u_delim)
+    from ..v0.run_dir import node_parts_dir
+    parts_d = node_parts_dir(r_dir, node.id)
+    has_unit_stubs = parts_d.is_dir() and any(parts_d.glob("u*.md"))
+    stubs_count = 0
+    if parts_d.is_dir():
+        stubs_count = sum(1 for p in parts_d.glob("u*.md") if p.is_file() and p.stat().st_size > 0)
+    current_units = max(count_units(current_text, _u_delim), stubs_count)
 
+    prior_units = 0
+    prior_bytes = 0
     snaps = list_attempt_snapshots(r_dir, node.id)
     if snaps:
         latest_snap = snaps[-1]
@@ -1549,6 +1565,9 @@ async def _transition_after_writer(
             prior_text = read_attempt_snapshot_text(latest_snap)
             prior_bytes = len(prior_text.encode("utf-8"))
             prior_units = count_units(prior_text, _u_delim)
+            if latest_snap.is_dir():
+                snap_stubs = sum(1 for p in latest_snap.glob("u*.md") if p.is_file() and p.stat().st_size > 0)
+                prior_units = max(prior_units, snap_stubs)
 
             if current_bytes < prior_bytes or (prior_units > 0 and current_units < prior_units):
                 corrupted, _ = is_artifact_corrupted(r_dir, node)
@@ -1596,10 +1615,50 @@ async def _transition_after_writer(
         except Exception:
             pass
 
-    if episode_ok and (gates_passed or bypassed):
+    # A writer that finished its slice but never exited (2026-09-16 323-block
+    # seed 2, unit-02: "episode ended with 25 of 25 units written") used to be
+    # charged an attempt and redispatched over a complete artifact. When the
+    # declared unit count is met and every hard gate passes, the work is done:
+    # send it to review like any other finished episode.
+    units_exp = node.budget.units_expected if node.budget else None
+    timeout_salvaged = (
+        result_status == "timeout"
+        and not regressed_accidental
+        and gates_passed
+        and bool(units_exp)
+        and current_units >= (units_exp or 0)
+    )
+    # Same for an accidental-loss restore whose restored content is already
+    # complete (seed 2, unit-04: 25 units restored, then redispatched — the
+    # redispatch is exactly the step that clobbered it the first time).
+    restored_complete = False
+    if regressed_accidental and units_exp and node.gates:
+        restored_text = _read_artifact(r_dir, node.id)
+        restored_gates = evaluate_gates(node.gates, restored_text)
+        if all_passed(restored_gates) and count_units(restored_text, _u_delim) >= units_exp:
+            restored_complete = True
+            try:
+                write_gate_cache(ensure_audit_path(r_dir, node.id), restored_gates)
+            except OSError:
+                pass
+
+    if (episode_ok or timeout_salvaged) and (gates_passed or bypassed):
         node.non_attempts = 0
         node.status = "awaiting_review"
         node.last_defect = ""
+        if timeout_salvaged:
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_timeout_salvaged",
+                    "detail": (
+                        f"episode timed out with {current_units} of {units_exp} units "
+                        "written and all gates passing; proceeding to review"
+                    ),
+                }
+            )
         if not gates_passed and bypassed:
             log.append(
                 {
@@ -1642,13 +1701,73 @@ async def _transition_after_writer(
                     "detail": f"{result_status} from provider",
                 }
             )
+    elif restored_complete:
+        node.non_attempts = 0
+        node.status = "awaiting_review"
+        node.last_defect = ""
+        log.append(
+            {
+                "node_id": node.id,
+                "role": "harness",
+                "round": 0,
+                "type": "node_restored_complete",
+                "detail": "restored artifact already meets its gates; proceeding to review",
+            }
+        )
     elif regressed_accidental:
         # §L4: Do not count proven-accidental loss against max_attempts
         node.status = "pending"
         node.last_defect = (
             f"accidental loss restored: previous content ({prior_bytes}B) was lost; "
-            f"append to existing artifact (currently {prior_units} units) rather than restarting"
+            f"continue existing artifact (currently {prior_units} units) rather than restarting"
         )
+    elif (has_unit_stubs or os.getenv("KUSUDAEMON_CONTINUATION_PROGRESS", "0") == "1") and current_units > prior_units:
+        # A4: Forward progress made on units — continuation without charging an attempt.
+        node.status = "pending"
+        if result_status == "timeout":
+            if units_exp and units_exp > 0:
+                node.last_defect = (
+                    f"episode_timeout: episode ended with {current_units} of {units_exp} units written; "
+                    f"resume at unit {current_units + 1}"
+                )
+            elif current_units > 0:
+                node.last_defect = (
+                    f"episode_timeout: episode ended with {current_units} units written; "
+                    f"resume at unit {current_units + 1}"
+                )
+            else:
+                node.last_defect = "episode_timeout: episode wall clock exceeded"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_continuation_progress",
+                    "attempts": node.attempts,
+                    "prior_units": prior_units,
+                    "current_units": current_units,
+                    "episode_ok": False,
+                    "detail": node.last_defect,
+                }
+            )
+        else:
+            node.last_defect = "; ".join(
+                f"{result.gate}: {result.detail}" for result in unmet(gate_results)
+            ) or f"continuation: {current_units} units written"
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "harness",
+                    "round": 0,
+                    "type": "node_continuation_progress",
+                    "attempts": node.attempts,
+                    "prior_units": prior_units,
+                    "current_units": current_units,
+                    "episode_ok": episode_ok,
+                    "unmet": [result.gate for result in gate_results if not result.passed],
+                    "detail": node.last_defect,
+                }
+            )
     else:
         node.attempts += 1
         node.status = "blocked" if node.attempts >= max_attempts else "pending"

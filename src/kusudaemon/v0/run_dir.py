@@ -127,6 +127,60 @@ def ensure_node_parts_dir(run_dir: str | Path, node_id: str) -> Path:
     return d
 
 
+def extract_leaf_unit_range(node_or_brief: Any) -> tuple[int, int] | None:
+    """Extract (start, end) 1-based unit indices for a leaf node (armc-wall-clock-brainstorm §A1)."""
+    import re
+    brief = getattr(node_or_brief, "brief", str(node_or_brief or ""))
+    gates = getattr(node_or_brief, "gates", []) + getattr(node_or_brief, "warn_gates", [])
+    # 1. Look for units_range:lo-hi gate
+    for g in gates:
+        m = re.search(r"units_range:(\d+)-(\d+)", g)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi >= lo:
+                return lo, hi
+    # 2. Look for range in brief
+    from ..v2.survey import OUTPUT_UNIT_NOUNS, pluralize_unit_noun
+    nouns = set(OUTPUT_UNIT_NOUNS)
+    for n in OUTPUT_UNIT_NOUNS:
+        nouns.add(pluralize_unit_noun(n))
+    pat = "|".join(re.escape(w) for w in sorted(nouns, key=len, reverse=True))
+    m = re.search(rf"\b(?:{pat})\s+(\d+)\s+to\s+(\d+)\b", brief, re.IGNORECASE)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if hi >= lo:
+            return lo, hi
+    # 3. Check budget units_expected
+    budget = getattr(node_or_brief, "budget", None)
+    units_exp = getattr(budget, "units_expected", None) if budget else None
+    if units_exp is not None and isinstance(units_exp, int) and units_exp > 1:
+        return 1, units_exp
+    return None
+
+
+def ensure_leaf_unit_stubs(run_dir: str | Path, node: Any) -> list[Path]:
+    """Pre-create empty unit stubs out/<node>/u017.md ... u040.md before dispatch (armc-wall-clock-brainstorm §A1)."""
+    r = extract_leaf_unit_range(node)
+    if not r:
+        return []
+    node_id = getattr(node, "id", str(node))
+    parts_d = ensure_node_parts_dir(run_dir, node_id)
+    lo, hi = r
+    created: list[Path] = []
+    width = 4 if hi >= 1000 else 3
+    for idx in range(lo, hi + 1):
+        p = parts_d / f"u{idx:0{width}d}.md"
+        if not p.exists():
+            try:
+                p.write_text("", encoding="utf-8")
+                created.append(p)
+            except OSError:
+                pass
+        else:
+            created.append(p)
+    return created
+
+
 # PLAN-SWEEP-REPAIR.md §F6: typographic punctuation an agent's own writing
 # introduces but its edit tool cannot then match.
 #

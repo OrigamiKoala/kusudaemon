@@ -108,8 +108,21 @@ def classify_cli_failure(output: str) -> str:
         "failed to connect",
         "econnrefused",
         "econnreset",
+        "failed to get response headers",
+        "response header",
+        "gateway timeout",
+        "bad gateway",
+        "service unavailable",
+        "internal server error",
     )
     if any(p in low for p in transport_patterns):
+        return "transport"
+
+    status_5xx_pattern = re.compile(
+        r"(?:status(?:_code)?|http|code|error)[=:\s]+(500|502|503|504)\b|status\s+(500|502|503|504)\b|\b(500|502|503|504)\s+(server error|bad gateway|service unavailable|gateway timeout)\b",
+        re.IGNORECASE,
+    )
+    if status_5xx_pattern.search(output):
         return "transport"
 
     rate_limit_patterns = (

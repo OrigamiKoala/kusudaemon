@@ -648,6 +648,52 @@ def extract_spine_unit_noun(goal: str, delim: str = "") -> str:
     return "unit"
 
 
+def declared_tokens_per_unit(goal: str) -> int:
+    """Measured output size of one declared unit, from the goal's own
+    words-per-unit declaration. Pure text measurement -- no model call, no
+    file reads -- so tier classification can use it as freely as it uses
+    ``work_tokens``. Falls back to 200 when the goal declares a unit count
+    but not a unit size."""
+    from ..tokens import count_tokens
+
+    m_words = re.search(r"(?:at least|around|about|approximately|minimum of)?\s*(\d+)\s*words\s*(?:per|for each|each|in each)\b", goal, re.IGNORECASE)
+    if not m_words:
+        m_words = re.search(r"(?:each|every)\s+\w+\s+(?:should be|must be|is|needs to be)?\s*(?:at least|around|about|approximately)?\s*(\d+)\s*words\b", goal, re.IGNORECASE)
+    if m_words:
+        return count_tokens("word " * int(m_words.group(1)))
+    return 200
+
+
+def units_per_leaf_capacity(
+    goal: str,
+    *,
+    target_leaf_tokens: int = 4_000,
+    episode_budget_seconds: int = 1800,
+) -> int:
+    """How many declared output units fit in ONE leaf.
+
+    This is the harness's answer to "how much output can a single writer
+    episode be relied on to emit", derived by arithmetic from two measured
+    quantities: the leaf token budget and the goal's own declared unit size.
+    ``synthesize_output_spine`` tiles with it and ``v6/tiering`` classifies
+    with it, deliberately sharing one number -- if classify decides a goal
+    needs more than one leaf, the spine it routes to must actually produce
+    more than one leaf, and a second copy of this arithmetic could drift out
+    of agreement with the first.
+
+    The 5..25 clamp is the same one the tiler has always applied: below 5 the
+    per-leaf overhead dominates, above 25 a leaf stops being reliably
+    completable in one episode regardless of how small its units are.
+    """
+    tokens_per_unit = declared_tokens_per_unit(goal)
+    units_per_leaf = max(1, target_leaf_tokens // max(tokens_per_unit, 50))
+    # B1: Fit work to clock: size leaves via s_per_unit pacing
+    s_per_unit = max(30.0, tokens_per_unit * 0.15)
+    max_units_by_pace = max(5, int(0.6 * episode_budget_seconds / s_per_unit))
+    units_per_leaf = min(units_per_leaf, max_units_by_pace)
+    return max(5, min(25, units_per_leaf))
+
+
 def synthesize_output_spine(
     goal: str,
     *,
@@ -665,17 +711,8 @@ def synthesize_output_spine(
     delim = extract_unit_delimiter(goal)
     noun = extract_spine_unit_noun(goal, delim)
 
-    m_words = re.search(r"(?:at least|around|about|approximately|minimum of)?\s*(\d+)\s*words\s*(?:per|for each|each|in each)\b", goal, re.IGNORECASE)
-    if not m_words:
-        m_words = re.search(r"(?:each|every)\s+\w+\s+(?:should be|must be|is|needs to be)?\s*(?:at least|around|about|approximately)?\s*(\d+)\s*words\b", goal, re.IGNORECASE)
-    if m_words:
-        words = int(m_words.group(1))
-        tokens_per_unit = count_tokens("word " * words)
-    else:
-        tokens_per_unit = 200
-
-    units_per_leaf = max(1, target_leaf_tokens // max(tokens_per_unit, 50))
-    units_per_leaf = max(5, min(25, units_per_leaf))
+    tokens_per_unit = declared_tokens_per_unit(goal)
+    units_per_leaf = units_per_leaf_capacity(goal, target_leaf_tokens=target_leaf_tokens)
     if n <= units_per_leaf:
         units_per_leaf = max(1, math.ceil(n / 2))
 

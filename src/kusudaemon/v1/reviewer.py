@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 from ..roles.protocol import RoleProvider
 from .gates import estimate_tokens
-from .provider import ProviderDeadlineError, ProviderError
+from .provider import ProviderDeadlineError, ProviderError, call_scope
 from .tree import TaskNode
 
 # §11.10.13: the reviewer's input side gets the §8 "small outputs
@@ -218,12 +218,33 @@ _CONTRACT_BOILERPLATE = re.compile(
 _TRACEABLE_INPUT_PREFIXES = ("Handoff from ", "Research finding")
 
 
+# Contract sections that interpret the *task* rather than declare a rule a
+# claim could be traced to (`v2/contract.py::_T2_CONTRACT_SECTIONS`). Intake's
+# assumptions ("coordinates are (column, row)") say nothing about where an
+# invented "purpose and city value" paragraph came from; counting them as
+# rules disabled the vacuous-pass rule on every intake-answered run, and
+# 323-block seed 1's unit-03 was lost to three `claims_supported` fails on a
+# contract whose Global rubric was `(none)`.
+_NON_RULE_SECTIONS = frozenset({"assumptions", "unresolved objections"})
+_CONTRACT_HEADING = re.compile(r"^\s*#{1,6}\s*(.*?)\s*$")
+_NO_RUBRIC_PLACEHOLDER = re.compile(r"^\s*\(no global rubric was elicited[^)]*\)\s*$")
+
+
 def contract_declares_rules(contract_text: str) -> bool:
-    """True when the contract carries at least one substantive line."""
-    return any(
-        not _CONTRACT_BOILERPLATE.match(line)
-        for line in (contract_text or "").splitlines()
-    )
+    """True when a rule-bearing section of the contract carries at least one
+    substantive line. Assumptions and unresolved objections do not count."""
+    in_non_rule = False
+    for line in (contract_text or "").splitlines():
+        heading = _CONTRACT_HEADING.match(line)
+        if heading:
+            in_non_rule = heading.group(1).strip().lower() in _NON_RULE_SECTIONS
+            continue
+        if in_non_rule:
+            continue
+        if _CONTRACT_BOILERPLATE.match(line) or _NO_RUBRIC_PLACEHOLDER.match(line):
+            continue
+        return True
+    return False
 
 
 def has_traceable_source(declared_inputs: str) -> bool:
@@ -607,13 +628,31 @@ def _call_triage(
             "content": "\n\n".join(content_parts),
         },
     ]
-    return provider.complete_json(
-        messages,
-        TRIAGE_SCHEMA,
-        temperature=temperature,
-        on_reasoning=on_reasoning,
-        streaming=True,
-    )
+    # TRIAGE_SCHEMA is small, so the provider's default cap is 2048 — but on a
+    # reasoning model that budget covers the thinking trace too. Every triage
+    # call in the 2026-09-16 323-block runs hit it ("output ceiling (2048
+    # tokens, the maximum)"), and verdict roles are not escalated, so triage
+    # always failed after ~2-3 minutes and fell through to full review anyway.
+    # Triage answers a small fixed schema from an outline and a gate summary --
+    # it never sees the artifact. The 8192 default (2026-09-16) did not make it
+    # succeed: it truncated at the ceiling, took the emit-now retry, truncated
+    # again and fell through to full review anyway -- just four times slower
+    # than at 2048, which is the whole point of a pre-filter. Fail fast.
+    with call_scope(max_tokens=_env_int("KUSUDAEMON_TRIAGE_MAX_TOKENS", 2048)):
+        return provider.complete_json(
+            messages,
+            TRIAGE_SCHEMA,
+            temperature=temperature,
+            on_reasoning=on_reasoning,
+            streaming=True,
+        )
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 
 def effective_judgment_for(
