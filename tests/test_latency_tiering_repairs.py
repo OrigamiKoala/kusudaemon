@@ -92,8 +92,10 @@ def _one_artifact_estimate(**over) -> ScopeEstimate:
     return ScopeEstimate(**fields)
 
 
+@patch.dict(os.environ, {"KUSUDAEMON_TIER_OUTPUT_SIGNALS": "1"})
 class TestOutputVolumeAxis(unittest.TestCase):
-    """The tier table's missing axis: output VOLUME, not output SHAPE."""
+    """The tier table's missing axis: output VOLUME, not output SHAPE.
+    Opt-in since 2026-09-25, so these tests pin the flag on."""
 
     def test_one_file_of_many_units_is_not_a_single_node_run(self) -> None:
         """The 142-floor shape: `files_touched="1"`, `artifacts=1`, and 100

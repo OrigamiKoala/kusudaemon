@@ -144,6 +144,20 @@ SplitHandler = Callable[[Path, TaskNode, TaskTree, Path, EventLog], bool]
 NodePassedHook = Callable[[Path, TaskNode, TaskTree, Path, EventLog], None]
 
 
+def _wants_unit_stubs(node: TaskNode) -> bool:
+    """Whether ``node`` gets per-unit stub files (armc-wall-clock-brainstorm
+    §A1). Decomposed leaves only: a T1 single node has bash and appends to
+    one file (21/21 complete before dcf4874), and ``extract_leaf_unit_range``'s
+    budget ``units_expected`` fallback would otherwise stub it too.
+    ``KUSUDAEMON_UNIT_STUBS=0`` disables."""
+    from ..v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID
+
+    return (
+        os.getenv("KUSUDAEMON_UNIT_STUBS", "1") == "1"
+        and node.id not in (SINGLE_NODE_ID, DIRECT_NODE_ID)
+    )
+
+
 async def dispatch_node(
     run_dir: str | Path,
     node: TaskNode,
@@ -189,10 +203,12 @@ async def dispatch_node(
         adapter = writer_adapter_factory(node)
         if wt_dir is not None and hasattr(adapter, "workspace_path"):
             adapter.workspace_path = str(wt_dir)
-        # A1: Pre-create unit stubs before prompt generation so writer knows exact file targets
-        ensure_leaf_unit_stubs(run_dir, node)
-        if wt_dir is not None:
-            ensure_leaf_unit_stubs(wt_dir, node)
+        # A1: Pre-create unit stubs before prompt generation so writer knows
+        # exact file targets.
+        if _wants_unit_stubs(node):
+            ensure_leaf_unit_stubs(run_dir, node)
+            if wt_dir is not None:
+                ensure_leaf_unit_stubs(wt_dir, node)
         result, promotion = await run_writer_node(
             run_dir, node, prompt_for_node(node), adapter, env, budget
         )

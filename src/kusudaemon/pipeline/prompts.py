@@ -250,8 +250,10 @@ def _artifact_instruction(
             existing_parts = [p.name for p in part_files]
             empty_stubs = [p.name for p in part_files if p.stat().st_size == 0]
             filled_parts = [p.name for p in part_files if p.stat().st_size > 0]
+            unit_stub_layout = any(re.fullmatch(r"u\d+\.md", n) for n in existing_parts)
         except OSError:
             part_files, existing_parts, empty_stubs, filled_parts = [], [], [], []
+            unit_stub_layout = False
         ascii_clause = (
             "Use plain ASCII punctuation throughout — straight quotes (' and \"), "
             "hyphens, and \"...\" rather than curly quotes, en/em dashes or a single-"
@@ -259,27 +261,44 @@ def _artifact_instruction(
             "typographic character you cannot reproduce byte-for-byte later makes "
             "every edit that targets that line fail (PLAN-SWEEP-REPAIR.md \u00a7F6)."
         )
-        if empty_stubs:
-            empty_list = ", ".join(f"`{name}`" for name in empty_stubs)
+        if unit_stub_layout:
+            # armc-wall-clock-brainstorm §A1: one pre-created file per unit
+            # (``uNNN.md`` = unit NNN). A per-unit ``write`` lands in its own
+            # file, so the one-write-per-unit habit that clobbered single-file
+            # leaves (200-menu-week unit-03 kept only week 52 of 16) is safe
+            # here. Filled units stay editable so a retry can fix a defect in
+            # place; this branch also covers the all-filled case so a fix is
+            # never routed to the generic ``part-NN.md`` advice below, which
+            # would sort ahead of ``u001.md`` in the concatenation.
+            if empty_stubs:
+                todo = (
+                    f"Empty unit files to fill ({len(empty_stubs)}): "
+                    + ", ".join(f"`{name}`" for name in empty_stubs)
+                    + ".\n"
+                )
+            else:
+                todo = f"All {len(existing_parts)} unit files already hold content.\n"
             filled_note = ""
             if filled_parts:
-                filled_list = ", ".join(f"`{name}`" for name in filled_parts)
                 filled_note = (
-                    f"Parts already finished ({len(filled_parts)}): {filled_list}. "
-                    "Forbid rewriting or touching any file that already holds a unit — "
-                    "a write over finished content loses work and is a defect.\n"
+                    f"Units already written ({len(filled_parts)}): "
+                    + ", ".join(f"`{name}`" for name in filled_parts)
+                    + ". They are finished work: to correct one, re-read it and make a "
+                    "targeted edit inside that file rather than re-emitting it whole.\n"
                 )
             instruction = (
-                f"Your artifact is the set of unit files in `{parts_dir}`. "
-                "The harness concatenates them in filename order, and that concatenation is "
-                "the deliverable — it is what the gates count and what gets assembled.\n"
-                "Do not merge, concatenate or copy them into one file, and do not write "
-                f"`{absolute_path}` — the parts directory takes precedence over it, so "
-                "anything written there is ignored.\n"
+                f"Your artifact is the set of unit files in `{parts_dir}`, one file per "
+                "unit (`u037.md` holds unit 37). The harness concatenates them in "
+                "filename order, and that concatenation is the deliverable — it is what "
+                "the gates count and what gets assembled.\n"
+                "Do not merge, concatenate or copy them into one file, do not write "
+                f"`{absolute_path}` (the parts directory takes precedence, so anything "
+                "written there is ignored), and do not create any other file in that "
+                "directory.\n"
+                "Write each unit into its own file with your file tools, then move on "
+                "to the next; never put one unit's content into another unit's file.\n"
+                f"{todo}"
                 f"{filled_note}"
-                f"Write each unit as its own new file into its designated stub, then move on:\n"
-                f"Empty unit files to fill ({len(empty_stubs)}): {empty_list}.\n"
-                "Never rewrite a file that already holds a unit.\n"
                 + ascii_clause
             )
         elif existing_parts:
@@ -613,7 +632,7 @@ def segments(
                         continuity_text = ("\n\nRecent finished units for continuity:\n" + "\n\n".join(continuity_lines)) if continuity_lines else ""
                         retry_block += (
                             f"\n\nContinuation: write only the remaining {len(empty_stubs)} empty unit files ({', '.join(f'`{s}`' for s in empty_stubs)}). "
-                            "Do not rewrite finished units.\n"
+                            "Do not rewrite finished units; a targeted edit inside a finished unit's file is fine if it needs a fix.\n"
                             f"{continuity_text}"
                         )
                     elif prior_artifact.startswith("[ARTIFACT EXCEEDS INLINE CAP:"):

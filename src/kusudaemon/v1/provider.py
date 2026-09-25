@@ -798,6 +798,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # PLAN-SWEEP-REPAIR.md §F2: same phase/role/elapsed context as
         # _http_transport for the streaming twin.
         t0 = time.time()
+        effective_deadline = deadline_s
         if effective_deadline is None:
             cur_role = _scoped_role(self.role)
             if cur_role == "orchestrator":

@@ -114,6 +114,10 @@ def classify_cli_failure(output: str) -> str:
         "bad gateway",
         "service unavailable",
         "internal server error",
+        # NVIDIA NIM's generic server-side failure via the AI SDK. Observed
+        # 2026-09-25 ending episodes ~2 s in; classified as ``error`` it cost
+        # a real attempt each (200-menu-week s2 unit-01 lost 2 in 4 s).
+        "failed to generate completions",
     )
     if any(p in low for p in transport_patterns):
         return "transport"

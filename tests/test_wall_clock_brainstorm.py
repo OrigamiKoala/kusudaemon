@@ -103,7 +103,8 @@ class WallClockBrainstormTest(unittest.TestCase):
 
             instruction = _artifact_instruction(node, run_dir)
             self.assertIn("Empty unit files to fill (4):", instruction)
-            self.assertIn("Never rewrite a file that already holds a unit", instruction)
+            self.assertIn("targeted edit inside that file", instruction)
+            self.assertNotIn("part-NN", instruction)
             self.assertIn("u001.md", instruction)
 
             # Retry prompt lists empty stubs without "append"
@@ -111,6 +112,7 @@ class WallClockBrainstormTest(unittest.TestCase):
             prompt = build_node_prompt(node, run_dir)
             self.assertIn("Continuation: write only the remaining 4 empty unit files", prompt)
             self.assertIn("Do not rewrite finished units", prompt)
+            self.assertIn("targeted edit inside a finished unit's file is fine", prompt)
 
     def test_a4_continuation_progress_does_not_charge_attempts(self) -> None:
         node = TaskNode(
@@ -158,6 +160,7 @@ class WallClockBrainstormTest(unittest.TestCase):
         self.assertLessEqual(cap, 15)
         self.assertGreaterEqual(cap, 5)
 
+    @patch.dict(os.environ, {"KUSUDAEMON_UNIT_PACING": "1"})
     def test_b3_budget_seconds_calibrated(self) -> None:
         node = TaskNode(
             id="u1",
@@ -171,6 +174,7 @@ class WallClockBrainstormTest(unittest.TestCase):
         self.assertGreaterEqual(sec, 1250)
         self.assertLessEqual(sec, 1800)
 
+    @patch.dict(os.environ, {"KUSUDAEMON_CLASSIFY_FAST_PATH": "1"})
     def test_c1_deterministic_classify_fast_path(self) -> None:
         goal = "Write 20 chapters. Use '=== Chapter N: ===' to separate each chapter."
         options = RunOptions(goal=goal, backend="gptme")

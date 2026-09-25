@@ -519,7 +519,9 @@ def _classify_raw(signals: Signals, estimate: ScopeEstimate, goal: str = "") -> 
     PLAN-BENCH-INTEGRITY.md §1.4a: A single output FILE is not a single unit
     of WORK. The output-volume conjunct in ``_classify_raw_inner`` is the
     durable form of that rule; ``KUSUDAEMON_TIER_OUTPUT_SIGNALS=0`` is its
-    kill switch, for isolating the axis in a sweep.
+    kill switch. It depends on per-unit stub files for decomposed leaves
+    (``KUSUDAEMON_UNIT_STUBS``, on by default): without them a bash-less
+    ``_PROSE`` leaf clobbers its single file with one ``write`` per unit.
     """
     if os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "1") != "1":
         return _classify_raw_inner(signals, estimate)

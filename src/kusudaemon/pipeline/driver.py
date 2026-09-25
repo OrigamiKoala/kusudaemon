@@ -193,13 +193,18 @@ def _budget_seconds(node: TaskNode, remaining_budget_s: float | None = None) -> 
     measured_tps = float(os.getenv("KUSUDAEMON_MEASURED_TPS", "35.0"))
     units_exp = node.budget.units_expected if node.budget else None
     if units_exp and units_exp > 0:
-        # B3: Calibrate _budget_seconds with pacing and safety headroom
-        s_per_unit = float(os.getenv("KUSUDAEMON_SECONDS_PER_UNIT", "50.0"))
-        output_sec = int(units_exp * s_per_unit)
         expected_output_tokens = units_exp * 400
         output_seconds = int(expected_output_tokens * 2 / max(1.0, measured_tps))
-        seconds = max(seconds, int(output_sec * 1.3), output_seconds, 600)
-    elif node.gates and any(g.startswith("units_min:") for g in node.gates):
+        seconds = max(seconds, output_seconds)
+        # B3 pacing calibration: opt-in since 2026-09-25 (it raised a 100-unit
+        # T1 episode's budget from ~2285s to the 7200s ceiling, so a stalled
+        # writer could burn the whole cell before its timeout fired).
+        if os.getenv("KUSUDAEMON_UNIT_PACING", "0") == "1":
+            s_per_unit = float(os.getenv("KUSUDAEMON_SECONDS_PER_UNIT", "50.0"))
+            seconds = max(seconds, int(units_exp * s_per_unit * 1.3), 600)
+    elif os.getenv("KUSUDAEMON_UNIT_PACING", "0") == "1" and node.gates and any(
+        g.startswith("units_min:") for g in node.gates
+    ):
         seconds = max(seconds, 600)
 
     bounded = max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
@@ -1007,7 +1012,13 @@ class RecursiveDriver:
         from ..tokens import expected_units, extract_unit_delimiter
         exp_units = expected_units(goal)
         unit_delim = extract_unit_delimiter(goal)
-        is_declared_multi_unit = bool(exp_units and exp_units >= 8 and unit_delim and signals.work_tokens < 2000)
+        # C1 fast path: default OFF since 2026-09-25 — its synthetic estimate
+        # (artifacts=N, files_touched="many") forced every LongGenBench goal to
+        # T3. ``KUSUDAEMON_CLASSIFY_FAST_PATH=1`` opts in.
+        is_declared_multi_unit = bool(
+            os.getenv("KUSUDAEMON_CLASSIFY_FAST_PATH", "0") == "1"
+            and exp_units and exp_units >= 8 and unit_delim and signals.work_tokens < 2000
+        )
         if override == "T3" or (override in ("T0", "T1") and intake_disabled) or (intake_disabled and signals.work_tokens >= 150_000) or is_declared_multi_unit:
             estimate = ScopeEstimate(
                 files_touched="many" if is_declared_multi_unit else ("1" if override == "T0" else "few" if override == "T1" else "unknown"),

@@ -40,6 +40,8 @@ _REPLAY_INVALIDATING_TYPES = frozenset(
         "node_gate_failed",           # round loop transitioned the node
         "node_episode_timeout",       # round loop transitioned the node on timeout
         "node_throttled",             # round loop transitioned the node on rate limit
+        "node_transport",             # round loop transitioned the node on transport failure
+        "node_continuation_progress", # round loop returned the node to pending (A4)
         "node_review_failed",         # review consumed the completion
         "node_redispatch_requested",  # operator redispatch — new attempt series
         "node_reopened",              # operator direct reset — new attempt series
