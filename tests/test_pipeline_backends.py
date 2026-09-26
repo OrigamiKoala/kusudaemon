@@ -27,12 +27,19 @@ _ENV_KEYS = (
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
     "KUSUDAEMON_PROVIDER",
+    "KUSUDAEMON_LEAF_TEMPLATE_TOOLS",
 )
 
 
 class _EnvGuard:
+    def __init__(self, narrow: bool = False) -> None:
+        self._narrow = narrow
+
     def __enter__(self) -> "_EnvGuard":
         self._backup = {key: os.environ.pop(key, None) for key in _ENV_KEYS}
+        if self._narrow:
+            # The pre-2026-09-26 behaviour: node.tools narrows the set.
+            os.environ["KUSUDAEMON_LEAF_TEMPLATE_TOOLS"] = "1"
         os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
         os.environ["OPENAI_API_KEY"] = "test-key"
         # resolve() has no built-in fallback (provider_config.py) -- fill
@@ -55,9 +62,30 @@ class WriterAdapterToolAllowlistTest(unittest.TestCase):
             adapter = build_writer_adapter("gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts")
         self.assertEqual(adapter.tool_allowlist, DEFAULT_TOOL_ALLOWLIST + (str(SEARXNG_TOOL_PATH),))
 
+    def test_narrowed_node_still_gets_the_t1_toolset_by_default(self) -> None:
+        """2026-09-26: a template's narrower list no longer removes tools from
+        a writer -- every leaf gets what the T1 writer gets."""
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"], tools=["read", "save"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node,
+                always_grant_web_search=False,
+            )
+        self.assertEqual(adapter.tool_allowlist, DEFAULT_TOOL_ALLOWLIST)
+
+    def test_template_tools_can_only_add(self) -> None:
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"], tools=["read", "web"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node,
+                always_grant_web_search=False,
+            )
+        self.assertEqual(adapter.tool_allowlist[: len(DEFAULT_TOOL_ALLOWLIST)], DEFAULT_TOOL_ALLOWLIST)
+        self.assertIn("web", adapter.tool_allowlist)
+
     def test_narrowed_node_keeps_its_tools_and_gains_web_search(self) -> None:
         node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"], tools=["read"])
-        with _EnvGuard():
+        with _EnvGuard(narrow=True):
             adapter = build_writer_adapter("gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node)
         self.assertEqual(adapter.tool_allowlist, ("read", str(SEARXNG_TOOL_PATH)))
 
@@ -65,7 +93,7 @@ class WriterAdapterToolAllowlistTest(unittest.TestCase):
         node = TaskNode(
             id="n", brief="b", artifact="out/n.md", gates=["nonempty"], tools=["read", str(SEARXNG_TOOL_PATH)]
         )
-        with _EnvGuard():
+        with _EnvGuard(narrow=True):
             adapter = build_writer_adapter("gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node)
         self.assertEqual(adapter.tool_allowlist, ("read", str(SEARXNG_TOOL_PATH)))
         self.assertEqual(adapter.tool_allowlist.count(str(SEARXNG_TOOL_PATH)), 1)
@@ -73,7 +101,7 @@ class WriterAdapterToolAllowlistTest(unittest.TestCase):
     def test_always_grant_web_search_false_narrows_tools(self) -> None:
         # §D25: always_grant_web_search=False does not add web search unless node requested it
         node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"], tools=["read"])
-        with _EnvGuard():
+        with _EnvGuard(narrow=True):
             adapter = build_writer_adapter(
                 "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node,
                 always_grant_web_search=False,

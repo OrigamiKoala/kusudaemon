@@ -52,6 +52,7 @@ def normalize_opencode_model(model: str | None) -> str | None:
 
 
 class OpenCodeAdapter(CommandAgentAdapter):
+    boot_gate = True
     supports_session_resume = True
     supports_tool_restriction = True
     has_file_tools = True

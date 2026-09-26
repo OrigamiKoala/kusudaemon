@@ -171,7 +171,9 @@ class CeilingEscalationCoversPartialParses(unittest.TestCase):
         self.assertEqual(out["files_touched"], "1", "the model's real answer must survive")
         self.assertNotEqual(out["files_touched"], "unknown")
         self.assertEqual(len(seen), 2, "a truncated response must be retried")
-        self.assertGreater(seen[1], seen[0], "the retry must raise the ceiling")
+        # 2026-09-26: the first retry resumes at the same ceiling with the
+        # cut-off reasoning carried forward; only a second cut-off raises it.
+        self.assertEqual(seen[1], seen[0])
 
     def test_an_untruncated_response_is_not_retried(self) -> None:
         seen: list[int] = []

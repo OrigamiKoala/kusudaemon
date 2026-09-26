@@ -147,11 +147,13 @@ class TestP3TokenCeiling(unittest.TestCase):
         self.assertFalse(_hit_token_ceiling(raw, 8192))
 
     def test_a_truncated_response_is_retried_at_a_larger_cap(self) -> None:
+        """2026-09-26: the first cut-off resumes at the same cap (carrying its
+        reasoning forward); a second one raises the ceiling."""
         seen: list[int] = []
 
         def transport(url, payload, headers):
             seen.append(payload.get("max_tokens"))
-            if len(seen) == 1:
+            if len(seen) <= 2:
                 return {
                     "choices": [{"finish_reason": "length", "message": {"content": ""}}],
                     "usage": {"completion_tokens": payload["max_tokens"]},
@@ -162,8 +164,9 @@ class TestP3TokenCeiling(unittest.TestCase):
         provider = OpenAICompatibleProvider(transport=transport, api_key="unused", model="m")
         out = provider.complete_json([{"role": "user", "content": "hi"}], _SCHEMA)
         self.assertEqual(out, {"verdict": "ok"})
-        self.assertEqual(len(seen), 2)
-        self.assertGreater(seen[1], seen[0], "the retry must raise the ceiling")
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen[1], seen[0], "the first retry resumes at the same ceiling")
+        self.assertGreater(seen[2], seen[1], "a second cut-off must raise the ceiling")
 
     def test_the_retry_does_not_grow_the_prompt(self) -> None:
         """Seed1 re-asked at the same cap and carried the failure forward:
@@ -181,7 +184,10 @@ class TestP3TokenCeiling(unittest.TestCase):
 
         provider = OpenAICompatibleProvider(transport=transport, api_key="unused", model="m")
         provider.complete_json([{"role": "user", "content": "hi"}], _SCHEMA)
-        self.assertEqual(len(set(lengths)), 1, f"message count grew across retries: {lengths}")
+        # 2026-09-26: one carry-forward block (here just the nudge, since the
+        # cut-off response was empty) is added once and replaced, not stacked.
+        self.assertLessEqual(lengths[1] - lengths[0], 2, f"retry added too much: {lengths}")
+        self.assertEqual(lengths[1], lengths[2], f"message count grew across retries: {lengths}")
 
     def test_exhausting_the_ladder_names_the_ceiling_not_the_json(self) -> None:
         def transport(url, payload, headers):

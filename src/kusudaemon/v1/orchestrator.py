@@ -266,16 +266,21 @@ def _env_float(name: str, default: float) -> float:
 
 
 def orchestrator_max_tokens() -> int:
-    """§L.2 output cap. C2: tighten to 1024 to minimize deliberation overhead."""
-    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", 1024)
+    """§L.2 output cap. 2026-09-26: 16384 (C2's 1024 was spent on reasoning
+    before any JSON, so every call fell back to document order)."""
+    return _env_int("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", 16384)
 
 
 def orchestrator_deadline_s() -> float:
     """§L.2: how long a free slot may wait on one decision before the harness
-    dispatches in document order instead. C2: tighten to 60s."""
+    dispatches in document order instead. Defaults to the same
+    ``max(300, cap / KUSUDAEMON_MIN_DECODE_TPS)`` every other non-verdict
+    role gets, so the 16384 cap is reachable (C2's fixed 60 s cut the call off
+    after ~1-2k tokens). ``KUSUDAEMON_ORCHESTRATOR_DEADLINE_S`` overrides."""
     if _os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
         return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 60.0)
-    return 60.0
+    min_tps = _env_float("KUSUDAEMON_MIN_DECODE_TPS", 15.0) or 15.0
+    return max(300.0, orchestrator_max_tokens() / min_tps)
 
 
 def orchestrator_max_listed() -> int:

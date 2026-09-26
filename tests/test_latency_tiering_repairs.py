@@ -264,15 +264,16 @@ class TestDeadlineDoesNotEscalateTheCap(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
 
     def test_truncation_still_escalates_the_cap(self) -> None:
-        """The remedy that IS right for running out of room stays: a truncated
-        non-verdict response is retried at a larger cap."""
+        """Running out of room still earns a larger cap -- but since
+        2026-09-26 only on the second cut-off; the first resumes at the same
+        cap with the partial reasoning carried forward."""
         payloads: list[dict] = []
         calls = {"n": 0}
 
         def transport(url, payload, headers):
             payloads.append({"max_tokens": payload.get("max_tokens")})
             calls["n"] += 1
-            if calls["n"] == 1:
+            if calls["n"] <= 2:
                 return {
                     "choices": [
                         {"message": {"content": '{"action": "g'}, "finish_reason": "length"}
@@ -285,7 +286,8 @@ class TestDeadlineDoesNotEscalateTheCap(unittest.TestCase):
             [{"role": "user", "content": "plan"}], SCHEMA
         )
         self.assertEqual(result.get("action"), "go")
-        self.assertGreater(payloads[1]["max_tokens"], payloads[0]["max_tokens"])
+        self.assertEqual(payloads[1]["max_tokens"], payloads[0]["max_tokens"])
+        self.assertGreater(payloads[2]["max_tokens"], payloads[1]["max_tokens"])
 
 
 class TestBudgetDefaults(unittest.TestCase):

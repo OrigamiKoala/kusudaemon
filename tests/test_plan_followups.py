@@ -225,10 +225,14 @@ class WorkspaceToolsFallbackTest(unittest.TestCase):
         self.assertIn("shell", adapter.tool_allowlist)
         self.assertEqual(tuple(adapter.tool_allowlist[:4]), tuple(DEFAULT_TOOL_ALLOWLIST[:4]))
 
-    def test_non_workspace_keeps_template_opinion(self) -> None:
+    def test_non_workspace_gets_t1_toolset(self) -> None:
+        """2026-09-26: the prose template's read+save no longer denies bash
+        to a decomposed leaf; ``KUSUDAEMON_LEAF_TEMPLATE_TOOLS=1`` restores it."""
         adapter = self._adapter(is_workspace=False)
-        self.assertNotIn("shell", adapter.tool_allowlist)
-        self.assertEqual(list(adapter.tool_allowlist), ["read", "save"])
+        self.assertIn("shell", adapter.tool_allowlist)
+        with mock.patch.dict(os.environ, {"KUSUDAEMON_LEAF_TEMPLATE_TOOLS": "1"}):
+            narrowed = self._adapter(is_workspace=False)
+        self.assertEqual(list(narrowed.tool_allowlist), ["read", "save"])
 
     def test_code_shape_keeps_shell_without_workspace_flag(self) -> None:
         adapter = self._adapter(is_workspace=False, shape="code-dominant")

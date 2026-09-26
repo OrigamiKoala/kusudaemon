@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import posixpath
 import re
 import shlex
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -114,6 +117,11 @@ def classify_cli_failure(output: str) -> str:
         "bad gateway",
         "service unavailable",
         "internal server error",
+        # OpenCode's shared sqlite store (~/.local/share/opencode/opencode.db)
+        # when two CLIs boot in the same instant. The episode dies in <1 s
+        # before any model call; it is contention, not a writer failure
+        # (034-week s2 unit-01 lost an attempt to it on 2026-09-26).
+        "database is locked",
         # NVIDIA NIM's generic server-side failure via the AI SDK. Observed
         # 2026-09-25 ending episodes ~2 s in; classified as ``error`` it cost
         # a real attempt each (200-menu-week s2 unit-01 lost 2 in 4 s).
@@ -148,7 +156,43 @@ def classify_cli_failure(output: str) -> str:
     return "error"
 
 
+_BOOT_LOCK = threading.Lock()
+_LAST_BOOT = [0.0]
+
+
+def _boot_gap_s() -> float:
+    try:
+        return max(0.0, float(os.getenv("KUSUDAEMON_OPENCODE_BOOT_GAP_S", "2.0")))
+    except ValueError:
+        return 2.0
+
+
+async def _await_boot_slot() -> None:
+    """Space agent-CLI process starts at least ``KUSUDAEMON_OPENCODE_BOOT_GAP_S``
+    (default 2 s) apart, process-wide. Only adapters that set ``boot_gate``
+    (OpenCode) wait.
+
+    Every OpenCode episode opens the same sqlite store at boot, and two boots
+    in the same instant fail with ``database is locked``. The round loop's
+    index-based stagger only covered the first wave of one dispatch loop;
+    the orchestrated loop, retries, probes and backend role calls all booted
+    unspaced. Gating here covers every caller. A thread lock, because role
+    calls run in worker threads with their own event loops."""
+    gap = _boot_gap_s()
+    if gap <= 0:
+        return
+    with _BOOT_LOCK:
+        now = time.monotonic()
+        slot = max(now, _LAST_BOOT[0] + gap)
+        _LAST_BOOT[0] = slot
+    if slot > now:
+        await asyncio.sleep(slot - now)
+
+
 class CommandAgentAdapter:
+    # Overridden True by adapters whose CLI shares on-disk state at boot
+    # (OpenCode's sqlite store); see ``_await_boot_slot``.
+    boot_gate = False
     # Overridden True by adapters that can continue a prior run rather than
     # starting over (see ClaudeCodeAdapter). v0's runner falls back to a fresh
     # redispatch whenever this is False instead of erroring.
@@ -232,6 +276,8 @@ class CommandAgentAdapter:
         ):
             command_body = command_body.replace(placeholder, value)
         command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
+        if self.boot_gate:
+            await _await_boot_slot()
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the TUI shows the trajectory live.
         result = await env.exec(

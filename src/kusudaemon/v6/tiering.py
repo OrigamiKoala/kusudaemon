@@ -518,12 +518,15 @@ def _classify_raw(signals: Signals, estimate: ScopeEstimate, goal: str = "") -> 
 
     PLAN-BENCH-INTEGRITY.md §1.4a: A single output FILE is not a single unit
     of WORK. The output-volume conjunct in ``_classify_raw_inner`` is the
-    durable form of that rule; ``KUSUDAEMON_TIER_OUTPUT_SIGNALS=0`` is its
-    kill switch. It depends on per-unit stub files for decomposed leaves
-    (``KUSUDAEMON_UNIT_STUBS``, on by default): without them a bash-less
-    ``_PROSE`` leaf clobbers its single file with one ``write`` per unit.
+    durable form of that rule, opt-in via ``KUSUDAEMON_TIER_OUTPUT_SIGNALS=1``.
+    Off by default since 2026-09-26: it moved every LongGenBench cell off T1
+    (bash-append writer, 21/21 at >=99 %) onto decomposed leaves, which
+    finished clean in ~5 of ~27 runs since 09-14. It depends on per-unit stub
+    files for decomposed leaves (``KUSUDAEMON_UNIT_STUBS``): without them a
+    bash-less ``_PROSE`` leaf clobbers its single file with one ``write`` per
+    unit.
     """
-    if os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "1") != "1":
+    if os.getenv("KUSUDAEMON_TIER_OUTPUT_SIGNALS", "0") != "1":
         return _classify_raw_inner(signals, estimate)
     return _classify_raw_inner(signals, estimate, goal=goal)
 

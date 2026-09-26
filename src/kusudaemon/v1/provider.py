@@ -94,6 +94,44 @@ _MAX_STRUCTURED_TOKENS = 32768
 # actually means "needs more room".
 _EMIT_NOW_NUDGE = "Stop deliberating. Emit the JSON now."
 
+# 2026-09-26: how much of a cut-off answer's own reasoning is carried into the
+# emit-now retry. The tail is kept because that is where a deliberation's
+# conclusions sit; ~12k chars is ~3k tokens of extra prompt.
+_CARRY_FORWARD_CHARS = 12_000
+
+
+def _carry_forward(partial: str, nudge: str) -> list[dict[str, str]]:
+    """Messages that resume a cut-off role call instead of restarting it.
+
+    Before this, a response that hit the output ceiling or the deadline was
+    thrown away and the model deliberated again from nothing (classify spent
+    4096 + 8192 + 16384 tokens re-deriving the same estimate on 264-menu-week
+    seed 2). The retry now sees the tail of its own reasoning as an assistant
+    turn, then the nudge."""
+    tail = (partial or "").strip()
+    if not tail:
+        return [{"role": "user", "content": nudge}]
+    if len(tail) > _CARRY_FORWARD_CHARS:
+        tail = "[...earlier reasoning omitted...]\n" + tail[-_CARRY_FORWARD_CHARS:]
+    return [
+        {"role": "assistant", "content": f"(My reasoning so far, cut off before I answered:)\n{tail}"},
+        {"role": "user", "content": nudge},
+    ]
+
+
+# 2026-09-26: role caps sized so this reasoning model can finish deliberating
+# and still emit JSON. The orchestrator's 1024 (C2) was spent on reasoning
+# every time, so every call fell back to document order.
+_ORCHESTRATOR_MAX_TOKENS_DEFAULT = 16384
+_CLASSIFY_MAX_TOKENS_DEFAULT = 16384
+
+
+def _classify_max_tokens() -> int:
+    try:
+        return max(1, int(os.getenv("KUSUDAEMON_CLASSIFY_MAX_TOKENS", str(_CLASSIFY_MAX_TOKENS_DEFAULT))))
+    except ValueError:
+        return _CLASSIFY_MAX_TOKENS_DEFAULT
+
 
 def _deadline_retry_budget() -> int:
     """Deadline retries allowed per ``complete_json`` for a non-verdict role."""
@@ -128,8 +166,14 @@ class ProviderError(RuntimeError):
 
 
 class ProviderDeadlineError(ProviderError):
-    """SSE stream wall-clock deadline exceeded (PLAN-REVIEW-READ-LOOP.md §R1)."""
-    pass
+    """SSE stream wall-clock deadline exceeded (PLAN-REVIEW-READ-LOOP.md §R1).
+
+    ``partial`` is whatever reasoning/content streamed before the deadline, so
+    a retry can carry it forward instead of re-deliberating from scratch."""
+
+    def __init__(self, message: str, partial: str = "") -> None:
+        super().__init__(message)
+        self.partial = partial
 
 
 class ProviderHTTPError(ProviderError):
@@ -335,6 +379,11 @@ class OpenAICompatibleProvider(RoleProviderBase):
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         base_messages: list[dict[str, str]] = list(messages)
+        # The one carry-forward block for a cut-off response (see
+        # ``_carry_forward``). Replaced, never appended, on each retry: the
+        # latest partial already builds on the previous one, so the prompt
+        # grows by at most one bounded block (§P3's no-growth concern).
+        resume: list[dict[str, str]] = []
         last_error = "empty response"
 
         def make_messages(with_format: bool) -> list[dict[str, str]]:
@@ -345,7 +394,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 # 170-240-token prose copy is redundant and gets dropped.
                 # Before that proof (and on any formatless fallback) the prose
                 # stays, because nothing else carries the schema then.
-                return list(base_messages)
+                return [*base_messages, *resume]
             return [
                 {
                     "role": "system",
@@ -355,12 +404,13 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     ),
                 },
                 *base_messages,
+                *resume,
             ]
 
         def _default_max_tokens(sch: dict[str, Any]) -> int:
             current_role = _scoped_role(self.role)
             if current_role == "orchestrator":
-                return 1024
+                return _ORCHESTRATOR_MAX_TOKENS_DEFAULT
             props = sch.get("properties") or {}
             if len(props) <= 4 and all(
                 isinstance(p, dict) and p.get("type") in ("string", "integer", "number", "boolean")
@@ -368,7 +418,10 @@ class OpenAICompatibleProvider(RoleProviderBase):
             ):
                 return 2048
             if "questions" in props or "objections" in props:
-                return 4096
+                # Classify / intake. 2026-09-26: 16384 (was 4096). This
+                # model deliberates 4-11k tokens over a LongGenBench goal
+                # before emitting JSON, so 4096 cut off nearly every call.
+                return _classify_max_tokens()
             return 8192
 
         effective_max_tokens = max_tokens if max_tokens is not None else _scoped_max_tokens()
@@ -415,6 +468,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
 
         validation_attempts = 0
         cap_escalations = 0
+        truncation_retries = 0
         deadline_retries = 0
         empty_retries = 0
         verdict_deadline_retried = False
@@ -423,8 +477,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
             curr_payload = make_payload(with_format=use_format)
             min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
             current_cap = cap["max_tokens"] or _default_max_tokens(schema)
-            if current_role == "orchestrator":
-                deadline_s = float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "60.0"))
+            if current_role == "orchestrator" and os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
+                deadline_s = float(os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"])
             elif current_role in ("reviewer", "triage"):
                 deadline_s = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
             else:
@@ -440,21 +494,12 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 if is_verdict_role and not verdict_deadline_retried:
                     verdict_deadline_retried = True
                     last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                    base_messages = [
-                        *base_messages,
-                        {
-                            "role": "user",
-                            "content": "Stop deliberating. Emit the JSON verdict now.",
-                        },
-                    ]
+                    resume[:] = _carry_forward(pde.partial, "Stop deliberating. Emit the JSON verdict now.")
                     continue
                 elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
                     deadline_retries += 1
                     last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                    base_messages = [
-                        *base_messages,
-                        {"role": "user", "content": _EMIT_NOW_NUDGE},
-                    ]
+                    resume[:] = _carry_forward(pde.partial, _EMIT_NOW_NUDGE)
                     continue
                 raise
             except ProviderHTTPError as exc:
@@ -480,21 +525,12 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     if is_verdict_role and not verdict_deadline_retried:
                         verdict_deadline_retried = True
                         last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                        base_messages = [
-                            *base_messages,
-                            {
-                                "role": "user",
-                                "content": "Stop deliberating. Emit the JSON verdict now.",
-                            },
-                        ]
+                        resume[:] = _carry_forward(pde.partial, "Stop deliberating. Emit the JSON verdict now.")
                         continue
                     elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
                         deadline_retries += 1
                         last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                        base_messages = [
-                            *base_messages,
-                            {"role": "user", "content": _EMIT_NOW_NUDGE},
-                        ]
+                        resume[:] = _carry_forward(pde.partial, _EMIT_NOW_NUDGE)
                         continue
                     raise
             message = _first_choice_message(raw)
@@ -519,32 +555,44 @@ class OpenAICompatibleProvider(RoleProviderBase):
             if parsed is None:
                 parsed, parse_error = _parse_json_object(content)
 
-            # PLAN-REVIEW-READ-LOOP.md §R1.4: verdict roles retry at same cap with emit prompt; planner/classify double cap
+            # PLAN-REVIEW-READ-LOOP.md §R1.4 / 2026-09-26: a response cut off at
+            # the ceiling is resumed, not restarted -- the retry carries the
+            # tail of its own reasoning forward plus an emit-now nudge. Verdict
+            # roles get one such retry at the same cap. Other roles first
+            # retry at the same cap; only a second cut-off doubles the cap
+            # (still carrying forward), up to _MAX_STRUCTURED_TOKENS.
+            partial = (message.get("reasoning_content") or "") + content
             if truncated:
                 if is_verdict_role:
                     if not verdict_deadline_retried:
                         verdict_deadline_retried = True
                         last_error = "response truncated at ceiling; retrying with emit instruction"
-                        base_messages = [
-                            *base_messages,
-                            {
-                                "role": "user",
-                                "content": "Stop deliberating. Emit the JSON verdict now.",
-                            },
-                        ]
+                        resume[:] = _carry_forward(partial, "Stop deliberating. Emit the JSON verdict now.")
                         continue
                     last_error = f"response hit output ceiling ({cap['max_tokens']} tokens, the maximum) before JSON was complete"
                     if parsed is None:
                         break
                 else:
+                    # Retry even when the scanner found an object: a cut-off
+                    # response's "JSON" can be a fragment quoted from its own
+                    # reasoning (§R2, 343-block seed 3's fabricated estimate).
                     previous = cap["max_tokens"] or _default_max_tokens(schema)
+                    if truncation_retries == 0:
+                        truncation_retries += 1
+                        last_error = (
+                            f"response hit the output ceiling ({previous} tokens) before the "
+                            "JSON was complete; resuming with emit instruction"
+                        )
+                        resume[:] = _carry_forward(partial, _EMIT_NOW_NUDGE)
+                        continue
                     cap["max_tokens"] = min(previous * 2, _MAX_STRUCTURED_TOKENS)
                     if cap["max_tokens"] != previous:
                         cap_escalations += 1
                         last_error = (
                             f"response hit the output ceiling ({previous} tokens) before the "
-                            f"JSON was complete; retrying at {cap['max_tokens']}"
+                            f"JSON was complete; resuming at {cap['max_tokens']}"
                         )
+                        resume[:] = _carry_forward(partial, _EMIT_NOW_NUDGE)
                         continue
                     last_error = (
                         f"response hit the output ceiling ({previous} tokens, the maximum) "
@@ -570,6 +618,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
             if validation_attempts > retries:
                 break
 
+            # The response that did finish supersedes any carry-forward block;
+            # keeping it would put stale reasoning after the reprompt below.
+            resume.clear()
             base_messages = [
                 *base_messages,
                 {"role": "assistant", "content": content},
@@ -801,8 +852,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
         effective_deadline = deadline_s
         if effective_deadline is None:
             cur_role = _scoped_role(self.role)
-            if cur_role == "orchestrator":
-                effective_deadline = float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "60.0"))
+            if cur_role == "orchestrator" and os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
+                effective_deadline = float(os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"])
             elif cur_role in ("reviewer", "triage"):
                 effective_deadline = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
             else:
@@ -863,7 +914,8 @@ def _consume_sse_lines(
     for line in lines:
         if deadline_s is not None and (time.time() - start_time) > deadline_s:
             raise ProviderDeadlineError(
-                f"SSE stream wall-clock deadline exceeded ({time.time() - start_time:.1f}s > {deadline_s:.1f}s)"
+                f"SSE stream wall-clock deadline exceeded ({time.time() - start_time:.1f}s > {deadline_s:.1f}s)",
+                partial="".join(reasoning_parts) + "".join(content_parts),
             )
         raw_parts.append(line)
         if not line.startswith("data:"):

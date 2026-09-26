@@ -188,8 +188,15 @@ class WallClockBrainstormTest(unittest.TestCase):
             self.assertTrue(any(e.get("type") == "scope_estimate_skipped" for e in events))
 
     def test_c2_orchestrator_caps(self) -> None:
-        self.assertEqual(orchestrator_max_tokens(), 1024)
-        self.assertEqual(orchestrator_deadline_s(), 60.0)
+        # 2026-09-26: C2's 1024/60s was spent on reasoning before any JSON
+        # (every call fell back). Cap 16384; deadline scales with it.
+        with patch.dict(os.environ, {}, clear=False):
+            for k in ("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", "KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "KUSUDAEMON_MIN_DECODE_TPS"):
+                os.environ.pop(k, None)
+            self.assertEqual(orchestrator_max_tokens(), 16384)
+            self.assertEqual(orchestrator_deadline_s(), max(300.0, 16384 / 15.0))
+            os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"] = "60"
+            self.assertEqual(orchestrator_deadline_s(), 60.0)
 
     def test_c3_reviewer_deadline_configured(self) -> None:
         provider = OpenAICompatibleProvider(api_key="fake", base_url="http://fake")

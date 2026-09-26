@@ -1471,6 +1471,10 @@ class RecursiveDriver:
                     materialize_units(self.run_dir, chunks, units)
                     build_chunk_index(self.run_dir, chunks, units)
                     save_spine(self.run_dir, units)
+                    # Read back by _phase_explore: a spine sliced out of the
+                    # goal's own requested output has no source to explore.
+                    if tier_path(self.run_dir).is_file():
+                        self._write_tier_record(spine_source="output")
                     self._log(
                         {
                             "node_id": "-",
@@ -1628,7 +1632,23 @@ class RecursiveDriver:
             return
         if tier in ("T2", "T3"):
             units = load_spine(self.run_dir)
-            if not self._plan_will_partition(units):
+            if self._read_tier_record().get("spine_source") == "output":
+                # 2026-09-26: the units are the harness's own slices of the
+                # output the goal asks for ("Menu Weeks 19 to 36"), not parts
+                # of a source. Probing them summarised a restated goal, took
+                # 13-21 min per LongGenBench run, and every finding came back
+                # empty (probe_finding_degraded).
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "phase_skipped",
+                        "phase": "structural_exploration",
+                        "reason": "spine synthesized from the goal's declared output; no source to explore",
+                    }
+                )
+            elif not self._plan_will_partition(units):
                 self._log(
                     {
                         "node_id": "-",
@@ -1742,6 +1762,11 @@ class RecursiveDriver:
                 f"concerns)."
             )
         unit_path = unit_input_path(self.run_dir, unit)
+        if unit_path != unit.id:
+            # The probe's cwd is the workspace, not the run dir, so a
+            # run-dir-relative path never resolved and the probe spent its
+            # turns globbing for it.
+            unit_path = str(self.run_dir / unit_path)
         return (
             f'This is the "{unit.label}" unit of a text corpus a planner is '
             f"about to partition into work items. Read {unit_path} and "

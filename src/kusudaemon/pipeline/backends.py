@@ -20,6 +20,7 @@ JSON output, so the dashboard's consumers see one vocabulary either way.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -220,10 +221,19 @@ def build_writer_adapter(
         # is entirely shell work; SWE-bench mostly shell+edit). Planner-built
         # code-dominant leaves take the same path explicitly.
         base_tools = DEFAULT_TOOL_ALLOWLIST
-    elif node and node.tools:
+    elif node and node.tools and os.getenv("KUSUDAEMON_LEAF_TEMPLATE_TOOLS") == "1":
         base_tools = tuple(node.tools)
     else:
-        base_tools = DEFAULT_TOOL_ALLOWLIST
+        # 2026-09-26: every writer gets the T1 toolset. A template's
+        # per-shape list used to narrow decomposed leaves (``_PROSE`` =
+        # read+save, no bash), so a leaf could only overwrite its file or
+        # exact-match edit it, while the T1 writer appends with bash
+        # heredocs (21/21 at >=99 % vs ~5/27 decomposed runs since 09-14).
+        # Template tools may still add to the set (e.g. "web"), never
+        # remove from it. ``KUSUDAEMON_LEAF_TEMPLATE_TOOLS=1`` restores the
+        # narrowing.
+        extra = tuple(tool for tool in (node.tools if node else ()) if tool not in DEFAULT_TOOL_ALLOWLIST)
+        base_tools = DEFAULT_TOOL_ALLOWLIST + extra
     wants_web = (
         always_grant_web_search
         or bool(node is not None and ("web" in node.tools or _node_has_web_probe(node, run_dir_path)))

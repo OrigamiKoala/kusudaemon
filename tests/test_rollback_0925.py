@@ -95,7 +95,13 @@ class StreamTransportDeadlineTest(unittest.TestCase):
     def test_no_deadline_resolves_per_role_instead_of_raising(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", None)
+            os.environ.pop("KUSUDAEMON_MIN_DECODE_TPS", None)
+            # 2026-09-26: no fixed 60 s; the orchestrator scales with its cap
+            # like every other non-verdict role (payload cap 1024 -> floor 300).
+            self.assertEqual(self._call(None, "orchestrator"), 300.0)
+            os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"] = "60"
             self.assertEqual(self._call(None, "orchestrator"), 60.0)
+            os.environ.pop("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", None)
 
     def test_explicit_deadline_is_passed_through(self) -> None:
         self.assertEqual(self._call(12.5, "reviewer"), 12.5)
@@ -119,7 +125,9 @@ class ReplayInvalidationTest(unittest.TestCase):
 
 
 class RollbackDefaultsTest(unittest.TestCase):
-    def test_many_unit_single_file_goal_decomposes_by_default(self) -> None:
+    def test_many_unit_single_file_goal_stays_single_node_by_default(self) -> None:
+        """2026-09-26: the output-capacity axis is opt-in again. Decomposed
+        leaves lost most cells it routed away from T1."""
         signals = Signals(
             breadth_markers=6, goal_tokens=436, named_paths=[], output_markers=1,
             output_targets=2, work_files=1, work_tokens=436,
@@ -130,6 +138,8 @@ class RollbackDefaultsTest(unittest.TestCase):
         )
         goal = "Write 100 floors, each about 150 words, into one document."
         with patch.dict(os.environ, _clean_env(), clear=True):
+            self.assertEqual(classify(signals, estimate, goal=goal), "T1")
+        with patch.dict(os.environ, {**_clean_env(), "KUSUDAEMON_TIER_OUTPUT_SIGNALS": "1"}, clear=True):
             self.assertEqual(classify(signals, estimate, goal=goal), "T2")
 
     def test_unit_budget_uses_pre_pacing_formula_by_default(self) -> None:
