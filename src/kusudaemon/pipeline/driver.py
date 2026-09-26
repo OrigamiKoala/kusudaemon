@@ -67,6 +67,7 @@ from ..v6.tiering import (
 )
 from ..v6.work_object import PLAN_MIN_WORKSPACE_TOKENS, WorkObject, survey_workspace, work_object_from_text, work_object_none
 from ..v7.split import handle_split_proposal, maybe_derive_split_parent
+from ..adapters.opencode_cleanup import delete_run_sessions, schedule_node_cleanup
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, ensure_node_trace_path, node_trace_path, events_path, glossary_path, manifest_path, node_artifact_path, spec_path
@@ -645,6 +646,12 @@ class RecursiveDriver:
                 if export_path is not None:
                     entry["export_path"] = export_path
                 self._log(entry)
+                # 2026-09-26: the run is finished, so every OpenCode session it
+                # captured (probes and the pilot included) is disposable.
+                try:
+                    await delete_run_sessions(self.run_dir, self._log)
+                except Exception:
+                    pass
 
                 try:
                     traces_dir = self.run_dir / "traces"
@@ -2316,6 +2323,14 @@ class RecursiveDriver:
             from ..v1.worktree import WorktreeManager
             worktree_mgr = WorktreeManager(self._writer_workspace_path(), runs_dir=self.run_dir)
         admission_controller = getattr(self.provider, "admission_controller", None)
+
+        def on_node_passed(run_dir, node, tree, tree_path_, log) -> None:
+            if enable_split:
+                maybe_derive_split_parent(run_dir, node, tree, tree_path_, log)
+            # 2026-09-26: a passed node's OpenCode session is disposable, the
+            # same rule as scratch/ (adapters/opencode_cleanup.py).
+            schedule_node_cleanup(run_dir, log.append, node.id)
+
         try:
             await run_round_loop(
                 self.run_dir,
@@ -2338,7 +2353,7 @@ class RecursiveDriver:
                 # PLAN.md §C2: a config, not a redesign — see RunOptions.
                 max_parallel=effective_max_parallel,
                 split_handler=handle_split_proposal if enable_split else None,
-                on_node_passed=maybe_derive_split_parent if enable_split else None,
+                on_node_passed=on_node_passed,
                 # PLAN-AUDIT.md §E15: the exact same halt.flag check
                 # ``_run_phase``'s own phase-boundary halt already reads
                 # (``self._halted``) — not a second mechanism — so a halt

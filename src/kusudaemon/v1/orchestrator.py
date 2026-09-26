@@ -273,14 +273,14 @@ def orchestrator_max_tokens() -> int:
 
 def orchestrator_deadline_s() -> float:
     """§L.2: how long a free slot may wait on one decision before the harness
-    dispatches in document order instead. Defaults to the same
-    ``max(300, cap / KUSUDAEMON_MIN_DECODE_TPS)`` every other non-verdict
-    role gets, so the 16384 cap is reachable (C2's fixed 60 s cut the call off
-    after ~1-2k tokens). ``KUSUDAEMON_ORCHESTRATOR_DEADLINE_S`` overrides."""
-    if _os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
-        return _env_float("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", 60.0)
-    min_tps = _env_float("KUSUDAEMON_MIN_DECODE_TPS", 15.0) or 15.0
-    return max(300.0, orchestrator_max_tokens() / min_tps)
+    dispatches in document order instead. 90 s by default (2026-09-26; the
+    cap-scaled ~1092 s let one decision take 611 s).
+    ``KUSUDAEMON_ORCHESTRATOR_DEADLINE_S`` overrides; ``<= 0`` waits forever.
+    The provider enforces the same number on the whole call, retries
+    included."""
+    from .provider import orchestrator_decision_deadline_s
+
+    return orchestrator_decision_deadline_s()
 
 
 def orchestrator_max_listed() -> int:
@@ -574,7 +574,11 @@ def parse_orchestrator_decision(
     named_waits = [str(x) for x in (payload.get("wait_on") or [])]
 
     def first_ready() -> OrchestratorDecision:
-        return OrchestratorDecision("dispatch", ready[:1], [], reason, corrections)
+        # §L.6 applies here too: a corrected answer fills every free slot in
+        # document order. Filling one left the other slots idle until some
+        # node finished, because nothing else re-asks the orchestrator
+        # (200-menu-week s1, 2026-09-26: 2 of 3 slots idle for 21 minutes).
+        return OrchestratorDecision("dispatch", ready[:free_slots], [], reason, corrections)
 
     if action == "wait":
         if payload.get("node_ids"):
@@ -584,7 +588,7 @@ def parse_orchestrator_decision(
             if ready and free_slots > 0:
                 corrections.append(
                     "wait with nothing running would never wake; harness dispatched "
-                    f"{ready[0]!r}"
+                    f"{ready[:free_slots]!r}"
                 )
                 return first_ready()
             corrections.append("wait with nothing running and nothing dispatchable")
@@ -614,7 +618,7 @@ def parse_orchestrator_decision(
             return OrchestratorDecision("wait", [], list(in_flight), reason, corrections)
         if ready and free_slots > 0:
             corrections.append(
-                f"dispatch named nothing dispatchable and nothing is running; harness dispatched {ready[0]!r}"
+                f"dispatch named nothing dispatchable and nothing is running; harness dispatched {ready[:free_slots]!r}"
             )
             return first_ready()
         return OrchestratorDecision("wait", [], [], reason, corrections)

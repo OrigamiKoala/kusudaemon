@@ -21,8 +21,10 @@ Two things this module owns:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import re
 import random
 import threading
 import time
@@ -133,6 +135,23 @@ def _classify_max_tokens() -> int:
         return _CLASSIFY_MAX_TOKENS_DEFAULT
 
 
+_ORCHESTRATOR_DEADLINE_DEFAULT_S = 90.0
+
+
+def orchestrator_decision_deadline_s() -> float:
+    """Wall clock for one whole orchestrator decision, retries included.
+
+    2026-09-26: back to a short default (the cap-scaled ~1092 s let one
+    decision take 611 s). The round loop waits this long, and
+    ``complete_json`` spends at most this long, so a call it gives up on does
+    not keep running and block the next decision. ``<= 0`` means no deadline.
+    """
+    try:
+        return float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", str(_ORCHESTRATOR_DEADLINE_DEFAULT_S)))
+    except ValueError:
+        return _ORCHESTRATOR_DEADLINE_DEFAULT_S
+
+
 def _deadline_retry_budget() -> int:
     """Deadline retries allowed per ``complete_json`` for a non-verdict role."""
     try:
@@ -174,6 +193,73 @@ class ProviderDeadlineError(ProviderError):
     def __init__(self, message: str, partial: str = "") -> None:
         super().__init__(message)
         self.partial = partial
+
+
+class ProviderReasoningBudgetError(ProviderDeadlineError):
+    """A role call's streamed reasoning passed its budget; ``partial`` holds it."""
+
+
+# 2026-09-26: per-role reasoning control. Role calls on this reasoning model
+# spent 1-8k tokens choosing among <= 3 nodes (orchestrator) and 4-11k before a
+# ~100-token estimate (classify), at 6-40 tok/s on NIM, and nothing in the
+# request limited it. ``KUSUDAEMON_REASONING_<ROLE>`` takes ``on``, ``off``
+# and ``budget:N``, combined with commas (``off,budget:512``):
+#   off       -- send ``KUSUDAEMON_REASONING_OFF_PAYLOAD`` (default: the
+#                ``chat_template_kwargs.enable_thinking=false`` switch that
+#                vLLM/NIM chat templates read). Unverified against this
+#                endpoint; a 400 drops it for the provider's lifetime, and an
+#                endpoint that ignores it costs nothing.
+#   budget:N  -- client side and model-agnostic: once ~N tokens of reasoning
+#                have streamed, the call is cut and resumed with its own
+#                reasoning carried forward plus the emit-now nudge.
+_REASONING_DEFAULTS = {"orchestrator": "off,budget:512", "classify": "budget:3072"}
+_REASONING_OFF_PAYLOAD_DEFAULT: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@dataclass(frozen=True)
+class ReasoningSettings:
+    thinking_off: bool = False
+    budget_tokens: int | None = None
+
+
+def role_reasoning(role: str | None) -> ReasoningSettings:
+    key = re.sub(r"[^A-Za-z0-9]", "_", role or "").upper()
+    raw = os.getenv(f"KUSUDAEMON_REASONING_{key}") if key else None
+    if raw is None:
+        raw = _REASONING_DEFAULTS.get(role or "", "on")
+    off, budget = False, None
+    for token in re.split(r"[,+\s]+", raw.strip().lower()):
+        if token == "off":
+            off = True
+        elif token == "on":
+            off = False
+        elif token.startswith("budget:"):
+            try:
+                n = int(token.split(":", 1)[1])
+            except ValueError:
+                continue
+            budget = n if n > 0 else None
+    return ReasoningSettings(thinking_off=off, budget_tokens=budget)
+
+
+def _reasoning_off_payload() -> dict[str, Any]:
+    raw = os.getenv("KUSUDAEMON_REASONING_OFF_PAYLOAD")
+    if raw:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, dict):
+            return value
+    return copy.deepcopy(_REASONING_OFF_PAYLOAD_DEFAULT)
+
+
+def _reasoning_retry_budget() -> int:
+    """Budget cuts resumed per ``complete_json``; the next cut raises."""
+    try:
+        return max(0, int(os.getenv("KUSUDAEMON_REASONING_BUDGET_RETRIES", "1")))
+    except ValueError:
+        return 1
 
 
 class ProviderHTTPError(ProviderError):
@@ -292,6 +378,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # HTTP request first, a literal 2× on request count for the entire
         # Direct column.
         self._response_format_ok: bool | None = None
+        # 2026-09-26: ``False`` once the endpoint 400s a request carrying the
+        # reasoning-off switch; later calls stop sending it.
+        self._reasoning_switch_ok: bool | None = None
         # A3-2: `True` once some complete_json call returned schema-valid
         # JSON under `response_format` — the endpoint has proven it enforces
         # the schema, so later calls can drop the prose schema copy. `None`
@@ -449,6 +538,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
 
             if streaming:
                 payload["stream_options"] = {"include_usage": True}
+            if reasoning.thinking_off and self._reasoning_switch_ok is not False:
+                payload.update(_reasoning_off_payload())
             if with_format:
                 payload["response_format"] = {
                     "type": "json_schema",
@@ -473,36 +564,90 @@ class OpenAICompatibleProvider(RoleProviderBase):
         empty_retries = 0
         verdict_deadline_retried = False
 
+        orchestrator_budget = (
+            orchestrator_decision_deadline_s() if current_role == "orchestrator" else 0.0
+        )
+        call_started = time.monotonic()
+        reasoning = role_reasoning(current_role)
+        budget_retries = 0
+        emit_nudge = "Stop deliberating. Emit the JSON verdict now." if is_verdict_role else _EMIT_NOW_NUDGE
+
+        def attempt_sink() -> Callable[[str], None] | None:
+            """``on_reasoning`` for one attempt, enforcing the reasoning budget."""
+            if not (streaming and reasoning.budget_tokens):
+                return on_reasoning
+            limit_chars = reasoning.budget_tokens * 4
+            seen: list[str] = []
+            count = [0]
+
+            def sink(text: str) -> None:
+                if on_reasoning is not None:
+                    on_reasoning(text)
+                seen.append(text)
+                count[0] += len(text)
+                if count[0] > limit_chars:
+                    raise ProviderReasoningBudgetError(
+                        f"reasoning passed its budget (~{reasoning.budget_tokens} tokens)",
+                        partial="".join(seen),
+                    )
+
+            return sink
+
+        def resume_after_cut(pde: ProviderDeadlineError) -> bool:
+            """Carry a cut-off attempt forward; False means give up and raise."""
+            nonlocal budget_retries, deadline_retries, verdict_deadline_retried, last_error
+            if isinstance(pde, ProviderReasoningBudgetError):
+                if budget_retries >= _reasoning_retry_budget():
+                    return False
+                budget_retries += 1
+            elif is_verdict_role:
+                if verdict_deadline_retried:
+                    return False
+                verdict_deadline_retried = True
+            elif deadline_retries < _deadline_retry_budget():
+                deadline_retries += 1
+            else:
+                return False
+            last_error = f"{pde}; retrying with emit instruction"
+            resume[:] = _carry_forward(pde.partial, emit_nudge)
+            return True
+
         while validation_attempts <= retries:
             curr_payload = make_payload(with_format=use_format)
             min_tps = float(os.getenv("KUSUDAEMON_MIN_DECODE_TPS", "15"))
             current_cap = cap["max_tokens"] or _default_max_tokens(schema)
-            if current_role == "orchestrator" and os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
-                deadline_s = float(os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"])
+            if orchestrator_budget > 0:
+                # One budget for the whole decision: every retry below gets
+                # only what is left of it.
+                deadline_s = orchestrator_budget - (time.monotonic() - call_started)
+                if deadline_s <= 0:
+                    raise ProviderDeadlineError(
+                        f"orchestrator decision budget ({orchestrator_budget:.0f}s) spent; last: {last_error}"
+                    )
             elif current_role in ("reviewer", "triage"):
                 deadline_s = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
             else:
                 deadline_s = max(300.0, current_cap / min_tps)
+            sent_switch = reasoning.thinking_off and self._reasoning_switch_ok is not False
             try:
                 raw = self._call(
                     curr_payload,
                     stream=streaming,
-                    on_reasoning=on_reasoning,
+                    on_reasoning=attempt_sink(),
                     deadline_s=deadline_s,
                 )
             except ProviderDeadlineError as pde:
-                if is_verdict_role and not verdict_deadline_retried:
-                    verdict_deadline_retried = True
-                    last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                    resume[:] = _carry_forward(pde.partial, "Stop deliberating. Emit the JSON verdict now.")
-                    continue
-                elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
-                    deadline_retries += 1
-                    last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                    resume[:] = _carry_forward(pde.partial, _EMIT_NOW_NUDGE)
+                if resume_after_cut(pde):
                     continue
                 raise
             except ProviderHTTPError as exc:
+                if exc.status == 400 and sent_switch:
+                    # The reasoning switch is the newer, unverified field, so
+                    # it is dropped first; a second 400 reaches the
+                    # response_format fallback below.
+                    self._reasoning_switch_ok = False
+                    last_error = f"endpoint rejected the reasoning switch: {exc}"
+                    continue
                 # §12's fallback must be reachable when the *endpoint* (not
                 # the model) rejects structured output: some OpenAI-compatible
                 # hosts 400 on `response_format` / `strict`. The system prompt
@@ -518,19 +663,11 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     raw = self._call(
                         curr_payload,
                         stream=streaming,
-                        on_reasoning=on_reasoning,
+                        on_reasoning=attempt_sink(),
                         deadline_s=deadline_s,
                     )
                 except ProviderDeadlineError as pde:
-                    if is_verdict_role and not verdict_deadline_retried:
-                        verdict_deadline_retried = True
-                        last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                        resume[:] = _carry_forward(pde.partial, "Stop deliberating. Emit the JSON verdict now.")
-                        continue
-                    elif not is_verdict_role and deadline_retries < _deadline_retry_budget():
-                        deadline_retries += 1
-                        last_error = f"response deadline exceeded ({pde}); retrying with emit instruction"
-                        resume[:] = _carry_forward(pde.partial, _EMIT_NOW_NUDGE)
+                    if resume_after_cut(pde):
                         continue
                     raise
             message = _first_choice_message(raw)
@@ -546,7 +683,15 @@ class OpenAICompatibleProvider(RoleProviderBase):
             comp_tokens = int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0
             if comp_tokens <= 1 and not content.strip() and empty_retries < 3:
                 empty_retries += 1
-                last_error = f"transient empty completion ({comp_tokens} tokens)"
+                # 2026-09-26: a stream that ends with reasoning and no answer
+                # (classify and the orchestrator, ~600 s in, cut mid-sentence)
+                # is resumed from that reasoning, not restarted from nothing.
+                partial_reasoning = str(message.get("reasoning_content") or "")
+                if partial_reasoning.strip():
+                    last_error = "stream ended after reasoning with no answer; resuming with emit instruction"
+                    resume[:] = _carry_forward(partial_reasoning, emit_nudge)
+                else:
+                    last_error = f"transient empty completion ({comp_tokens} tokens)"
                 continue
 
             # §P3: before blaming the JSON, ask whether there was room for any.
@@ -852,8 +997,8 @@ class OpenAICompatibleProvider(RoleProviderBase):
         effective_deadline = deadline_s
         if effective_deadline is None:
             cur_role = _scoped_role(self.role)
-            if cur_role == "orchestrator" and os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"):
-                effective_deadline = float(os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"])
+            if cur_role == "orchestrator" and orchestrator_decision_deadline_s() > 0:
+                effective_deadline = orchestrator_decision_deadline_s()
             elif cur_role in ("reviewer", "triage"):
                 effective_deadline = float(os.getenv("KUSUDAEMON_REVIEWER_DEADLINE_S", "180.0"))
             else:
@@ -861,7 +1006,12 @@ class OpenAICompatibleProvider(RoleProviderBase):
                 cap_tok = payload.get("max_tokens") or 4096
                 effective_deadline = max(300.0, cap_tok / min_tps)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            # The deadline is only checked when a line arrives, so a stalled
+            # stream also needs a socket read timeout no longer than it.
+            read_timeout = self.timeout
+            if effective_deadline and effective_deadline > 0:
+                read_timeout = min(read_timeout or effective_deadline, effective_deadline)
+            with urllib.request.urlopen(request, timeout=read_timeout) as response:
                 lines = (line.decode("utf-8", errors="replace").rstrip("\n") for line in response)
                 return _consume_sse_lines(lines, on_reasoning, deadline_s=effective_deadline, t0=t0)
         except ProviderDeadlineError:

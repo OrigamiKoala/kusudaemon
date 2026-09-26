@@ -261,6 +261,17 @@ def _artifact_instruction(
             "typographic character you cannot reproduce byte-for-byte later makes "
             "every edit that targets that line fail (PLAN-SWEEP-REPAIR.md \u00a7F6)."
         )
+        # 2026-09-26: with bash, a leaf ran `wc -w` on unit 1 and rewrote it
+        # toward "200-220 words" (292 -> 264 -> ...) until its context
+        # degenerated; the episode timed out with 1 of 18 units written.
+        length_clause = (
+            "A per-unit length in the goal (for example \"200-220 words\" per "
+            "entry) is a target, not an exact requirement: write each unit once at "
+            "about that length and move on to the next. Do not count a finished "
+            "unit's words and rewrite it to land inside the range. Every rewrite "
+            "spends time the remaining units need, and a missing unit costs far "
+            "more than one that runs a little long or short.\n"
+        )
         if unit_stub_layout:
             # armc-wall-clock-brainstorm §A1: one pre-created file per unit
             # (``uNNN.md`` = unit NNN). A per-unit ``write`` lands in its own
@@ -299,6 +310,7 @@ def _artifact_instruction(
                 "to the next; never put one unit's content into another unit's file.\n"
                 f"{todo}"
                 f"{filled_note}"
+                + length_clause
                 + ascii_clause
             )
         elif existing_parts:
@@ -320,6 +332,7 @@ def _artifact_instruction(
                 "something already written, make a targeted edit inside the one "
                 "part that contains it. Never rewrite a whole part to change "
                 "some of it.\n"
+                + length_clause
                 + ascii_clause
             )
         else:
@@ -341,6 +354,7 @@ def _artifact_instruction(
                 "Part files are preferred for anything long: each part is written "
                 "once and never rewritten, so no single write can carry more than "
                 "one part's worth of content.\n"
+                + length_clause
                 + ascii_clause
             )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:

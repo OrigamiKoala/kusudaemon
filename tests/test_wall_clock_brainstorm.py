@@ -188,13 +188,14 @@ class WallClockBrainstormTest(unittest.TestCase):
             self.assertTrue(any(e.get("type") == "scope_estimate_skipped" for e in events))
 
     def test_c2_orchestrator_caps(self) -> None:
-        # 2026-09-26: C2's 1024/60s was spent on reasoning before any JSON
-        # (every call fell back). Cap 16384; deadline scales with it.
+        # 2026-09-26: C2's 1024 was spent on reasoning before any JSON, so the
+        # cap is 16384. The deadline is a fixed 90 s for the whole decision
+        # (the cap-scaled ~1092 s let one decision take 611 s).
         with patch.dict(os.environ, {}, clear=False):
             for k in ("KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS", "KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "KUSUDAEMON_MIN_DECODE_TPS"):
                 os.environ.pop(k, None)
             self.assertEqual(orchestrator_max_tokens(), 16384)
-            self.assertEqual(orchestrator_deadline_s(), max(300.0, 16384 / 15.0))
+            self.assertEqual(orchestrator_deadline_s(), 90.0)
             os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"] = "60"
             self.assertEqual(orchestrator_deadline_s(), 60.0)
 

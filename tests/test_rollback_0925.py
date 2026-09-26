@@ -96,9 +96,9 @@ class StreamTransportDeadlineTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", None)
             os.environ.pop("KUSUDAEMON_MIN_DECODE_TPS", None)
-            # 2026-09-26: no fixed 60 s; the orchestrator scales with its cap
-            # like every other non-verdict role (payload cap 1024 -> floor 300).
-            self.assertEqual(self._call(None, "orchestrator"), 300.0)
+            # 2026-09-26 (later): the orchestrator's whole decision gets a
+            # fixed 90 s, not the cap-scaled deadline other roles get.
+            self.assertEqual(self._call(None, "orchestrator"), 90.0)
             os.environ["KUSUDAEMON_ORCHESTRATOR_DEADLINE_S"] = "60"
             self.assertEqual(self._call(None, "orchestrator"), 60.0)
             os.environ.pop("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", None)

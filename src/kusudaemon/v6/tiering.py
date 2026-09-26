@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from ..v1.gates import estimate_tokens
+from ..v1.provider import call_scope
 from ..roles.protocol import RoleProvider
 from ..v2.intake import QuestionSet
 from .work_object import WorkObject, iter_workspace_paths
@@ -263,7 +264,10 @@ def estimate_scope(
             "content": f"Goal: {goal}\n\nWork object digest:\n{_work_digest(work)}",
         },
     ]
-    payload = provider.complete_json(messages, ESTIMATE_SCHEMA, on_reasoning=on_reasoning)
+    # 2026-09-26: stamped so cost rows say "classify" (they said "unknown")
+    # and ``KUSUDAEMON_REASONING_CLASSIFY`` applies.
+    with call_scope(role="classify"):
+        payload = provider.complete_json(messages, ESTIMATE_SCHEMA, on_reasoning=on_reasoning)
     return ScopeEstimate(
         files_touched=str(payload.get("files_touched", "unknown")),
         artifacts=int(payload.get("artifacts", 1)),
@@ -374,9 +378,10 @@ def estimate_scope_full(
             "content": f"Goal: {goal}\n\nWork object digest:\n{_work_digest(work)}",
         },
     ]
-    payload = provider.complete_json(
-        messages, FULL_SCOPE_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
-    )
+    with call_scope(role="classify"):
+        payload = provider.complete_json(
+            messages, FULL_SCOPE_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
+        )
     questions = tuple(
         IntakeQuestion(
             id=str(item.get("id") or f"q{index + 1}"),

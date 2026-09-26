@@ -144,6 +144,46 @@ SplitHandler = Callable[[Path, TaskNode, TaskTree, Path, EventLog], bool]
 NodePassedHook = Callable[[Path, TaskNode, TaskTree, Path, EventLog], None]
 
 
+class _OrchestratorReasoningTrace:
+    """Streamed orchestrator reasoning -> ``orchestrator/reasoning-NNN.txt``.
+
+    2026-09-26: the orchestrator's reasoning was never recorded, so a call that
+    ran 600 s left no trace of what it deliberated. The file is opened on the
+    first chunk (no file when the model streams no reasoning) and flushed every
+    ~4 KB, so a call the round loop abandoned can still be read while it runs.
+    A trace failure never fails the call.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fh: Any = None
+        self._pending = 0
+        self._broken = False
+
+    def write(self, text: str) -> None:
+        if self._broken or not text:
+            return
+        try:
+            if self._fh is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._fh = self.path.open("a", encoding="utf-8")
+            self._fh.write(text)
+            self._pending += len(text)
+            if self._pending >= 4096:
+                self._fh.flush()
+                self._pending = 0
+        except OSError:
+            self._broken = True
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+
 def _wants_unit_stubs(node: TaskNode) -> bool:
     """Whether ``node`` gets per-unit stub files (armc-wall-clock-brainstorm
     §A1). Decomposed leaves only: a T1 single node has bash and appends to
@@ -1104,20 +1144,32 @@ async def run_round_loop(
                                     )
                                 break
                             messages = None
-                            forced_dispatch_id: str | None = None
+                            forced_dispatch_ids: list[str] = []
+                            forced_reason = ""
                             if ready and free > 0:
-                                if (
-                                    len(ready) == 1
-                                    and free == 1
-                                    and not running
-                                    and os.getenv("KUSUDAEMON_ORCHESTRATOR_SKIP_FORCED", "1") != "0"
-                                ):
+                                skip_forced = os.getenv("KUSUDAEMON_ORCHESTRATOR_SKIP_FORCED", "1") != "0"
+                                if skip_forced and len(ready) == 1 and free == 1 and not running:
                                     # PLAN-REVIEW-READ-LOOP.md §O3 (operator decision
                                     # 2026-09-16): forced choice — exactly one
                                     # dispatchable node, one free slot, nothing in
                                     # flight. The only possible answer is that node,
                                     # so no model call is spent.
-                                    forced_dispatch_id = ready[0]
+                                    forced_dispatch_ids = [ready[0]]
+                                    forced_reason = "forced choice: single dispatchable node and slot"
+                                elif (
+                                    skip_forced
+                                    and os.getenv("KUSUDAEMON_ORCHESTRATOR_SKIP_FITS", "1") != "0"
+                                    and len(ready) <= free
+                                    and all(tree.nodes[i].attempts == 0 for i in ready)
+                                ):
+                                    # 2026-09-26: every dispatchable node is fresh and
+                                    # fits a free slot, so there is nothing to order
+                                    # and no retry to judge; the only other answer
+                                    # is holding fresh work back for a dependency
+                                    # nobody declared. No model call is spent.
+                                    # ``KUSUDAEMON_ORCHESTRATOR_SKIP_FITS=0`` asks anyway.
+                                    forced_dispatch_ids = list(ready)
+                                    forced_reason = "forced choice: every dispatchable node fits a free slot"
                                 else:
                                     now = time.monotonic()
                                     previous = None
@@ -1141,8 +1193,8 @@ async def run_round_loop(
                                         previous_decision=previous,
                                     )
                                     messages = RubricOrch
-                        if forced_dispatch_id is not None:
-                            node = tree.nodes[forced_dispatch_id]
+                        if forced_dispatch_ids:
+                            forced_nodes = [tree.nodes[i] for i in forced_dispatch_ids]
                             round_index = first_round + calls
                             calls += 1
                             told = events
@@ -1151,40 +1203,44 @@ async def run_round_loop(
                             last_decision = {
                                 "round": round_index,
                                 "action": "dispatch",
-                                "node_ids": [node.id],
+                                "node_ids": list(forced_dispatch_ids),
                                 "wait_on": [],
-                                "reason": "forced choice: single dispatchable node and slot",
+                                "reason": forced_reason,
                                 "corrections": [],
                                 "ts": time.time(),
                             }
                             log.append(
                                 {
-                                    "node_id": node.id,
+                                    "node_id": forced_dispatch_ids[0] if len(forced_dispatch_ids) == 1 else "-",
+                                    "node_ids": list(forced_dispatch_ids),
                                     "role": "orchestrator",
                                     "round": round_index,
                                     "type": "orchestrator_call_skipped",
-                                    "reason": "forced choice: single dispatchable node and slot",
+                                    "reason": forced_reason,
                                     "events": [
                                         {"node_id": e.node_id, "outcome": e.outcome, "attempts": e.attempts}
                                         for e in told
                                     ],
                                 }
                             )
-                            node.status = "dispatched"
+                            for node in forced_nodes:
+                                node.status = "dispatched"
                             await _save_tree_locked(tree, tree_path, tree_lock)
-                            log.append(
-                                {
-                                    "node_id": node.id,
-                                    "role": "orchestrator",
-                                    "round": round_index,
-                                    "type": "node_dispatch_decided",
-                                    "reason": "forced choice: single dispatchable node and slot",
-                                    "redispatch": node.attempts > 0,
-                                }
-                            )
-                            if node.attempts == 0:
+                            for node in forced_nodes:
+                                log.append(
+                                    {
+                                        "node_id": node.id,
+                                        "role": "orchestrator",
+                                        "round": round_index,
+                                        "type": "node_dispatch_decided",
+                                        "reason": forced_reason,
+                                        "redispatch": node.attempts > 0,
+                                    }
+                                )
+                            if any(node.attempts == 0 for node in forced_nodes):
                                 fresh_rounds += 1
-                            start_job(node, "dispatch")
+                            for node in forced_nodes:
+                                start_job(node, "dispatch")
                             if fresh_rounds >= max_rounds:
                                 no_new_work = True
                         elif messages is None:
@@ -1207,12 +1263,21 @@ async def run_round_loop(
                                 abandoned = None
                                 cap_tokens = orchestrator_max_tokens()
 
+                                trace = _OrchestratorReasoningTrace(
+                                    Path(run_dir) / "orchestrator" / f"reasoning-{round_index:03d}.txt"
+                                )
+
                                 def _call(msgs: list[dict[str, str]] = messages) -> Any:
                                     # §L.2/§L.7: bounded output, and cost stamped
                                     # "orchestrator" — thread-local, so the shared
                                     # provider's other callers are unaffected.
-                                    with call_scope(role="orchestrator", max_tokens=cap_tokens):
-                                        return provider.complete_json(msgs, ORCHESTRATOR_SCHEMA, streaming=True)
+                                    try:
+                                        with call_scope(role="orchestrator", max_tokens=cap_tokens):
+                                            return provider.complete_json(
+                                                msgs, ORCHESTRATOR_SCHEMA, streaming=True, on_reasoning=trace.write
+                                            )
+                                    finally:
+                                        trace.close()
 
                                 call_task = asyncio.ensure_future(asyncio.to_thread(_call))
                                 call_task.add_done_callback(
@@ -1220,7 +1285,13 @@ async def run_round_loop(
                                 )
                                 try:
                                     if deadline > 0:
-                                        payload = await asyncio.wait_for(asyncio.shield(call_task), deadline)
+                                        # A few seconds past the provider's own
+                                        # budget, so its deadline error (not an
+                                        # abandoned thread) is what normally ends
+                                        # the call.
+                                        payload = await asyncio.wait_for(
+                                            asyncio.shield(call_task), deadline + min(5.0, deadline * 0.1)
+                                        )
                                     else:
                                         payload = await call_task
                                 except asyncio.TimeoutError:

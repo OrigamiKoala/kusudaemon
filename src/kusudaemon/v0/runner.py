@@ -248,10 +248,20 @@ async def run_node(
     parts_d = Path(run_dir) / "out" / node_id
     has_unit_stubs = parts_d.is_dir() and any(parts_d.glob("u*.md"))
     if session is not None and session.get("session_id"):
+        # 2026-09-26: a passed node's OpenCode session may have been deleted
+        # (adapters/opencode_cleanup.py); a node reopened later starts fresh.
+        session_deleted = str(session.get("session_id")) in {
+            str(e.get("session_id")) for e in events if e.get("type") == "opencode_session_deleted"
+        }
         # armc-wall-clock-brainstorm §A4: On retries of unit-based leaves,
         # dispatch a fresh session briefed only on the missing ordinals
         # rather than resuming a degenerated session.
-        if supports_resume and not has_unit_stubs and os.getenv("KUSUDAEMON_WRITER_FRESH_RETRY", "0") != "1":
+        if (
+            supports_resume
+            and not has_unit_stubs
+            and not session_deleted
+            and os.getenv("KUSUDAEMON_WRITER_FRESH_RETRY", "0") != "1"
+        ):
             resume_session_id = session.get("session_id")
             dispatch_reason = "resumed_session"
             log.append(
@@ -266,7 +276,10 @@ async def run_node(
         else:
             # A session id was captured last time but fresh redispatch or
             # unit continuation requested / resume unsupported.
-            dispatch_reason = "resume_unsupported" if not supports_resume else "fresh_session_continuation"
+            if session_deleted:
+                dispatch_reason = "session_deleted"
+            else:
+                dispatch_reason = "resume_unsupported" if not supports_resume else "fresh_session_continuation"
             log.append(
                 {
                     "node_id": node_id,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import os
 import sys
 import tempfile
 import time
@@ -167,6 +168,15 @@ def wait(*ids: str, reason: str = "hold") -> dict[str, Any]:
 
 
 class EventDrivenLoopTest(unittest.TestCase):
+    # These exercise the orchestrator's own choices (wait, reorder, retry)
+    # with fresh nodes that fit their slots, which the 2026-09-26 fits-skip
+    # would otherwise decide without a call.
+    def setUp(self) -> None:
+        os.environ["KUSUDAEMON_ORCHESTRATOR_SKIP_FITS"] = "0"
+
+    def tearDown(self) -> None:
+        os.environ.pop("KUSUDAEMON_ORCHESTRATOR_SKIP_FITS", None)
+
     def test_choice_is_used_and_forced_choice_skips_call(self) -> None:
         # It picks the LAST dispatchable node each time: reverse document order.
         # The first two decisions each have ≥2 dispatchable nodes (real calls);
@@ -291,9 +301,15 @@ class EventDrivenLoopTest(unittest.TestCase):
 class RegressionFixesTest(unittest.TestCase):
     """PLAN-SWEEP-REPAIR.md §L.2-§L.7."""
 
+    def setUp(self) -> None:
+        os.environ["KUSUDAEMON_ORCHESTRATOR_SKIP_FITS"] = "0"
+
     def tearDown(self) -> None:
-        for name in ("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", "KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS"):
-            import os
+        for name in (
+            "KUSUDAEMON_ORCHESTRATOR_DEADLINE_S",
+            "KUSUDAEMON_ORCHESTRATOR_MAX_TOKENS",
+            "KUSUDAEMON_ORCHESTRATOR_SKIP_FITS",
+        ):
             os.environ.pop(name, None)
 
     def test_schema_is_strict_mode_valid(self) -> None:
