@@ -188,13 +188,20 @@ class ScopeEstimate:
     work_kind: str = "unknown"
 
 
+# 2026-09-26: was 50. LongGenBench goals ask for 52 weekly menus or 100
+# floors, so the model had to reconcile "the goal says 52" with "the schema
+# says at most 50", and one classify call collapsed into "0. 0. 0. ..." while
+# deliberating exactly that. Tiering only asks whether the count is 1 or
+# above 8, so a large bound changes no tier.
+ARTIFACTS_MAX = 1000
+
 ESTIMATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["files_touched", "artifacts", "answerable_without_exploration"],
     "additionalProperties": False,
     "properties": {
         "files_touched": {"type": "string", "enum": list(FILES_TOUCHED_VALUES)},
-        "artifacts": {"type": "integer", "minimum": 1, "maximum": 50},
+        "artifacts": {"type": "integer", "minimum": 1, "maximum": ARTIFACTS_MAX},
         "answerable_without_exploration": {"type": "boolean"},
         "work_kind": {"type": "string", "enum": list(WORK_KIND_VALUES)},
         "ambiguities": {
@@ -215,7 +222,7 @@ _ESTIMATE_SYSTEM_PROMPT = (
     "§A4). You never see file contents -- only the goal and a digest of the "
     "target work object (directory names, token counts, a truncated, "
     "content-free file listing). Estimate: how many distinct artifacts the "
-    "goal implies producing; whether it plausibly touches exactly one file, "
+    "goal implies producing (the full count, however large); whether it plausibly touches exactly one file, "
     "a few, many, or you cannot tell (files_touched); whether you could "
     "answer it correctly right now without exploring the work object "
     "further (answerable_without_exploration); what kind of work this "
@@ -299,7 +306,7 @@ FULL_SCOPE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "files_touched": {"type": "string", "enum": list(FILES_TOUCHED_VALUES)},
-        "artifacts": {"type": "integer", "minimum": 1, "maximum": 50},
+        "artifacts": {"type": "integer", "minimum": 1, "maximum": ARTIFACTS_MAX},
         "answerable_without_exploration": {"type": "boolean"},
         "work_kind": {"type": "string", "enum": list(WORK_KIND_VALUES)},
         "questions": {

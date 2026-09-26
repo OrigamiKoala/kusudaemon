@@ -20,7 +20,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget, EpisodeResult
 from .events import EventLog
-from .run_dir import ensure_node_trace_path, events_path, node_artifact_path
+from .run_dir import ensure_node_trace_path, events_path, node_artifact_path, node_trace_path
 
 _SESSION_POLL_INTERVAL_SECONDS = 0.05
 
@@ -199,6 +199,61 @@ def _continuation_prompt(
     )
 
 
+_TRACE_TAIL_BYTES = 256 * 1024
+_DEGENERATE_ERROR_MARKER = "degenerate model output"
+
+
+def _session_tail_degenerate(
+    run_dir: Path, node_id: str, events: list[dict[str, Any]]
+) -> str | None:
+    """Why the node's previous session must not be resumed, or None.
+
+    2026-09-26: resuming replays the session's history, garbage included,
+    and the model tends to continue whatever it last produced (the
+    ``</think></think>...`` storm in 142-floor seed 1 came from a resumed
+    session). The session is refused when the last episode was stopped for
+    degenerate output (``_agent_worker.py``) or the model's last output in the
+    trace fails ``degeneration_reason``. A turn that was merely cut off is
+    still resumed: in the OpenCode store, resumes after an aborted turn went
+    bad 1 time in 34 against 3 in 123 for the rest.
+    """
+    from ..degeneration import degeneration_reason, guard_enabled
+
+    if not guard_enabled():
+        return None
+    last = EventLog.scan(events, node_id, "episode_completed")
+    if last is not None and _DEGENERATE_ERROR_MARKER in str(last.get("error") or ""):
+        return "episode stopped for degenerate output"
+    path = node_trace_path(run_dir, node_id)
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - _TRACE_TAIL_BYTES))
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    outputs: list[str] = []
+    for line in tail.splitlines():
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "thinking" or (
+            rec.get("type") == "message" and rec.get("role") == "assistant"
+        ):
+            text = rec.get("content")
+            if isinstance(text, str) and text.strip():
+                outputs.append(text)
+    if not outputs:
+        return None
+    # The last output alone, then the last few together (a loop can span
+    # several short parts).
+    reason = degeneration_reason(outputs[-1]) or degeneration_reason("\n".join(outputs[-8:]))
+    return f"last model output in the trace looks degenerate ({reason})" if reason else None
+
+
 async def run_node(
     run_dir: str | Path,
     node_id: str,
@@ -253,6 +308,11 @@ async def run_node(
         session_deleted = str(session.get("session_id")) in {
             str(e.get("session_id")) for e in events if e.get("type") == "opencode_session_deleted"
         }
+        degenerate_detail = (
+            _session_tail_degenerate(run_dir, node_id, events)
+            if supports_resume and not has_unit_stubs and not session_deleted
+            else None
+        )
         # armc-wall-clock-brainstorm §A4: On retries of unit-based leaves,
         # dispatch a fresh session briefed only on the missing ordinals
         # rather than resuming a degenerated session.
@@ -260,6 +320,7 @@ async def run_node(
             supports_resume
             and not has_unit_stubs
             and not session_deleted
+            and degenerate_detail is None
             and os.getenv("KUSUDAEMON_WRITER_FRESH_RETRY", "0") != "1"
         ):
             resume_session_id = session.get("session_id")
@@ -278,17 +339,21 @@ async def run_node(
             # unit continuation requested / resume unsupported.
             if session_deleted:
                 dispatch_reason = "session_deleted"
+            elif degenerate_detail is not None:
+                dispatch_reason = "session_degenerate"
             else:
                 dispatch_reason = "resume_unsupported" if not supports_resume else "fresh_session_continuation"
-            log.append(
-                {
-                    "node_id": node_id,
-                    "role": "writer",
-                    "round": 0,
-                    "type": "node_redispatched",
-                    "reason": dispatch_reason,
-                }
-            )
+            redispatch: dict[str, Any] = {
+                "node_id": node_id,
+                "role": "writer",
+                "round": 0,
+                "type": "node_redispatched",
+                "reason": dispatch_reason,
+            }
+            if degenerate_detail is not None:
+                redispatch["detail"] = degenerate_detail
+                redispatch["session_id"] = session.get("session_id")
+            log.append(redispatch)
     elif dispatched is not None:
         # Crashed before any output ever hit disk: nothing to continue from,
         # so redispatch fresh. "The original prompt" is the caller's

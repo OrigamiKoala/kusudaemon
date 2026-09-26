@@ -169,7 +169,10 @@ class CarryForwardTest(unittest.TestCase):
         self.assertNotIn("first", joined)
 
     def test_long_reasoning_is_clipped_to_its_tail(self) -> None:
-        t = _Transport([_cut("x" * 50_000 + "THE-END"), _ok('{"action": "go"}')])
+        # Varied filler: a run of one character is a degenerate loop, which
+        # _carry_forward deliberately drops (test_degeneration_0926).
+        filler = " ".join(f"weighed option {i}" for i in range(3_000))
+        t = _Transport([_cut(filler + "THE-END"), _ok('{"action": "go"}')])
         OpenAICompatibleProvider(transport=t, api_key="k", model="m").complete_json(
             [{"role": "user", "content": "plan"}], _ACTION_SCHEMA
         )

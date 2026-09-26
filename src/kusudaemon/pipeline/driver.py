@@ -563,6 +563,18 @@ class RecursiveDriver:
                 self.provider.set_event_hook(_on_fallback)
             elif getattr(self.provider, "_on_model_fallback", None) is None:
                 self.provider._on_model_fallback = _on_fallback
+
+            def _on_degenerate(info: dict[str, Any]) -> None:
+                self._log({
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "role_output_degenerate",
+                    **info,
+                })
+
+            if hasattr(self.provider, "set_degenerate_hook"):
+                self.provider.set_degenerate_hook(_on_degenerate)
         from ..v7.capabilities import write_capabilities_toml
         write_capabilities_toml(self.run_dir, self.options.capabilities, self.options.workspace_root)
         # §D0c: record who is (supposed to be) making progress, so a
@@ -3119,7 +3131,7 @@ class RecursiveDriver:
         if not role_model or _norm_model(role_model) == _norm_model(getattr(self.provider, "model", None)):
             return self.provider
         admission_controller = getattr(self.provider, "admission_controller", None)
-        return make_role_provider(
+        routed = make_role_provider(
             options=self.options,
             model=role_model,
             run_dir=self.run_dir,
@@ -3133,6 +3145,12 @@ class RecursiveDriver:
             should_abort=self._halted,
             admission_controller=admission_controller,
         )
+        degenerate_hook = getattr(self.provider, "_on_degenerate", None)
+        if degenerate_hook is None:
+            degenerate_hook = getattr(self.provider, "_pending_degenerate", None)
+        if degenerate_hook is not None and hasattr(routed, "set_degenerate_hook"):
+            routed.set_degenerate_hook(degenerate_hook)
+        return routed
 
     def _generate_resumption_brief(self) -> None:
         """PLAN-EFFICIENCY-AND-HORIZON.md §M7: Resumption brief for operator.

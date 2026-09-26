@@ -26,6 +26,7 @@ class LazyRoleProvider(RoleProviderBase):
         self._pending_abort: Callable[[], bool] | None = None
         self._pending_event: Callable[[str, str, str], None] | None = None
         self._pending_backoff: Callable[[int, float], None] | None = None
+        self._pending_degenerate: Callable[[dict[str, Any]], None] | None = None
 
     def _get_instance(self) -> RoleProvider:
         if self._instance is None:
@@ -36,6 +37,8 @@ class LazyRoleProvider(RoleProviderBase):
                 self._instance.set_event_hook(self._pending_event)
             if self._pending_backoff is not None and hasattr(self._instance, "set_backoff_hook"):
                 self._instance.set_backoff_hook(self._pending_backoff)
+            if self._pending_degenerate is not None and hasattr(self._instance, "set_degenerate_hook"):
+                self._instance.set_degenerate_hook(self._pending_degenerate)
         return self._instance
 
     def _resolve(self) -> RoleProvider:
@@ -68,12 +71,19 @@ class LazyRoleProvider(RoleProviderBase):
         if self._instance is not None and hasattr(self._instance, "set_backoff_hook"):
             self._instance.set_backoff_hook(on_backoff)
 
+    def set_degenerate_hook(
+        self, on_degenerate: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        self._pending_degenerate = on_degenerate
+        if self._instance is not None and hasattr(self._instance, "set_degenerate_hook"):
+            self._instance.set_degenerate_hook(on_degenerate)
+
     def complete_json(
         self,
         messages: list[dict[str, str]],
         schema: dict[str, Any],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         retries: int = 2,
         on_reasoning: Callable[[str], None] | None = None,
         streaming: bool = False,

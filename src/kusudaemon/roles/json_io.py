@@ -165,13 +165,14 @@ def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = N
                 cand["files_touched"] = "unknown"
 
             art = cand.get("artifacts")
+            art_max = int((props.get("artifacts") or {}).get("maximum") or 1000)
             if not isinstance(art, int):
                 try:
-                    cand["artifacts"] = max(1, min(50, int(art)))
+                    cand["artifacts"] = max(1, min(art_max, int(art)))
                 except (TypeError, ValueError):
                     cand["artifacts"] = 1
             else:
-                cand["artifacts"] = max(1, min(50, art))
+                cand["artifacts"] = max(1, min(art_max, art))
 
             if "answerable_without_exploration" not in cand:
                 cand["answerable_without_exploration"] = False

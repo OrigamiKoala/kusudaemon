@@ -65,7 +65,7 @@ class _ScriptedProvider:
         messages: list[dict[str, str]],
         schema: dict[str, Any],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         retries: int = 2,
         on_reasoning: Callable[[str], None] | None = None,
         streaming: bool = False,

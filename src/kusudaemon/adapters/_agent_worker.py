@@ -70,7 +70,28 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any
+
+# 2026-09-26: the degeneration guard lives in the package, but this file runs
+# as a standalone script, so import it by path. Without it the guard is off.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from kusudaemon.degeneration import (  # noqa: E402
+        DegenerationMonitor,
+        degeneration_reason,
+        guard_enabled,
+    )
+except Exception:  # noqa: BLE001
+    DegenerationMonitor = None  # type: ignore[assignment,misc]
+    degeneration_reason = None  # type: ignore[assignment]
+
+    def guard_enabled() -> bool:  # type: ignore[misc]
+        return False
+
+# Prefix of the error a degeneration kill reports; cli_agent.classify_cli_failure
+# matches it to make the episode a non-attempt.
+DEGENERATE_ERROR_PREFIX = "degenerate model output"
 
 CLAUDE = "claude"
 CODEX = "codex"
@@ -833,7 +854,45 @@ def translate_line(line: str, fmt: str, session_dir: str = "") -> list[str] | No
     return [line]
 
 
-async def _pump(proc: asyncio.subprocess.Process, fmt: str, session_dir: str) -> None:
+class _OutputGuard:
+    """Watches the model's own text (thinking and assistant messages) for
+    degeneration and reports the reason once.
+
+    OpenCode prints a reasoning or text part only when the part is finished,
+    so each part is checked whole, and a rolling monitor catches a loop that
+    spans several small parts. Tool output is never checked: a writer that
+    reads a binary file is not degenerating.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = guard_enabled() and DegenerationMonitor is not None
+        self._monitor = DegenerationMonitor() if self.enabled else None
+
+    def check(self, rec: dict[str, Any]) -> str | None:
+        if not self.enabled:
+            return None
+        rtype = rec.get("type")
+        if rtype == "thinking":
+            text = rec.get("content")
+        elif rtype == "message" and rec.get("role") == "assistant":
+            text = rec.get("content")
+        else:
+            return None
+        if not isinstance(text, str) or not text:
+            return None
+        reason = degeneration_reason(text)  # type: ignore[misc]
+        if reason is None:
+            reason = self._monitor.feed(text + "\n")  # type: ignore[union-attr]
+        return reason
+
+
+async def _pump(
+    proc: asyncio.subprocess.Process,
+    fmt: str,
+    session_dir: str,
+    fatal_event: asyncio.Event | None = None,
+    fatal_holder: dict[str, str] | None = None,
+) -> None:
     # §D13: opencode's CLI emits one step-start per agent step, each
     # translated into a logdir line — without dedupe, a single episode's
     # trace fills with repeated "session started" entries (one per step).
@@ -841,6 +900,7 @@ async def _pump(proc: asyncio.subprocess.Process, fmt: str, session_dir: str) ->
     # (session_id attached) are the only two that carry information; exact
     # (logdir, session_id) repeats are dropped.
     emitted_sessions: set[tuple[str, str]] = set()
+    guard = _OutputGuard()
     while True:
         try:
             data = await proc.stdout.readline()  # type: ignore[union-attr]
@@ -873,6 +933,17 @@ async def _pump(proc: asyncio.subprocess.Process, fmt: str, session_dir: str) ->
                     if "ts" not in rec and "timestamp" not in rec and "time" not in rec and "created_at" not in rec:
                         rec["ts"] = time.time()
                         emitted = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+                    reason = guard.check(rec)
+                    if reason and fatal_event is not None and not fatal_event.is_set():
+                        # Print the garbage first, so the trace shows what was
+                        # cut, then stop the episode before the next step
+                        # builds on it.
+                        print(emitted, flush=True)
+                        if fatal_holder is not None:
+                            fatal_holder["error"] = f"{DEGENERATE_ERROR_PREFIX} ({reason})"
+                        fatal_event.set()
+                        _terminate_proc_group(proc)
+                        return
             print(emitted, flush=True)
 
 
@@ -1020,15 +1091,14 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
     fatal_event = asyncio.Event()
     fatal_holder: dict[str, str] = {}
 
-    pump_task = asyncio.ensure_future(_pump(proc, fmt, session_dir))
+    pump_task = asyncio.ensure_future(_pump(proc, fmt, session_dir, fatal_event, fatal_holder))
     stderr_task = None
     log_watch_task = None
-    killer_task = None
+    killer_task = asyncio.ensure_future(_fatal_killer(proc, fatal_event))
 
     if fmt == OPENCODE:
         stderr_task = asyncio.ensure_future(_pump_stderr(proc, fmt, fatal_event, fatal_holder))
         log_watch_task = asyncio.ensure_future(_watch_opencode_log(proc, start_offset, fatal_event, fatal_holder))
-        killer_task = asyncio.ensure_future(_fatal_killer(proc, fatal_event))
 
     # Wait for process exit or fatal error trigger
     wait_proc = asyncio.ensure_future(proc.wait())
@@ -1053,6 +1123,9 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
             killer_task.cancel()
         err = fatal_holder.get("error") or "opencode fatal stream error"
         print(json.dumps({"type": "message", "role": "system", "content": f"Error: {err}"}), flush=True)
+        # cli_agent reports stderr as the episode's error.
+        sys.stderr.write(f"kusudaemon agent worker: {err}\n")
+        sys.stderr.flush()
         return proc.returncode or 1
 
     wait_fatal.cancel()

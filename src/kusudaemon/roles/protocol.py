@@ -22,7 +22,7 @@ class RoleProvider(Protocol):
         messages: list[dict[str, str]],
         schema: dict[str, Any],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         retries: int = 2,
         on_reasoning: Callable[[str], None] | None = None,
         streaming: bool = False,
@@ -38,6 +38,7 @@ class RoleProviderBase:
     _should_abort: Callable[[], bool] | None = None
     _on_model_fallback: Callable[[str, str, str], None] | None = None
     _on_backoff: Callable[[int, float], None] | None = None
+    _on_degenerate: Callable[[dict[str, Any]], None] | None = None
 
     def set_abort_hook(self, should_abort: Callable[[], bool] | None) -> None:
         self._should_abort = should_abort
@@ -51,3 +52,8 @@ class RoleProviderBase:
         self, on_backoff: Callable[[int, float], None] | None
     ) -> None:
         self._on_backoff = on_backoff
+
+    def set_degenerate_hook(
+        self, on_degenerate: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        self._on_degenerate = on_degenerate

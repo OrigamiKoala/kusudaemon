@@ -126,6 +126,11 @@ def classify_cli_failure(output: str) -> str:
         # 2026-09-25 ending episodes ~2 s in; classified as ``error`` it cost
         # a real attempt each (200-menu-week s2 unit-01 lost 2 in 4 s).
         "failed to generate completions",
+        # 2026-09-26: _agent_worker.py stopped the episode because the model's
+        # output turned to garbage (degeneration.py). Seen from the first
+        # token at small contexts and in bare OpenCode too, so it is the
+        # endpoint's fault, not the writer's, and costs no attempt.
+        "degenerate model output",
     )
     if any(p in low for p in transport_patterns):
         return "transport"

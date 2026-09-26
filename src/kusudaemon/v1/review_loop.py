@@ -238,7 +238,7 @@ def run_review_read_loop(
     brief: str = "",
     gate_results: dict[str, Any] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     run_dir: str | Path | None = None,
 ) -> ReviewVerdict:
     """Execute the goal-directed read loop over the artifact."""

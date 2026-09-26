@@ -507,7 +507,7 @@ def _call_reviewer(
     declared_inputs: str = "",
     brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     effective_judgment: list[str] | None = None,
 ) -> dict[str, Any]:
     content_parts = [f"Rubric:\n{rubric_lines}"]
@@ -603,7 +603,7 @@ def _call_triage(
     declared_inputs: str = "",
     brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = None,
 ) -> dict[str, Any]:
     content_parts = [
         f"Document Outline:\n{outline}",
@@ -686,7 +686,7 @@ def _review_node_judged(
     declared_inputs: str = "",
     brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     triage_provider: RoleProvider | None = None,
     cached_sections: list[dict[str, Any]] | None = None,
     all_gates_passed: bool | None = None,
@@ -1002,7 +1002,7 @@ def review_node(
     declared_inputs: str = "",
     brief: str = "",
     on_reasoning: Callable[[str], None] | None = None,
-    temperature: float = 0.0,
+    temperature: float | None = None,
     triage_provider: RoleProvider | None = None,
     cached_sections: list[dict[str, Any]] | None = None,
     all_gates_passed: bool | None = None,

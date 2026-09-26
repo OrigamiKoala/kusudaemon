@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator
 
+from ..degeneration import DegenerationMonitor, degeneration_reason, guard_enabled
 from .gates import estimate_tokens
 from .json_schema import describe_schema, validate
 from ..provider_config import require, resolve
@@ -111,7 +112,10 @@ def _carry_forward(partial: str, nudge: str) -> list[dict[str, str]]:
     seed 2). The retry now sees the tail of its own reasoning as an assistant
     turn, then the nudge."""
     tail = (partial or "").strip()
-    if not tail:
+    # 2026-09-26: never feed garbage back. A cut-off attempt whose tail is
+    # script soup or a loop would prime the retry to continue it, so the
+    # retry restarts from the original messages plus the nudge instead.
+    if not tail or (guard_enabled() and degeneration_reason(tail)):
         return [{"role": "user", "content": nudge}]
     if len(tail) > _CARRY_FORWARD_CHARS:
         tail = "[...earlier reasoning omitted...]\n" + tail[-_CARRY_FORWARD_CHARS:]
@@ -150,6 +154,46 @@ def orchestrator_decision_deadline_s() -> float:
         return float(os.getenv("KUSUDAEMON_ORCHESTRATOR_DEADLINE_S", str(_ORCHESTRATOR_DEADLINE_DEFAULT_S)))
     except ValueError:
         return _ORCHESTRATOR_DEADLINE_DEFAULT_S
+
+
+# 2026-09-26: sampling for role calls. They were greedy (temperature 0.0),
+# which is how this reasoning model ends up in loops like "week 2 is 8-14,
+# week 2 is 8-14, ..." or one reviewer sentence repeated for 30k chars.
+# Callers that pass no temperature get these; an explicit value (the
+# reviewer's 0.7 second-opinion sample) is kept as given.
+# KUSUDAEMON_ROLE_TOP_P=none leaves top_p out of the request.
+_ROLE_TEMPERATURE_DEFAULT = 0.6
+_ROLE_TOP_P_DEFAULT = 0.95
+
+
+def role_sampling() -> tuple[float, float | None]:
+    """(temperature, top_p) for a role call that did not choose its own."""
+    try:
+        temperature = float(os.getenv("KUSUDAEMON_ROLE_TEMPERATURE", str(_ROLE_TEMPERATURE_DEFAULT)))
+    except ValueError:
+        temperature = _ROLE_TEMPERATURE_DEFAULT
+    raw_top_p = os.getenv("KUSUDAEMON_ROLE_TOP_P", str(_ROLE_TOP_P_DEFAULT)).strip().lower()
+    if raw_top_p in ("", "none", "off"):
+        return temperature, None
+    try:
+        return temperature, float(raw_top_p)
+    except ValueError:
+        return temperature, _ROLE_TOP_P_DEFAULT
+
+
+def _apply_sampling(payload: dict[str, Any], temperature: float | None) -> None:
+    default_temperature, top_p = role_sampling()
+    payload["temperature"] = default_temperature if temperature is None else temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
+
+
+def _degenerate_retry_budget() -> int:
+    """Fresh restarts per ``complete_json`` after degenerate output."""
+    try:
+        return max(0, int(os.getenv("KUSUDAEMON_DEGENERATE_RETRIES", "2")))
+    except ValueError:
+        return 2
 
 
 def _deadline_retry_budget() -> int:
@@ -197,6 +241,14 @@ class ProviderDeadlineError(ProviderError):
 
 class ProviderReasoningBudgetError(ProviderDeadlineError):
     """A role call's streamed reasoning passed its budget; ``partial`` holds it."""
+
+
+class ProviderDegenerateError(ProviderDeadlineError):
+    """The stream turned to garbage (``degeneration.py``); ``reason`` says how."""
+
+    def __init__(self, message: str, partial: str = "", reason: str = "") -> None:
+        super().__init__(message, partial)
+        self.reason = reason
 
 
 # 2026-09-26: per-role reasoning control. Role calls on this reasoning model
@@ -392,6 +444,24 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # one run can't starve the endpoint for the other.
         self._throttle = threading.Semaphore(max(1, concurrency))
 
+    def _report_degenerate(self, reason: str, *, chars: int, action: str) -> None:
+        """Tell the driver (``role_output_degenerate`` event); never raises."""
+        hook = getattr(self, "_on_degenerate", None)
+        if hook is None:
+            return
+        try:
+            hook({
+                "reason": reason,
+                "action": action,
+                "chars": chars,
+                "role": _scoped_role(self.role),
+                "phase": self.phase,
+                "call_node": _scoped_node(self.node_id),
+                "model": self.model,
+            })
+        except Exception:  # noqa: BLE001 -- observability only
+            pass
+
     def _record_usage(self, payload: dict[str, Any], raw: dict[str, Any], content: str) -> None:
         usage = raw.get("usage") if isinstance(raw, dict) else None
         estimated = False
@@ -428,15 +498,15 @@ class OpenAICompatibleProvider(RoleProviderBase):
         self,
         messages: list[dict[str, str]],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> ProviderResponse:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
             "stream": False,
         }
+        _apply_sampling(payload, temperature)
         effective_max = max_tokens
         if effective_max is None and os.getenv("KUSUDAEMON_ROLE_MAX_TOKENS"):
             try:
@@ -461,7 +531,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         messages: list[dict[str, str]],
         schema: dict[str, Any],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         retries: int = _DEFAULT_STRUCTURED_RETRIES,
         on_reasoning: Callable[[str], None] | None = None,
         streaming: bool = False,
@@ -530,9 +600,9 @@ class OpenAICompatibleProvider(RoleProviderBase):
             payload: dict[str, Any] = {
                 "model": self.model,
                 "messages": make_messages(with_format),
-                "temperature": temperature,
                 "stream": streaming,
             }
+            _apply_sampling(payload, temperature)
             if cap["max_tokens"]:
                 payload["max_tokens"] = cap["max_tokens"]
 
@@ -563,6 +633,7 @@ class OpenAICompatibleProvider(RoleProviderBase):
         deadline_retries = 0
         empty_retries = 0
         verdict_deadline_retried = False
+        degenerate_retries = 0
 
         orchestrator_budget = (
             orchestrator_decision_deadline_s() if current_role == "orchestrator" else 0.0
@@ -573,10 +644,13 @@ class OpenAICompatibleProvider(RoleProviderBase):
         emit_nudge = "Stop deliberating. Emit the JSON verdict now." if is_verdict_role else _EMIT_NOW_NUDGE
 
         def attempt_sink() -> Callable[[str], None] | None:
-            """``on_reasoning`` for one attempt, enforcing the reasoning budget."""
-            if not (streaming and reasoning.budget_tokens):
+            """``on_reasoning`` for one attempt, enforcing the reasoning budget
+            and cutting the stream as soon as it degenerates."""
+            guard = guard_enabled()
+            if not streaming or not (reasoning.budget_tokens or guard):
                 return on_reasoning
-            limit_chars = reasoning.budget_tokens * 4
+            limit_chars = reasoning.budget_tokens * 4 if reasoning.budget_tokens else None
+            monitor = DegenerationMonitor() if guard else None
             seen: list[str] = []
             count = [0]
 
@@ -585,7 +659,15 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     on_reasoning(text)
                 seen.append(text)
                 count[0] += len(text)
-                if count[0] > limit_chars:
+                if monitor is not None:
+                    why = monitor.feed(text)
+                    if why:
+                        raise ProviderDegenerateError(
+                            f"reasoning degenerated ({why}) after {count[0]} chars",
+                            partial="".join(seen),
+                            reason=why,
+                        )
+                if limit_chars is not None and count[0] > limit_chars:
                     raise ProviderReasoningBudgetError(
                         f"reasoning passed its budget (~{reasoning.budget_tokens} tokens)",
                         partial="".join(seen),
@@ -593,9 +675,23 @@ class OpenAICompatibleProvider(RoleProviderBase):
 
             return sink
 
+        def restart_after_degenerate(why: str, chars: int) -> bool:
+            """Drop a garbage attempt and start over; False means give up."""
+            nonlocal degenerate_retries, last_error
+            retry = degenerate_retries < _degenerate_retry_budget()
+            self._report_degenerate(why, chars=chars, action="restart" if retry else "gave_up")
+            if not retry:
+                return False
+            degenerate_retries += 1
+            last_error = f"output degenerated ({why}); restarting fresh"
+            resume.clear()
+            return True
+
         def resume_after_cut(pde: ProviderDeadlineError) -> bool:
             """Carry a cut-off attempt forward; False means give up and raise."""
             nonlocal budget_retries, deadline_retries, verdict_deadline_retried, last_error
+            if isinstance(pde, ProviderDegenerateError):
+                return restart_after_degenerate(pde.reason, len(pde.partial))
             if isinstance(pde, ProviderReasoningBudgetError):
                 if budget_retries >= _reasoning_retry_budget():
                     return False
@@ -672,9 +768,11 @@ class OpenAICompatibleProvider(RoleProviderBase):
                     raise
             message = _first_choice_message(raw)
             if not streaming and on_reasoning is not None:
-                reasoning = message.get("reasoning_content")
-                if reasoning:
-                    on_reasoning(reasoning)
+                # (Named so it does not shadow ``reasoning``, the settings
+                # object ``make_payload`` reads on the next attempt.)
+                reasoning_text = message.get("reasoning_content")
+                if reasoning_text:
+                    on_reasoning(reasoning_text)
             content = message.get("content") or ""
             self._record_usage(curr_payload, raw, content)
 
@@ -707,6 +805,18 @@ class OpenAICompatibleProvider(RoleProviderBase):
             # retry at the same cap; only a second cut-off doubles the cap
             # (still carrying forward), up to _MAX_STRUCTURED_TOKENS.
             partial = (message.get("reasoning_content") or "") + content
+            # 2026-09-26: a finished response can be garbage too (a
+            # non-streaming call, or content after clean reasoning). Unless it
+            # still yields schema-valid JSON, restart fresh: the validation
+            # reprompt below would put the garbage in the next prompt.
+            degenerate = degeneration_reason(partial) if guard_enabled() else None
+            if degenerate and (parsed is None or validate(
+                _repair_common_schema_omissions(_unwrap_schema_echo(parsed, schema), schema), schema
+            )):
+                if restart_after_degenerate(degenerate, len(partial)):
+                    continue
+                last_error = f"output degenerated ({degenerate})"
+                break
             if truncated:
                 if is_verdict_role:
                     if not verdict_deadline_retried:
