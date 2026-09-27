@@ -1056,6 +1056,34 @@ async def _fatal_killer(proc: asyncio.subprocess.Process, fatal_event: asyncio.E
     _kill_proc_group(proc)
 
 
+def _forward_termination(proc: asyncio.subprocess.Process) -> None:
+    """Pass SIGTERM/SIGHUP/SIGINT on to the CLI's own process group.
+
+    The CLI runs in a session of its own (so the kills above do not take the
+    worker with them), which puts it outside the group the harness signals on
+    an episode timeout. Without this the worker died and the CLI kept going:
+    2026-09-27, 346-block s2 unit-03 "timed out after 199s" and its opencode
+    session wrote 25 units over the next 50 minutes, after the run had ended.
+    The CLI gets SIGTERM, then SIGKILL after a short grace; the worker keeps
+    running meanwhile, so it still drains the CLI's output and exits normally.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _on_signal() -> None:
+        _terminate_proc_group(proc)
+        loop.call_later(1.5, _kill_if_running)
+
+    def _kill_if_running() -> None:
+        if proc.returncode is None:
+            _kill_proc_group(proc)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+
+
 async def _run(fmt: str, command: list[str], session_dir: str) -> int:
     cmd = list(command)
     start_offset = 0
@@ -1087,6 +1115,7 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
         limit=_MAX_LINE_BYTES,
         start_new_session=True,
     )
+    _forward_termination(proc)
 
     fatal_event = asyncio.Event()
     fatal_holder: dict[str, str] = {}

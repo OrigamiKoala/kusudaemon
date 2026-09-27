@@ -729,6 +729,8 @@ async def run_round_loop(
         if admission_controller is not None
         else get_global_admission_controller(provider_concurrency or 4)
     )
+    if hasattr(admission, "seed_wave_cap"):
+        admission.seed_wave_cap(max_parallel)
     default_budget = writer_budget or EpisodeBudget()
     tree_lock = asyncio.Lock()
     provider_sem = (

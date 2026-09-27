@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..utils.process_group import (
+    descendant_process_groups,
     kill_process_group,
     signal_process_group,
     track_process_group,
@@ -267,19 +268,25 @@ class LocalEnvironment:
         """SIGTERM the agent's whole group, escalating to SIGKILL if it lingers."""
         if proc is None or proc.returncode is not None:
             return
-        signal_process_group(proc.pid, signal.SIGTERM)
+        # The agent worker runs the CLI in a session of its own, so the CLI is
+        # not in proc's group; signal its group too, or it outlives the episode.
+        detached = sorted(descendant_process_groups(proc.pid))
+        for group in (proc.pid, *detached):
+            signal_process_group(group, signal.SIGTERM)
         try:
             # Shielded because this often runs while a CancelledError propagates,
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, signal.SIGKILL)
+            for group in (proc.pid, *detached):
+                signal_process_group(group, signal.SIGKILL)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:
             # Cancelled again mid-wait: fall back to the blocking sweep so the
             # agent cannot outlive us.
-            kill_process_group(proc.pid)
+            for group in (proc.pid, *detached):
+                kill_process_group(group)
 
     @staticmethod
     async def _finish_io(io_task: asyncio.Task[None] | None) -> None:

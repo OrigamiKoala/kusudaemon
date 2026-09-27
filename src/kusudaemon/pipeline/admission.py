@@ -34,6 +34,7 @@ class RunAdmissionController:
         self.on_backoff = on_backoff
         # AIMD: start wave cap at initial or 2 (§B7.3)
         self.current_wave_cap = max(1, initial_wave_cap or min(2, self.concurrency))
+        self._throttled = False
 
     def _ensure_async_sem(self) -> asyncio.Semaphore:
         try:
@@ -108,14 +109,36 @@ class RunAdmissionController:
     def record_wave_outcome(self, throttled_count: int, max_parallel: int) -> int:
         """AIMD adjustment on wave size (§B7.3).
 
-        Start at 2; after a wave completes with zero throttles, +1;
-        on any 429, halve.
+        After a wave completes with zero throttles, +1 (up to
+        ``max_parallel``); on any 429, halve. A success never lowers the cap:
+        2026-09-27, the T1 phase's ``max_parallel=1`` successes pinned this
+        process-global cap at 1, and the T2 phase that followed ran its three
+        leaves one at a time. Callers clamp to their own ``max_parallel``.
         """
         with self._lock:
             if throttled_count == 0:
-                self.current_wave_cap = min(max_parallel, self.current_wave_cap + 1)
+                self.current_wave_cap = max(
+                    self.current_wave_cap, min(max_parallel, self.current_wave_cap + 1)
+                )
             else:
                 self.current_wave_cap = max(1, self.current_wave_cap // 2)
+                self._throttled = True
+            return self.current_wave_cap
+
+    def seed_wave_cap(self, max_parallel: int) -> int:
+        """Open the cap to ``max_parallel`` at the start of a round loop.
+
+        The §B7.3 slow start (cap 2, +1 per finished job) costs a whole
+        episode per slot when episodes run 10–25 minutes: 346-block s2
+        (2026-09-27) held 2 of 4 fresh leaves back for 815 s. ``max_parallel``
+        is already bounded by the ready-set width and memory, so start there
+        and let throttling (non-attempts, halving) find the provider's limit.
+        Once anything has been throttled the learned cap is kept.
+        ``KUSUDAEMON_WAVE_SLOW_START=1`` keeps the old slow start.
+        """
+        with self._lock:
+            if not self._throttled and os.getenv("KUSUDAEMON_WAVE_SLOW_START", "0") != "1":
+                self.current_wave_cap = max(self.current_wave_cap, max_parallel)
             return self.current_wave_cap
 
 

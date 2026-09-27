@@ -18,6 +18,7 @@ from __future__ import annotations
 import atexit
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -47,22 +48,70 @@ def signal_process_group(pid: int, sig: int) -> bool:
     return True
 
 
+def descendant_process_groups(pid: int) -> set[int]:
+    """Process groups of everything descended from group ``pid``, except ``pid`` itself.
+
+    A child that starts its own session (``_agent_worker.py`` runs ``opencode``
+    that way so it can kill the CLI without killing itself) leaves our group,
+    so ``killpg(pid)`` never reaches it. 2026-09-27: an opencode episode
+    "timed out" this way kept writing for 50 minutes after its run ended.
+    Collect these *before* signalling: once the parent dies, its children are
+    reparented to init and the ancestry is gone.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,pgid="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    children: dict[int, list[int]] = {}
+    pgid_of: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            p, pp, g = (int(x) for x in parts)
+        except ValueError:
+            continue
+        children.setdefault(pp, []).append(p)
+        pgid_of[p] = g
+    frontier = [p for p, g in pgid_of.items() if g == pid] or [pid]
+    seen = set(frontier)
+    groups: set[int] = set()
+    while frontier:
+        p = frontier.pop()
+        for c in children.get(p, ()):
+            if c in seen:
+                continue
+            seen.add(c)
+            frontier.append(c)
+            g = pgid_of.get(c)
+            if g is not None and g != pid and g > 1:
+                groups.add(g)
+    return groups
+
+
 def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
-    """SIGTERM the group, then SIGKILL whatever ignored it.
+    """SIGTERM the group and its detached descendants, then SIGKILL stragglers.
 
     Blocking, so it suits signal and atexit handlers. Async callers should
     escalate around ``await proc.wait()`` rather than block the event loop.
     """
-    if not signal_process_group(pid, signal.SIGTERM):
-        return
+    groups = [pid, *sorted(descendant_process_groups(pid))]
+    alive = [g for g in groups if signal_process_group(g, signal.SIGTERM)]
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
+    while alive and time.monotonic() < deadline:
         # Signal 0 only probes for existence; once the group is gone the CLI has
         # flushed its trajectory and there is nothing left to escalate against.
-        if not signal_process_group(pid, 0):
-            return
-        time.sleep(0.05)
-    signal_process_group(pid, signal.SIGKILL)
+        alive = [g for g in alive if signal_process_group(g, 0)]
+        if alive:
+            time.sleep(0.05)
+    for g in alive:
+        signal_process_group(g, signal.SIGKILL)
 
 
 def kill_all_tracked() -> None:
