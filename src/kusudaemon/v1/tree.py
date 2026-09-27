@@ -107,6 +107,9 @@ class TaskNode:
     status: NodeStatus = "pending"
     attempts: int = 0
     non_attempts: int = 0
+    # 2026-09-27: consecutive same-session nudges since the last other
+    # outcome (v1/round_loop.py::_writer_stall_nudge). Not an attempt count.
+    nudges: int = 0
     last_defect: str = ""
     parent: str = ""
     # PLAN.md §C1 (node-type template system): warn-severity gates shipped
@@ -160,6 +163,7 @@ class TaskNode:
             status=data.get("status", "pending"),
             attempts=int(data.get("attempts", 0)),
             non_attempts=int(data.get("non_attempts", 0)),
+            nudges=int(data.get("nudges", 0)),
             last_defect=str(data.get("last_defect", "")),
             parent=str(data.get("parent", "")),
             warn_gates=list(data.get("warn_gates") or []),

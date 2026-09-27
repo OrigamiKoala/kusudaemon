@@ -42,6 +42,7 @@ _REPLAY_INVALIDATING_TYPES = frozenset(
         "node_throttled",             # round loop transitioned the node on rate limit
         "node_transport",             # round loop transitioned the node on transport failure
         "node_continuation_progress", # round loop returned the node to pending (A4)
+        "node_nudged",                # round loop returned the node for a same-session nudge
         "node_review_failed",         # review consumed the completion
         "node_redispatch_requested",  # operator redispatch — new attempt series
         "node_reopened",              # operator direct reset — new attempt series
@@ -254,6 +255,39 @@ def _session_tail_degenerate(
     return f"last model output in the trace looks degenerate ({reason})" if reason else None
 
 
+def _last_captured_session(events: list[dict[str, Any]], node_id: str) -> dict[str, Any] | None:
+    """The newest ``session_captured`` event for ``node_id`` that names a session.
+
+    A resumed episode re-captures only its logdir (the session id is already
+    known and skipped), so the newest event carries ``session_id: None``.
+    Scanning for the newest event of any kind made the next redispatch read
+    "no session" and start fresh (294-menu-week s1, 2026-09-27: attempt 3
+    was ``no_session_captured`` right after a resumed attempt 2).
+    """
+    match: dict[str, Any] | None = None
+    for event in events:
+        if event.get("node_id") == node_id and event.get("type") == "session_captured" and event.get("session_id"):
+            match = event
+    return match
+
+
+def _pending_nudge(events: list[dict[str, Any]], node_id: str) -> dict[str, Any] | None:
+    """The round loop's ``node_nudged`` event if this dispatch is answering it.
+
+    It must be the node's newest writer-lifecycle event: a dispatch, redispatch
+    or completion after it means the nudge was already sent (or superseded).
+    """
+    latest: dict[str, Any] | None = None
+    for event in events:
+        if event.get("node_id") != node_id:
+            continue
+        if event.get("type") in ("node_nudged", "node_dispatched", "node_redispatched", "episode_completed"):
+            latest = event
+    if latest is not None and latest.get("type") == "node_nudged" and latest.get("message"):
+        return latest
+    return None
+
+
 async def run_node(
     run_dir: str | Path,
     node_id: str,
@@ -281,7 +315,8 @@ async def run_node(
         return _result_from_completed_event(completed)
 
     dispatched = EventLog.scan(events, node_id, "node_dispatched")
-    session = EventLog.scan(events, node_id, "session_captured")
+    session = _last_captured_session(events, node_id)
+    nudge = _pending_nudge(events, node_id)
     supports_resume = bool(getattr(adapter, "supports_session_resume", False))
 
     # Sessions/logdirs already captured by prior attempts of this node. The
@@ -308,9 +343,12 @@ async def run_node(
         session_deleted = str(session.get("session_id")) in {
             str(e.get("session_id")) for e in events if e.get("type") == "opencode_session_deleted"
         }
+        # A nudge resumes even a unit-stub leaf: its point is to keep the
+        # session's plan (the §A4 fresh retry below re-derives it).
+        resumable = not has_unit_stubs or nudge is not None
         degenerate_detail = (
             _session_tail_degenerate(run_dir, node_id, events)
-            if supports_resume and not has_unit_stubs and not session_deleted
+            if supports_resume and resumable and not session_deleted
             else None
         )
         # armc-wall-clock-brainstorm §A4: On retries of unit-based leaves,
@@ -318,22 +356,23 @@ async def run_node(
         # rather than resuming a degenerated session.
         if (
             supports_resume
-            and not has_unit_stubs
+            and resumable
             and not session_deleted
             and degenerate_detail is None
             and os.getenv("KUSUDAEMON_WRITER_FRESH_RETRY", "0") != "1"
         ):
             resume_session_id = session.get("session_id")
-            dispatch_reason = "resumed_session"
-            log.append(
-                {
-                    "node_id": node_id,
-                    "role": "writer",
-                    "round": 0,
-                    "type": "node_redispatched",
-                    "reason": "resumed_session",
-                }
-            )
+            dispatch_reason = "nudged_session" if nudge is not None else "resumed_session"
+            redispatched: dict[str, Any] = {
+                "node_id": node_id,
+                "role": "writer",
+                "round": 0,
+                "type": "node_redispatched",
+                "reason": dispatch_reason,
+            }
+            if nudge is not None:
+                redispatched["nudge"] = nudge.get("nudge")
+            log.append(redispatched)
         else:
             # A session id was captured last time but fresh redispatch or
             # unit continuation requested / resume unsupported.
@@ -417,7 +456,13 @@ async def run_node(
         # artifact from scratch (observed live: a 300-block doc back at
         # block 1 after a timeout-resume, each whole-file `write` wiping
         # all prior appended progress).
-        prompt = _continuation_prompt(run_dir, node_id, prompt, resume_session_id)
+        if dispatch_reason == "nudged_session":
+            # The session already holds the task, its plan and its work so
+            # far; resending the full prompt invites re-planning, which is
+            # the stall being answered. The nudge alone says "continue".
+            prompt = str(nudge["message"])
+        else:
+            prompt = _continuation_prompt(run_dir, node_id, prompt, resume_session_id)
 
     trace_path = ensure_node_trace_path(run_dir, node_id)
     # The trace is append-only across attempts: a prior attempt's entries

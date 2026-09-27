@@ -184,6 +184,29 @@ class _OrchestratorReasoningTrace:
             self._fh = None
 
 
+def _credits_single_writer_progress(node: TaskNode) -> bool:
+    """Whether a single-writer (T1/T0) episode that adds units is a non-attempt.
+
+    Decomposed leaves get this through their unit stubs (A4). The single
+    node appends to one file, so it had no credit: 294-menu-week s1
+    (2026-09-27) was charged for the episode that took ``single.md`` from 0
+    to 1 week, and two charged episodes escalate T1 -> T2. Units are counted
+    in the file with the node's own ``units_min`` delimiter; an episode that
+    adds none is still charged, so ``max_attempts`` still bounds a stuck
+    writer. Only a goal that declares a unit count qualifies: without one
+    the count falls back to headings, which is not progress toward anything
+    (and would delay a size-defect escalation by a free episode).
+    ``KUSUDAEMON_SINGLE_PROGRESS_CREDIT=0`` disables.
+    """
+    from ..v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID
+
+    return (
+        node.id in (SINGLE_NODE_ID, DIRECT_NODE_ID)
+        and bool(node.budget and node.budget.units_expected)
+        and os.getenv("KUSUDAEMON_SINGLE_PROGRESS_CREDIT", "1") != "0"
+    )
+
+
 def _wants_unit_stubs(node: TaskNode) -> bool:
     """Whether ``node`` gets per-unit stub files (armc-wall-clock-brainstorm
     §A1). Decomposed leaves only: a T1 single node has bash and appends to
@@ -1600,6 +1623,61 @@ def _read_artifact(run_dir: Path, node_id: str) -> str:
         return ""
 
 
+def writer_nudge_cap() -> int:
+    """Consecutive same-session nudges allowed per stall (``KUSUDAEMON_WRITER_NUDGES``, 0 disables)."""
+    try:
+        return max(0, int(os.getenv("KUSUDAEMON_WRITER_NUDGES", "3")))
+    except ValueError:
+        return 3
+
+
+def _writer_stall_nudge(
+    node: TaskNode,
+    *,
+    prior_nudges: int,
+    episode_ok: bool,
+    result_status: str | None,
+    gates_passed: bool,
+    units_expected: int | None,
+    prior_units: int,
+    current_units: int,
+) -> str | None:
+    """The nudge to send when a writer ended its own turn with units missing, else None.
+
+    2026-09-27, 294-menu-week s1: the T1 writer wrote week 1 and ended its
+    turn mid-sentence; the next attempt thought for ~29k chars, said "Let me
+    write the complete file now" and ended its turn with no tool call. Both
+    episodes were ``done``, each cost an attempt, and each retry restarted
+    the planning from scratch. A person at the OpenCode prompt would type
+    "continue"; this does the same, in the same session, without charging
+    an attempt.
+
+    Only a voluntary end counts (``done``, not a timeout or a provider
+    failure), and only when the node declares a unit count that is not met,
+    so a stall is measurable. The first nudge is free; each later one needs
+    the previous nudge to have added at least one unit, and the run stops
+    nudging after ``KUSUDAEMON_WRITER_NUDGES`` (default 3) in a row. After
+    that the episode is handled as before (progress credit or an attempt).
+    """
+    cap = writer_nudge_cap()
+    if cap <= 0 or not episode_ok or result_status not in (None, "done") or gates_passed:
+        return None
+    if not units_expected or current_units >= units_expected:
+        return None
+    if prior_nudges >= cap:
+        return None
+    if prior_nudges > 0 and current_units <= prior_units:
+        return None
+    return (
+        "[Harness notice] Your turn ended, but the artifact is not finished: "
+        f"it holds {current_units} of {units_expected} units. Do not re-plan, "
+        "re-read the task, or re-count words. Continue now from unit "
+        f"{current_units + 1}: write it with your file tools, then the next, "
+        f"until all {units_expected} units are on disk. End your turn only "
+        "after the last unit is written."
+    )
+
+
 async def _transition_after_writer(
     node: TaskNode,
     tree: TaskTree,
@@ -1617,6 +1695,9 @@ async def _transition_after_writer(
     r_dir = run_dir or Path(tree_path).parent
     bypassed = is_node_bypassed(r_dir, node.id, "review") or is_node_bypassed(r_dir, node.id)
     gates_passed = all_passed(gate_results)
+    # Nudges count consecutive stalls; every other outcome ends the streak.
+    prior_nudges = getattr(node, "nudges", 0)
+    node.nudges = 0
 
     # PLAN-TOKEN-ACCOUNTING.md §O7 & §L4: artifact shrink check and accidental loss recovery
     # PLAN-SWEEP-REPAIR.md §B2/B4 option (a): current text resolves via
@@ -1810,7 +1891,45 @@ async def _transition_after_writer(
             f"accidental loss restored: previous content ({prior_bytes}B) was lost; "
             f"continue existing artifact (currently {prior_units} units) rather than restarting"
         )
-    elif (has_unit_stubs or os.getenv("KUSUDAEMON_CONTINUATION_PROGRESS", "0") == "1") and current_units > prior_units:
+    elif (
+        nudge_message := _writer_stall_nudge(
+            node,
+            prior_nudges=prior_nudges,
+            episode_ok=episode_ok,
+            result_status=result_status,
+            gates_passed=gates_passed,
+            units_expected=units_exp,
+            prior_units=prior_units,
+            current_units=current_units,
+        )
+    ) is not None:
+        node.nudges = prior_nudges + 1
+        node.status = "pending"
+        node.last_defect = (
+            f"stalled: turn ended with {current_units} of {units_exp} units written; "
+            f"nudged in the same session ({node.nudges}/{writer_nudge_cap()})"
+        )
+        log.append(
+            {
+                "node_id": node.id,
+                "role": "harness",
+                "round": 0,
+                "type": "node_nudged",
+                "attempts": node.attempts,
+                "nudge": node.nudges,
+                "cap": writer_nudge_cap(),
+                "prior_units": prior_units,
+                "current_units": current_units,
+                "units_expected": units_exp,
+                "unmet": [result.gate for result in gate_results if not result.passed],
+                "message": nudge_message,
+            }
+        )
+    elif (
+        has_unit_stubs
+        or _credits_single_writer_progress(node)
+        or os.getenv("KUSUDAEMON_CONTINUATION_PROGRESS", "0") == "1"
+    ) and current_units > prior_units:
         # A4: Forward progress made on units — continuation without charging an attempt.
         node.status = "pending"
         if result_status == "timeout":
