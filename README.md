@@ -8,21 +8,21 @@ The harness successfully ***doubles*** the mean completion rate on LongGenBench,
 
 ### Results
 
-Long-horizon benchmark results on **LongGenBench** (September 2026 sweep: 120 runs across 20 tasks × 2 arms × 3 seeds, 5400 s per-run limit, using `nvidia/nemotron-3.5-lightning-30b-a3b`):
+Long-horizon benchmark results on **LongGenBench** (September 2026 sweep, updated 2026-10-01: 120 runs across 20 tasks × 2 arms × 3 seeds, 5400 s per-run limit, using `nvidia/nemotron-3.5-lightning-30b-a3b`):
 
 | Metric | Bare OpenCode (Arm A) | Kusudaemon (Arm C) | Delta |
 |---|---|---|---|
-| **Mean completion rate** | **43.8 %** | **93.9 %** | **+50.2 points** |
-| **Whole task completed** (100 % units present) | **23 / 60 (38.3 %)** | **55 / 60 (91.7 %)** | **+53.4 points** |
-| Median completion rate | 11.3 % | 100.0 % | +88.7 points |
-| Tasks with 3 / 3 seeds finished | 3 of 20 | 16 of 20 | +13 tasks |
-| Wall clock per *fully completed* document | 57.9 min | 56.3 min | Comparable cost |
+| **Mean completion rate** | **42.7 %** | **96.2 %** | **+53.5 points** |
+| **Whole task completed** (100 % units present) | **23 / 60 (38.3 %)** | **56 / 60 (93.3 %)** | **+55.0 points** |
+| Median completion rate | 3.0 % | 100.0 % | +97.0 points |
+| Tasks with 3 / 3 seeds finished | 3 of 20 | 17 of 20 | +14 tasks |
+| Wall clock per *fully completed* document | 50.3 min | 55.6 min | Comparable cost |
 
 **By task type:**
-- **Week diary** (52 units): Arm A 55.6 % (7/15 whole) → **Arm C 100 % (15/15 whole)**
+- **Week diary** (52 units): Arm A 53.6 % (7/15 whole) → **Arm C 100 % (15/15 whole)**
 - **Building floor plan** (100 units): Arm A 65.1 % (9/15 whole) → **Arm C 96.9 % (14/15 whole)**
-- **City blocks** (100 units): Arm A 32.5 % (4/15 whole) → **Arm C 100 % (15/15 whole)**
-- **Weekly menus** (52 units, heavy constraints): Arm A 21.8 % (3/15 whole) → **Arm C 78.7 % (11/15 whole)**
+- **City blocks** (100 units): Arm A 30.5 % (4/15 whole) → **Arm C 100 % (15/15 whole)**
+- **Weekly menus** (52 units, heavy constraints): Arm A 21.5 % (3/15 whole) → **Arm C 87.8 % (12/15 whole)**
 
 Kusudaemon roughly doubles the completion rate and finishes whole documents more than twice as often as the bare agent. Bare agents display bimodal behavior (either finishing or collapsing early due to context drift or clobbered outputs), whereas Kusudaemon's outer-loop gates, unit stubs, stall nudges, and resume/salvage recovery ensure consistent task completion with comparable wall-clock cost per finished document.
 

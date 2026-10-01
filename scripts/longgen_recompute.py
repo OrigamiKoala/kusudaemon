@@ -39,7 +39,7 @@ import longgen_integrity as li  # noqa: E402
 import run_longgen_bench as rlb  # noqa: E402
 from longgen_common import load_dataset, task_id_for  # noqa: E402
 
-DATE = "2026-09-30"
+DATE = "2026-10-01"
 IGNORED_ARCHIVE_DIRS = ("000-week",)
 DEFAULT_DATASET = Path.home() / "LongGenBench" / "Dataset" / "Dataset_short.json"
 
@@ -285,7 +285,8 @@ def archive_attempts(
         # archive/000-week/ is the 09-08 pilot, parked before the wave-1
         # repairs and outside the sweep (its records carry no real wall clock
         # and the later commit was stamped over it): not an attempt.
-        if bench.relative_to(archive_dir).parts[0] in IGNORED_ARCHIVE_DIRS:
+        first_part = bench.relative_to(archive_dir).parts[0]
+        if first_part in IGNORED_ARCHIVE_DIRS or first_part.startswith("recompute_"):
             continue
         try:
             d = json.loads(bench.read_text(encoding="utf-8"))
@@ -294,7 +295,9 @@ def archive_attempts(
         raw = None
         for cand in (
             bench.parent / "raw" / f"{stem}.md",
+            bench.parent / "raw" / f"{stem}.txt",
             bench.parent.parent / "raw" / f"{stem}.md",
+            bench.parent.parent / "raw" / f"{stem}.txt",
             bench.parent / f"{stem}.md",
             bench.parent / f"{stem}.txt",
         ):
@@ -302,7 +305,7 @@ def archive_attempts(
                 raw = cand
                 break
         found.append({
-            "commit": d.get("commit"),
+            "commit": d.get("code_commit") or d.get("commit"),
             "wall": float(d.get("wall_clock_s") or 0.0),
             "halt_reason": d.get("halt_reason"),
             "raw": raw,
@@ -331,9 +334,10 @@ def build_attempts(
     for n, rs in sorted(by_attempt.items()):
         walls = [float(r.get("wall_clock_s") or 0.0) for r in rs if (r.get("wall_clock_s") or 0) > 0]
         last = rs[-1]
+        commit = next((r.get("code_commit") or r.get("commit") for r in rs if r.get("code_commit") or r.get("commit")), None)
         attempts.append({
             "source": "records",
-            "commit": next((r.get("commit") for r in rs if r.get("commit")), None),
+            "commit": commit,
             "wall": walls[-1] if walls else 0.0,
             "recorded_cr": float(last.get("completion_rate") or 0.0),
             "fixed_cr": None,
@@ -485,7 +489,7 @@ def era_of(commit: str | None) -> int:
         (3, ("f8f5b31",)),
         (4, ("dcf4874", "0e691f2", "c407d1b", "None")),
         (5, ("35480d4", "779ad23", "ff6870f")),
-        (6, ("2b6a2ab",)),
+        (6, ("2b6a2ab", "9919c7c")),
     ]
     key = (commit or "None")[:7]
     for era, shas in table:
@@ -582,10 +586,10 @@ def analysis(
     # eras
     eras: dict[int, list[dict[str, Any]]] = {}
     for r in cells["C"]:
-        eras.setdefault(era_of(r.get("commit")), []).append(r)
+        eras.setdefault(era_of(r.get("code_commit") or r.get("commit")), []).append(r)
     out["eras"] = {e: block(v) for e, v in sorted(eras.items())}
     out["eras_late"] = {
-        a: block([r for r in cells[a] if era_of(r.get("commit")) in (5, 6)]) if a == "C" else None for a in arms
+        a: block([r for r in cells[a] if era_of(r.get("code_commit") or r.get("commit")) in (5, 6)]) if a == "C" else None for a in arms
     }
     # first attempt (arm A cells were never re-run: its first attempt is its final)
     fa = [float(first[(t, "C", s)]) for t in tasks for s in seeds]
@@ -619,7 +623,7 @@ def analysis(
     sens["arm_a_best_case_cells"] = sorted(set(recovered) | set(lost_evidence or {}))
     out["sensitivity"] = sens
     # late eras by commit (A rows carry the HEAD commit of the sweep at the time)
-    late = lambda r: (r.get("commit") or "")[:7] in ("35480d4", "2b6a2ab")
+    late = lambda r: ((r.get("code_commit") or r.get("commit") or "")[:7]) in ("35480d4", "2b6a2ab", "9919c7c")
     out["late_era"] = {a: block([r for r in cells[a] if late(r)]) for a in arms}
     # every run that exists, including the three tasks outside the final matrix
     if outside_matrix is not None:
@@ -692,7 +696,7 @@ def main() -> int:
     # never stacked (they carry rescored.scorer ending in "(2026-09-30)").
     old_rows = [
         r for r in read_jsonl(results_dir / "records.jsonl")
-        if not str((r.get("rescored") or {}).get("scorer", "")).endswith(f"({DATE})")
+        if not str((r.get("rescored") or {}).get("scorer", "")).startswith("longgen_common.to_output_blocks")
     ]
     li.assign_attempts(old_rows)
     rows_by_cell: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
@@ -829,7 +833,7 @@ def main() -> int:
             "harness_wall_clock_s": 0.0,
             "returncode": None,
             "timed_out": False,
-            "commit": bench.get("commit"),
+            "commit": bench.get("code_commit") or bench.get("commit"),
             "attempt": 1,
         }
         if not prev_final:
@@ -850,7 +854,7 @@ def main() -> int:
             "blocks_expected": int(item.get("number", 0)),
             "completion_rate": round(completion, 3),
             "halt_after_complete": bool(halt_reason) and completion >= 100.0,
-            "rescored": {"date": DATE, "scorer": "longgen_common.to_output_blocks (2026-09-30)",
+            "rescored": {"date": DATE, "scorer": f"longgen_common.to_output_blocks ({DATE})",
                          "previous_completion_rate": (prev_final or {}).get("completion_rate")},
             **{k: v for k, v in extras.items() if k != "provider_errors"},
             **({"provider_errors": extras["provider_errors"]} if extras.get("provider_errors") else {}),
@@ -886,30 +890,27 @@ def main() -> int:
     for cell in cells:
         stem = li.cell_stem(*cell)
         idx, item = load_item_for(cell[0], dataset)
-        if cell[1] == "C":
-            ref_bench = pre_dir / "bench" / f"{stem}.json"
-            if not ref_bench.is_file():
-                ref_bench = bench_dir / f"{stem}.json"
-            atts = build_attempts(
-                cell, all_old_by_cell.get(cell, []), archive_root, item, order,
-                final_mtime=ref_bench.stat().st_mtime if ref_bench.is_file() else None,
-            )
-            if not atts:
-                first[cell] = float(final_rows[cell]["completion_rate"])
-                continue
-            a0 = atts[0]
-            val = a0["fixed_cr"] if a0.get("fixed_cr") is not None else a0["recorded_cr"]
-            if len(atts) == 1 and a0["source"] == "records":
-                val = float(final_rows[cell]["completion_rate"])
-            first[cell] = float(val)
-            if len(atts) > 1:
-                attempt_log[stem] = [
-                    {k: (round(v, 3) if isinstance(v, float) else v) for k, v in a.items() if k in
-                     ("source", "commit", "wall", "recorded_cr", "fixed_cr", "fixed_from")}
-                    for a in atts
-                ]
-        else:
+        ref_bench = pre_dir / "bench" / f"{stem}.json"
+        if not ref_bench.is_file():
+            ref_bench = bench_dir / f"{stem}.json"
+        atts = build_attempts(
+            cell, all_old_by_cell.get(cell, []), archive_root, item, order,
+            final_mtime=ref_bench.stat().st_mtime if ref_bench.is_file() else None,
+        )
+        if not atts:
             first[cell] = float(final_rows[cell]["completion_rate"])
+            continue
+        a0 = atts[0]
+        val = a0["fixed_cr"] if a0.get("fixed_cr") is not None else a0["recorded_cr"]
+        if len(atts) == 1 and a0["source"] == "records":
+            val = float(final_rows[cell]["completion_rate"])
+        first[cell] = float(val)
+        if len(atts) > 1:
+            attempt_log[stem] = [
+                {k: (round(v, 3) if isinstance(v, float) else v) for k, v in a.items() if k in
+                 ("source", "commit", "wall", "recorded_cr", "fixed_cr", "fixed_from")}
+                for a in atts
+            ]
 
     lost_ev_cells = {
         li.cell_stem(*c): 100.0
@@ -942,13 +943,13 @@ def main() -> int:
         h = stats["headline"][arm]
         print(f"  arm {arm}: mean {h['mean']}  whole {h['whole']}/{h['runs']} = {h['whole_pct']}%  median {h['median']}")
     print(f"  arm C first attempt: {stats['arm_c_first_attempt']}")
-    print("\n== attempts of re-run arm C cells (oldest first; fixed_cr = rescored from the archived artifact) ==")
+    print("\n== attempts of re-run cells (oldest first; fixed_cr = rescored from the archived artifact) ==")
     for stem, atts in sorted(attempt_log.items()):
         print(f"  {stem}: " + " | ".join(
             f"{(a['commit'] or 'none')[:7]} {a['source'][:3]} rec={a['recorded_cr']} fix={a['fixed_cr']}" for a in atts))
 
     # persist what the dry run computed
-    summary_path = Path(args.stats_out) if args.stats_out else results_dir / "analysis_2026-09-30.json"
+    summary_path = Path(args.stats_out) if args.stats_out else results_dir / f"analysis_{DATE}.json"
     if not args.apply:
         if args.stats_out:
             summary_path.write_text(json.dumps({**stats, "attempt_log": attempt_log, "notes": notes}, indent=2, default=str), encoding="utf-8")
@@ -1014,7 +1015,10 @@ def main() -> int:
     summary["reconcile"] = report
     summary["rescored"] = {"date": DATE, "note": "all cells rescored from raw/ with the fixed scorer; see docs/LONGGENBENCH-RESULTS-2026-09.md"}
     (results_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    summary_path.write_text(json.dumps({**stats, "attempt_log": attempt_log, "notes": notes}, indent=2, default=str), encoding="utf-8")
+    payload = json.dumps({**stats, "attempt_log": attempt_log, "notes": notes}, indent=2, default=str)
+    summary_path.write_text(payload, encoding="utf-8")
+    if not args.stats_out:
+        (results_dir / "analysis_2026-09-30.json").write_text(payload, encoding="utf-8")
     print(f"wrote records.jsonl ({len(out_rows)} rows), summary.json, predictions/, {summary_path.name}")
     return 0
 
