@@ -245,9 +245,18 @@ class RecordRepairTest(unittest.TestCase):
         ]
         summary = rlb.summarize(records)
         arm = summary["arms"]["C"]
+        # 2026-09-30 (results doc §4.3.5): an "unknown" halt with an incomplete
+        # document is NOT quarantined. It carries no evidence of a provider
+        # fault, and quarantining it hid three real failures and moved arm C's
+        # mean from 93.9 % to 99.0 %. Transport/budget halts still are.
+        self.assertEqual(arm["valid_runs"], 2)
+        self.assertEqual(arm["mean_completion_pct"], 0.275)
+        self.assertEqual(arm["excluded"]["total"], 0)
+        records[0]["halt_reason"] = "socket read timeout"
+        summary = rlb.summarize(records)
+        arm = summary["arms"]["C"]
         self.assertEqual(arm["valid_runs"], 1)
-        self.assertEqual(arm["mean_completion_pct"], 0.5)
-        self.assertEqual(arm["excluded"]["by_reason"].get("unknown"), 1)
+        self.assertEqual(arm["excluded"]["by_reason"].get("transport"), 1)
 
 
 class ProviderErrorContextTest(unittest.TestCase):

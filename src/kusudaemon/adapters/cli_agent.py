@@ -131,6 +131,9 @@ def classify_cli_failure(output: str) -> str:
         # token at small contexts and in bare OpenCode too, so it is the
         # endpoint's fault, not the writer's, and costs no attempt.
         "degenerate model output",
+        # _agent_worker.py's opt-in first-output watchdog (item 10): the
+        # provider produced nothing, which is not the writer's fault.
+        "no first output",
     )
     if any(p in low for p in transport_patterns):
         return "transport"

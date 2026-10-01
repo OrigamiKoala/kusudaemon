@@ -115,7 +115,12 @@ async def run_assembly_loop(
 
     review: DocumentReviewResult | None = None
     if document_review:
-        review = run_document_review(run_dir, tree, provider, log=log)
+        # LONGGENBENCH-RESULTS-2026-09 §4.1 item 8: stamp the role so the
+        # review's calls land under "reviewer" in cost rows, not "unknown".
+        from ..v1.provider import call_scope
+
+        with call_scope(role="reviewer"):
+            review = run_document_review(run_dir, tree, provider, log=log)
         if review.escalated:
             return AssemblyRunResult(
                 assembly=assembly,

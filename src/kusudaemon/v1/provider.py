@@ -444,6 +444,44 @@ class OpenAICompatibleProvider(RoleProviderBase):
         # one run can't starve the endpoint for the other.
         self._throttle = threading.Semaphore(max(1, concurrency))
 
+    def _report_schema_failure(
+        self,
+        error: str,
+        *,
+        content: str,
+        reasoning: str,
+        attempt: int,
+        parsed: Any = None,
+        head_chars: int = 1500,
+    ) -> None:
+        """LONGGENBENCH-RESULTS-2026-09 §4.1 item 4: raw responses were never
+        logged, so "$.action: missing required property" (13 cells) could not
+        be diagnosed. Emits a ``role_schema_failure`` event carrying the head
+        and tail of the raw content and the parsed keys. It rides the
+        degenerate hook (whose ``**info`` overrides the event ``type``), so no
+        second hook has to be wired through the role-provider proxies. Never
+        raises."""
+        hook = getattr(self, "_on_degenerate", None)
+        if hook is None:
+            return
+        try:
+            hook({
+                "type": "role_schema_failure",
+                "error": str(error)[:500],
+                "attempt": attempt,
+                "content_chars": len(content),
+                "content_head": content[:head_chars],
+                "content_tail": content[-head_chars:] if len(content) > head_chars else "",
+                "reasoning_chars": len(reasoning),
+                "parsed_keys": sorted(parsed.keys()) if isinstance(parsed, dict) else None,
+                "role": _scoped_role(self.role),
+                "phase": self.phase,
+                "call_node": _scoped_node(self.node_id),
+                "model": self.model,
+            })
+        except Exception:  # noqa: BLE001 — observability only
+            pass
+
     def _report_degenerate(self, reason: str, *, chars: int, action: str) -> None:
         """Tell the driver (``role_output_degenerate`` event); never raises."""
         hook = getattr(self, "_on_degenerate", None)
@@ -869,6 +907,13 @@ class OpenAICompatibleProvider(RoleProviderBase):
             else:
                 last_error = parse_error
 
+            self._report_schema_failure(
+                last_error,
+                content=content,
+                reasoning=str(message.get("reasoning_content") or ""),
+                attempt=validation_attempts + 1,
+                parsed=parsed,
+            )
             validation_attempts += 1
             if validation_attempts > retries:
                 break

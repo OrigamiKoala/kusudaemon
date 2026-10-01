@@ -4,6 +4,30 @@ Kusudaemon is an advanced agent harness engineered specifically for complex, lon
 
 Kusudaemon solves this by breaking down large goals into a tree of smaller, manageable subtasks. Each subtask is executed independently in a bounded environment and verified by code-based gates before being marked as complete.
 
+The harness successfully ***doubles*** the mean completion rate on LongGenBench, as well as the rate of which the whole task is completed.
+
+### Results
+
+Long-horizon benchmark results on **LongGenBench** (September 2026 sweep: 120 runs across 20 tasks × 2 arms × 3 seeds, 5400 s per-run limit, using `nvidia/nemotron-3.5-lightning-30b-a3b`):
+
+| Metric | Bare OpenCode (Arm A) | Kusudaemon (Arm C) | Delta |
+|---|---|---|---|
+| **Mean completion rate** | **43.8 %** | **93.9 %** | **+50.2 points** |
+| **Whole task completed** (100 % units present) | **23 / 60 (38.3 %)** | **55 / 60 (91.7 %)** | **+53.4 points** |
+| Median completion rate | 11.3 % | 100.0 % | +88.7 points |
+| Tasks with 3 / 3 seeds finished | 3 of 20 | 16 of 20 | +13 tasks |
+| Wall clock per *fully completed* document | 57.9 min | 56.3 min | Comparable cost |
+
+**By task type:**
+- **Week diary** (52 units): Arm A 55.6 % (7/15 whole) → **Arm C 100 % (15/15 whole)**
+- **Building floor plan** (100 units): Arm A 65.1 % (9/15 whole) → **Arm C 96.9 % (14/15 whole)**
+- **City blocks** (100 units): Arm A 32.5 % (4/15 whole) → **Arm C 100 % (15/15 whole)**
+- **Weekly menus** (52 units, heavy constraints): Arm A 21.8 % (3/15 whole) → **Arm C 78.7 % (11/15 whole)**
+
+Kusudaemon roughly doubles the completion rate and finishes whole documents more than twice as often as the bare agent. Bare agents display bimodal behavior (either finishing or collapsing early due to context drift or clobbered outputs), whereas Kusudaemon's outer-loop gates, unit stubs, stall nudges, and resume/salvage recovery ensure consistent task completion with comparable wall-clock cost per finished document.
+
+For full methodology, breakdown by seed, and caveats, see [`docs/LONGGENBENCH-RESULTS-2026-09.md`](docs/LONGGENBENCH-RESULTS-2026-09.md) and [`BENCHMARKING.md`](BENCHMARKING.md).
+
 ### Core Architectural Invariants
 Kusudaemon is built around a few strict design principles:
 
@@ -438,6 +462,7 @@ and each owns one question:
 |---|---|
 | `CLAUDE.md` | Commands and architecture overview for working on the codebase. |
 | `BENCHMARKING.md` | Everything about benchmarking: the experimental design (§0), setup and commands (§2–§6), and the hermetic-suite gate that precedes any sweep (§9). |
+| `docs/LONGGENBENCH-RESULTS-2026-09.md` | 120-run empirical results, statistics, caveats, and forensic bug audit for the LongGenBench sweep. |
 | `PLAN-BENCH-INTEGRITY.md` | What the first sweeps found, which runs must be quarantined, and the repairs still open. |
 | `docs/PLAN-WORKSPACE-MODE.md` | Why arm C underperforms a bare backend on workspace tasks, and the flagged fixes for it. |
 | `PLAN-CONCURRENCY-AND-SHARED-STATE.md` | Parallelism, worktrees and rate-limit control — proposals with the case against each. Nothing there is decided. |

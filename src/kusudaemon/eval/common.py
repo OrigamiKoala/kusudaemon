@@ -22,10 +22,14 @@ _TRANSPORT_PATTERNS = (
 
 _BUDGET_PATTERNS = (
     "wall_clock_budget", "run budget", "budget exhausted",
+    "wall clock budget",
 )
 
 
-def classify_halt(halt_reason: str | None) -> HaltCategory:
+def classify_halt(
+    halt_reason: str | None,
+    completion_pct: float | None = None,
+) -> HaltCategory:
     """PLAN-BENCH-INTEGRITY.md §4.2: Classify a benchmark halt reason into
     'ok' | 'transport' | 'budget' | 'agent' | 'unknown'.
 
@@ -33,13 +37,22 @@ def classify_halt(halt_reason: str | None) -> HaltCategory:
     (e.g. "escalated in execute: no detail") is not evidence of model
     capability — it carries no signal about what stopped the run — so it
     classifies as "unknown", quarantined like transport/budget but counted
-    separately so quarantine reason counts stay honest."""
+    separately so quarantine reason counts stay honest.
+
+    LONGGENBENCH-RESULTS-2026-09 §4.1 item 3: a "no detail" halt whose
+    document is known to be incomplete (``completion_pct`` below 100) is a
+    real failure of the run, not a missing signal — quarantining it as
+    "unknown" removed three genuine failures from arm C's mean and moved it
+    from 93.9 % to 99.0 %. Callers that know the completion rate pass it;
+    with ``completion_pct=None`` the old "unknown" behaviour is unchanged."""
     if not halt_reason or not str(halt_reason).strip():
         return "ok"
     low = str(halt_reason).strip().lower()
     if low in ("none", "done", "complete", "success", "resolved"):
         return "ok"
     if "no detail" in low:
+        if completion_pct is not None and float(completion_pct) < 100.0:
+            return "agent"
         return "unknown"
     if any(p in low for p in _BUDGET_PATTERNS) or (
         re.search(r"\btimeout after \d+s", low)

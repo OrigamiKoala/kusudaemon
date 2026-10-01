@@ -430,6 +430,103 @@ class RunReport:
         return asdict(self)
 
 
+
+def resolve_final_artifact(run_dir: str | Path) -> Path | None:
+    """Resolve the file a finished run should export.
+
+    LONGGENBENCH-RESULTS-2026-09 §4.1 item 1: the old resolver returned the
+    first ``out/*.md`` file. A writer that used the parts layout
+    (``out/single/part-NN.md``) leaves a 0-byte (or no) ``out/single.md``
+    stub, so the stub was exported and a complete document shipped as an
+    empty file (6 of 60 arm-C cells; ``kusudaemon run`` did the same).
+
+    Order: a non-empty ``assembly/main.md``; then the single/direct node,
+    resolved through ``node_artifact_text`` (which prefers parts) — parts are
+    materialized into ``assembly/main.md``, a plain non-empty file is
+    returned as is; then the first non-empty ``out/*.md``; then the passed
+    nodes' resolved text concatenated into ``assembly/main.md``. Falls back to
+    the old behaviour (possibly an empty file) only when nothing has content,
+    so callers still see *a* path.
+    """
+    from ..v0.run_dir import node_artifact_text, node_parts_dir
+    from ..v6.direct import DIRECT_NODE_ID
+
+    run_dir = Path(run_dir)
+    assembly_main = run_dir / "assembly" / "main.md"
+
+    def _nonempty(p: Path) -> bool:
+        try:
+            return p.is_file() and p.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _materialize(text: str) -> Path | None:
+        try:
+            assembly_main.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(assembly_main, text)
+            return assembly_main
+        except OSError:
+            return None
+
+    if _nonempty(assembly_main):
+        return assembly_main
+
+    out_dir = run_dir / "out"
+    for node_id in (SINGLE_NODE_ID, DIRECT_NODE_ID):
+        parts_d = node_parts_dir(run_dir, node_id)
+        has_parts = parts_d.is_dir() and any(parts_d.glob("*.md"))
+        stub = out_dir / f"{node_id}.md"
+        if not has_parts and not stub.exists():
+            continue
+        try:
+            text = node_artifact_text(run_dir, node_id)
+        except (FileNotFoundError, OSError):
+            continue
+        if not text.strip():
+            continue
+        if has_parts:
+            got = _materialize(text)
+            if got is not None:
+                return got
+        elif _nonempty(stub):
+            return stub
+
+    if out_dir.is_dir():
+        for md in sorted(out_dir.glob("*.md")):
+            if _nonempty(md):
+                return md
+
+    # Decomposed run with parts-layout leaves and no assembly output: join
+    # every passed node's resolved text in tree order.
+    try:
+        tree = TaskTree.load(tree_path(run_dir)) if tree_path(run_dir).exists() else None
+    except Exception:  # noqa: BLE001 — resolution must never raise
+        tree = None
+    if tree is not None:
+        texts: list[str] = []
+        for node in tree.nodes.values():
+            if node.status != "passed":
+                continue
+            try:
+                t = node_artifact_text(run_dir, node.id)
+            except (FileNotFoundError, OSError):
+                continue
+            if t.strip():
+                texts.append(t.rstrip())
+        if texts:
+            got = _materialize("\n\n".join(texts) + "\n")
+            if got is not None:
+                return got
+
+    if assembly_main.is_file():
+        return assembly_main
+    if out_dir.is_dir():
+        md_files = sorted(out_dir.glob("*.md"))
+        if md_files:
+            return md_files[0]
+    return None
+
+
 WriterAdapterFactory = Callable[[TaskNode], AgentAdapter]
 ResearchAdapterFactory = Callable[[TaskNode, ResearchQuery], AgentAdapter]
 ProbeAdapterFactory = Callable[[ResearchQuery], AgentAdapter]
@@ -609,6 +706,7 @@ class RecursiveDriver:
         # by then anyway).
         heartbeat = start_heartbeat_thread(self.run_dir)
         self._start_time = time.time()
+        self._start_mono = time.monotonic()
         try:
             report = await self._run_phase("classify", round_index=0)
             ran: set[str] = {"classify"}
@@ -625,10 +723,11 @@ class RecursiveDriver:
                             break
                     if next_phase is None:
                         break
-                    if self._halted():
-                        self._set_phase(next_phase, _HALTED, detail=f"halted before {next_phase}")
-                        self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting"})
-                        report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
+                    cause = self._halt_cause()
+                    if cause is not None:
+                        self._set_phase(next_phase, _HALTED, detail=f"halted before {next_phase}: {cause}")
+                        self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting", "cause": cause})
+                        report = RunReport(status="halted", phase=next_phase, detail=cause)
                         break
                     report = await self._run_phase(next_phase, round_index=round_index)
                     if report.status != "done":
@@ -688,16 +787,11 @@ class RecursiveDriver:
             heartbeat.stop()
 
     def _resolve_final_artifact_path(self) -> Path | None:
-        """Find the primary assembled artifact or single output file."""
-        assembly_main = self.run_dir / "assembly" / "main.md"
-        if assembly_main.is_file():
-            return assembly_main
-        out_dir = self.run_dir / "out"
-        if out_dir.is_dir():
-            md_files = sorted(out_dir.glob("*.md"))
-            if md_files:
-                return md_files[0]
-        return None
+        """Find the primary assembled artifact or single output file.
+
+        LONGGENBENCH-RESULTS-2026-09 §4.1 item 1: see
+        ``resolve_final_artifact``."""
+        return resolve_final_artifact(self.run_dir)
 
     def _build_closing_statement(
         self,
@@ -860,7 +954,50 @@ class RecursiveDriver:
         if self.options.wall_clock_budget is None:
             return None
         elapsed = time.time() - getattr(self, "_start_time", time.time())
+        elapsed -= self._clock_skew_seconds()
         return max(0.0, self.options.wall_clock_budget - elapsed)
+
+    # A gap this large between the wall clock and the monotonic clock is a
+    # suspended machine, not clock noise (NTP steps are a second or two).
+    _CLOCK_SKEW_THRESHOLD_S = 30.0
+
+    def _clock_skew_seconds(self) -> float:
+        """LONGGENBENCH-RESULTS-2026-09 §4.1 item 7: time the machine spent
+        asleep since the run started, to exclude from the wall-clock budget.
+
+        ``time.monotonic`` does not advance while the machine is suspended
+        (macOS ``mach_absolute_time``, Linux ``CLOCK_MONOTONIC``) but
+        ``time.time`` does, so ``wall elapsed - monotonic elapsed`` is the
+        sleep. 247-s3 lost 3684 s that way, overran its budget and scored 0 %.
+        Below the threshold the gap is treated as noise. A ``clock_skew_detected``
+        event is logged whenever the excluded total grows by another
+        threshold's worth. (The ``caffeinate`` wrapper that prevents the sleep
+        itself belongs in the bench script, not here.)"""
+        start_mono = getattr(self, "_start_mono", None)
+        start_wall = getattr(self, "_start_time", None)
+        if start_mono is None or start_wall is None:
+            return 0.0
+        skew = (time.time() - start_wall) - (time.monotonic() - start_mono)
+        if skew < self._CLOCK_SKEW_THRESHOLD_S:
+            return 0.0
+        last = getattr(self, "_skew_logged", 0.0)
+        if skew - last >= self._CLOCK_SKEW_THRESHOLD_S:
+            self._skew_logged = skew
+            try:
+                self._log({
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "clock_skew_detected",
+                    "skew_seconds": round(skew, 1),
+                    "detail": (
+                        f"wall clock ran {skew:.0f}s ahead of the monotonic clock "
+                        "(machine suspended?); excluded from the wall-clock budget"
+                    ),
+                })
+            except Exception:  # noqa: BLE001 — observability only
+                pass
+        return skew
 
     async def _run_phase(self, phase: str, *, round_index: int) -> RunReport:
         if self._phase_done(phase):
@@ -889,9 +1026,10 @@ class RecursiveDriver:
                     self._set_phase(phase, _HALTED, detail=f"halted on wall clock budget in {phase}")
                     halt_path(self.run_dir).write_text("wall clock budget exhausted", encoding="utf-8")
                     return RunReport(status="halted", phase=phase, detail="wall clock budget exhausted")
-            if self._halted():
-                self._set_phase(phase, _HALTED, detail=f"halted in {phase}")
-                return RunReport(status="halted", phase=phase, detail="halted by operator")
+            cause = self._halt_cause()
+            if cause is not None:
+                self._set_phase(phase, _HALTED, detail=f"halted in {phase}: {cause}")
+                return RunReport(status="halted", phase=phase, detail=cause)
             t_attempt_start = time.time()
             try:
                 outcome: Any = await getattr(self, f"_phase_{phase}")()
@@ -970,7 +1108,10 @@ class RecursiveDriver:
             os._exit(137)
         if self._check_cost_ceiling():
             return RunReport(status="halted", phase=phase, detail="halted on cost ceiling")
-        return RunReport(status=status, phase=phase)
+        # LONGGENBENCH-RESULTS-2026-09 §4.1 item 3: the detail read from
+        # phase.json above used to be dropped here, so every escalated phase
+        # reached the benchmark as "escalated in execute: no detail".
+        return RunReport(status=status, phase=phase, detail=detail)
 
     def _reasoning_sink(self, pseudo_node_id: str) -> Callable[[str], None]:
         trace_path = node_trace_path(self.run_dir, pseudo_node_id)
@@ -2412,6 +2553,9 @@ class RecursiveDriver:
                 # promotion trigger). Log the actionable summary before the
                 # phase reports "escalated".
                 self._log_blocked_tree(tree)
+                # LONGGENBENCH-RESULTS-2026-09 §4.1 item 3: name the cause in
+                # the phase record too, so the report is never "no detail".
+                self._set_phase("execute", "escalated", detail=_blocked_detail(tree))
             else:
                 passed_count = sum(1 for n in tree.nodes.values() if n.status == "passed")
                 total_count = len([n for n in tree.nodes.values() if n.status != "split"])
@@ -2721,6 +2865,27 @@ class RecursiveDriver:
         if tree.is_blocked():
             return False
         if self._current_tier() == "T2":
+            # LONGGENBENCH-RESULTS-2026-09 §4.1 item 8: with a wall-clock
+            # budget this late, a document-review call (142-s3: ~14 min) can
+            # only cost the run its finished document. Skip it.
+            rem = self._remaining_budget_seconds()
+            min_rem = _doc_review_min_remaining_s()
+            if rem is not None and rem < min_rem:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "reviewer",
+                        "round": 0,
+                        "type": "document_review_skipped",
+                        "reason": "wall_clock_budget",
+                        "remaining_seconds": round(rem, 1),
+                        "detail": (
+                            f"remaining wall-clock budget ({rem:.0f}s) < {min_rem:.0f}s; "
+                            "skipping document review"
+                        ),
+                    }
+                )
+                return None
             try:
                 review = await self._document_review_cached_pass(tree, keep_depth_pass=False)
             except ProviderError as exc:
@@ -2819,16 +2984,39 @@ class RecursiveDriver:
                 }
             )
             return DocumentReviewResult()
-        review = await asyncio.to_thread(
-            run_document_review,
-            self.run_dir,
-            tree,
-            self.provider,
-            keep_depth_pass=keep_depth_pass,
-            log=self.log,
-            on_reasoning=self._reasoning_sink("phase-review"),
-            streaming=True,
-        )
+        def _run_stamped() -> DocumentReviewResult:
+            # §4.1 item 8: its calls carried no role stamp (`calls_by_role`
+            # said "unknown"). The scope is thread-local, so it is entered in
+            # the worker thread, not here.
+            from ..v1.provider import call_scope
+
+            with call_scope(role="reviewer"):
+                return run_document_review(
+                    self.run_dir,
+                    tree,
+                    self.provider,
+                    keep_depth_pass=keep_depth_pass,
+                    log=self.log,
+                    on_reasoning=self._reasoning_sink("phase-review"),
+                    streaming=True,
+                )
+
+        # …and a wall-clock cap: never wait past the endgame reserve.
+        rem = self._remaining_budget_seconds()
+        timeout = None if rem is None else max(1.0, rem - 180.0)
+        try:
+            review = await asyncio.wait_for(asyncio.to_thread(_run_stamped), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "reviewer",
+                    "round": 0,
+                    "type": "document_review_timeout",
+                    "detail": f"document review exceeded the remaining wall-clock budget ({timeout:.0f}s usable); continuing without it",
+                }
+            )
+            return DocumentReviewResult()
         self._write_document_review_cache(digest, review)
         return review
 
@@ -2932,6 +3120,26 @@ class RecursiveDriver:
             self.options.document_review and not self.options.disable_review and self._current_tier() == "T3"
         )
         review_digest: str | None = None
+        if run_full_document_review:
+            # §4.1 item 8: same late-budget skip as the T2 pass.
+            rem = self._remaining_budget_seconds()
+            min_rem = _doc_review_min_remaining_s()
+            if rem is not None and rem < min_rem:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "reviewer",
+                        "round": 0,
+                        "type": "document_review_skipped",
+                        "reason": "wall_clock_budget",
+                        "remaining_seconds": round(rem, 1),
+                        "detail": (
+                            f"remaining wall-clock budget ({rem:.0f}s) < {min_rem:.0f}s; "
+                            "skipping document review"
+                        ),
+                    }
+                )
+                run_full_document_review = False
         if run_full_document_review:
             review_digest = self._document_review_digest(self._load_tree(), keep_depth_pass=True)
             if self._document_review_cache_hit(review_digest):
@@ -3257,22 +3465,44 @@ class RecursiveDriver:
                 + "\n"
             )
 
-    def _halted(self) -> bool:
-        if halt_path(self.run_dir).exists():
-            return True
+    # Reasons ``halt.flag`` can carry when the harness itself wrote it.
+    _SYSTEM_HALT_REASONS = ("cost ceiling", "token ceiling", "wall clock budget exhausted")
+
+    def _halt_cause(self) -> str | None:
+        """LONGGENBENCH-RESULTS-2026-09 §4.1 item 6: why the run should stop,
+        or None. ``halt.flag`` written by the operator is "halted by
+        operator"; a flag the harness wrote itself (cost/token ceiling, the
+        wall-clock budget) and the wall-clock endgame report their own cause —
+        the endgame used to be reported as "halted by operator", which
+        ``classify_halt`` scored as an agent failure instead of a budget stop.
+        The endgame event is logged once, not on every poll."""
+        flag = halt_path(self.run_dir)
+        if flag.exists():
+            try:
+                text = flag.read_text(encoding="utf-8").strip()
+            except OSError:
+                text = ""
+            if text in self._SYSTEM_HALT_REASONS:
+                return text
+            return "halted by operator"
         rem = self._remaining_budget_seconds()
         if rem is not None and rem < 180.0:
             # D1: Wall-clock budget aware — reserve 180s for endgame (assembly/harvest)
-            self._log({
-                "node_id": "-",
-                "role": "harness",
-                "round": 0,
-                "type": "wall_clock_endgame",
-                "remaining_seconds": rem,
-                "detail": f"remaining wall-clock budget ({rem:.1f}s) < 180s; halting to enter endgame",
-            })
-            return True
-        return False
+            if not getattr(self, "_endgame_logged", False):
+                self._endgame_logged = True
+                self._log({
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "wall_clock_endgame",
+                    "remaining_seconds": rem,
+                    "detail": f"remaining wall-clock budget ({rem:.1f}s) < 180s; halting to enter endgame",
+                })
+            return "wall clock budget exhausted"
+        return None
+
+    def _halted(self) -> bool:
+        return self._halt_cause() is not None
 
     def _load_tree(self) -> TaskTree:
         """§11.6: a tree.json that exists but cannot be parsed is a corrupt
@@ -3485,6 +3715,28 @@ def _read_phase(run_dir: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _doc_review_min_remaining_s() -> float:
+    """Below this much remaining wall clock, document review is skipped."""
+    try:
+        return float(os.getenv("KUSUDAEMON_DOC_REVIEW_MIN_REMAINING_S", "600"))
+    except ValueError:
+        return 600.0
+
+
+def _blocked_detail(tree: TaskTree, limit: int = 3) -> str:
+    """``blocked: unit-01: <defect>; ...`` for the phase detail (§4.1 item 3)."""
+    parts: list[str] = []
+    blocked = [n for n in tree.nodes.values() if n.status == "blocked"]
+    for n in sorted(blocked, key=lambda n: n.id)[:limit]:
+        defect = " ".join((n.last_defect or "no defect recorded").split())
+        if len(defect) > 160:
+            defect = defect[:157] + "..."
+        parts.append(f"{n.id}: {defect}")
+    more = len(blocked) - limit
+    suffix = f" (+{more} more blocked)" if more > 0 else ""
+    return "blocked: " + "; ".join(parts) + suffix if parts else "blocked"
 
 
 def _count_statuses(tree: TaskTree) -> dict[str, int]:

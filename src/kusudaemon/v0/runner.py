@@ -121,6 +121,16 @@ def _snapshot_pre_writer(run_dir: str | Path, node_id: str, max_keep: int = 3) -
         return None
 
 
+def _artifact_bytes(run_dir: Path, node_id: str) -> int:
+    """Bytes of the node's resolved artifact (parts-aware); 0 when absent."""
+    from .run_dir import node_artifact_text
+
+    try:
+        return len(node_artifact_text(run_dir, node_id).strip().encode("utf-8"))
+    except (FileNotFoundError, OSError):
+        return 0
+
+
 def _continuation_prompt(
     run_dir: Path, node_id: str, prompt: str, resume_session_id: str | None
 ) -> str:
@@ -191,7 +201,12 @@ def _continuation_prompt(
         )
         overwrite_rule = (
             "Write incrementally: write each unit as its own new file and move on "
-            "so a later interruption never loses finished sections."
+            "so a later interruption never loses finished sections.\n"
+            "Work in small batches: at most 3 to 5 units per tool call, appending "
+            f"to the artifact (for a single file, `cat >> {artifact} <<'EOF'`) "
+            "and never re-emitting what is already written. A turn spent "
+            "planning or drafting a whole document before the first write is "
+            "how the previous attempt ran out of time with nothing on disk."
         )
     return (
         f"{prompt}\n\n[Harness notice — CONTINUATION, not a fresh task]\n"
@@ -335,6 +350,7 @@ async def run_node(
 
     resume_session_id: str | None = None
     dispatch_reason = "dispatched"
+    stalled_empty = False
     parts_d = Path(run_dir) / "out" / node_id
     has_unit_stubs = parts_d.is_dir() and any(parts_d.glob("u*.md"))
     if session is not None and session.get("session_id"):
@@ -351,6 +367,24 @@ async def run_node(
             if supports_resume and resumable and not session_deleted
             else None
         )
+        # LONGGENBENCH-RESULTS-2026-09 §4.1 item 5: a session that has already
+        # run an episode and left the artifact empty is not worth resuming —
+        # 294-s1 resumed such sessions into 30k+ token contexts for ~3000 s
+        # and each wrote nothing. A fresh session, told to work in small
+        # batches (see ``_continuation_prompt``), is the cheaper bet. A
+        # nudge (the harness's own same-session continue) is exempt.
+        if (
+            degenerate_detail is None
+            and nudge is None
+            and supports_resume
+            and resumable
+            and not session_deleted
+            and completed is not None
+            and _artifact_bytes(run_dir, node_id) == 0
+            and os.getenv("KUSUDAEMON_STALLED_SESSION_FRESH", "1") != "0"
+        ):
+            degenerate_detail = "previous episode ended with the artifact still empty"
+            stalled_empty = True
         # armc-wall-clock-brainstorm §A4: On retries of unit-based leaves,
         # dispatch a fresh session briefed only on the missing ordinals
         # rather than resuming a degenerated session.
@@ -379,7 +413,7 @@ async def run_node(
             if session_deleted:
                 dispatch_reason = "session_deleted"
             elif degenerate_detail is not None:
-                dispatch_reason = "session_degenerate"
+                dispatch_reason = "session_stalled_empty" if stalled_empty else "session_degenerate"
             else:
                 dispatch_reason = "resume_unsupported" if not supports_resume else "fresh_session_continuation"
             redispatch: dict[str, Any] = {

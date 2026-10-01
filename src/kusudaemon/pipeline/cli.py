@@ -988,7 +988,7 @@ def _derive_termination(resolved: bool, halt_reason: str | None, tree: Any = Non
     low = (halt_reason or "").lower()
     if "episode_timeout" in low or "episode wall clock" in low:
         return "episode_timeout"
-    if "wall_clock_budget" in low or "timeout after" in low or "harness_timeout" in low or "timed out after" in low:
+    if "wall_clock_budget" in low or "wall clock budget" in low or "timeout after" in low or "harness_timeout" in low or "timed out after" in low:
         return "harness_timeout"
     if any(k in low for k in ("429", "500", "502", "503", "504", "rate limit", "quota", "provider", "auth", "remoteprotocolerror", "connection")):
         return "provider_error"
@@ -1280,9 +1280,19 @@ def cmd_bench(
             "round": round_index,
             "model": model,
             "backend": backend,
-            "score": 1.0 if resolved else 0.0,
-            "resolved": resolved,
-            "termination": _derive_termination(resolved, halt_reason),
+            # `resolved` above is the PROCESS EXIT CODE, not a score. For a
+            # generation benchmark (an artifact delimiter is declared) the bare
+            # arm has no gates to say whether the document is finished, so the
+            # record must not claim a score: 2026-09-30 audit found all 60
+            # LongGenBench arm-A records "1.0 / resolved / gates_satisfied",
+            # including 37 below 100 % and 28 at 10 % or less. The benchmark
+            # runner scores the artifact and writes score/resolved/termination
+            # back (scripts/run_longgen_bench.py::write_back_arm_a_record).
+            "score": (None if delimiter else (1.0 if resolved else 0.0)),
+            "resolved": (None if delimiter else resolved),
+            "termination": ("unscored" if delimiter else _derive_termination(resolved, halt_reason)),
+            "score_basis": ("unscored" if delimiter else "process_exit_code"),
+            "process_exit_code": exit_code,
             "token_unit": "tokenizer-v1",
             "max_parallel": 1,
             "max_parallel_derived": 1,
@@ -1514,7 +1524,12 @@ def cmd_bench(
                 t_path = tree_path(run_dir)
                 if t_path.is_file():
                     try:
-                        nodes_total = len(TaskTree.load(t_path).nodes)
+                        # §4.1 item 1: count node statuses, not manifest rows
+                        # (retries add rows; split parents never pass).
+                        _tree = TaskTree.load(t_path)
+                        _live = [n for n in _tree.nodes.values() if n.status != "split"]
+                        nodes_total = len(_live)
+                        nodes_passed = sum(1 for n in _live if n.status == "passed")
                     except Exception:
                         nodes_total = len(entries)
                 else:
@@ -1563,6 +1578,20 @@ def cmd_bench(
                                 mds = sorted(out_dir.glob("*.md"))
                                 if mds:
                                     artifact_path = str(mds[0])
+            except Exception:
+                pass
+
+        # §4.1 item 1: a "done" run whose recorded artifact is missing or empty
+        # (a parts-layout stub exported by an older driver, or a resumed run)
+        # is re-resolved from the node files before being scored.
+        if resolved and not (
+            artifact_path and Path(artifact_path).is_file() and Path(artifact_path).stat().st_size > 0
+        ):
+            try:
+                from .driver import resolve_final_artifact
+                alt = resolve_final_artifact(run_dir)
+                if alt is not None and alt.is_file() and alt.stat().st_size > 0:
+                    artifact_path = str(alt)
             except Exception:
                 pass
 
@@ -1659,8 +1688,8 @@ def cmd_bench(
         print(f"arm:           {arm}")
         print(f"seed:          {seed}")
         print(f"model:         {model} ({backend})")
-        print(f"resolved:      {resolved}")
-        print(f"score:         {score}")
+        print(f"resolved:      {record.get('resolved')}")
+        print(f"score:         {record.get('score')}")
         print(f"tier:          measured={record['tier_measured']} final={record['tier_final']}")
         print(f"wall clock:    {wall_clock_s}s")
         print(f"calls by role: {record['calls_by_role']}")

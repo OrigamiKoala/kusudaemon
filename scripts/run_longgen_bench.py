@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -62,6 +63,24 @@ from longgen_common import (  # noqa: E402
     task_id_for,
     to_output_blocks,
 )
+from longgen_integrity import (  # noqa: E402
+    DEFAULT_EXCLUDED_TASKS,
+    IncompleteMatrixError,
+    UNKNOWN_PROVENANCE,
+    assign_attempts,
+    cell_stem,
+    code_provenance,
+    expected_cells,
+    format_reconcile,
+    opencode_provider_errors,
+    opencode_session_tokens,
+    provider_error_halt_reason,
+    reconcile_cells,
+    record_validity,
+    resolve_artifact_path,
+    summarize_matrix,
+    write_back_scored_record,
+)
 
 LONGGEN_REPO = "https://github.com/mozhu621/LongGenBench.git"
 DEFAULT_BACKEND = "opencode"
@@ -82,6 +101,29 @@ DATASETS = {
     "short": "Dataset/Dataset_short.json",
     "long": "Dataset/Dataset_long.json",
 }
+
+
+# --------------------------------------------------------------------------
+# keep the machine awake
+# --------------------------------------------------------------------------
+
+
+def with_caffeinate(cmd: list[str], *, enabled: bool = True) -> list[str]:
+    """Prefix ``cmd`` with ``caffeinate -ims`` so the laptop cannot sleep mid-run.
+
+    247-menu-week armC seed3 lost 3684 s with no events (the machine slept, per
+    ``pmset``), overran its budget (7550 s) and finished at 0 %, the only
+    reason arm C scores below arm A on any task. ``caffeinate`` ships with
+    macOS and exits when its command does; where it is absent (Linux, a
+    minimal VM) the command runs unwrapped. ``KUSUDAEMON_NO_CAFFEINATE=1`` or
+    ``--no-caffeinate`` turns this off.
+    """
+    if not enabled or os.environ.get("KUSUDAEMON_NO_CAFFEINATE") == "1":
+        return list(cmd)
+    exe = shutil.which("caffeinate")
+    if not exe:
+        return list(cmd)
+    return [exe, "-ims", *cmd]
 
 
 # --------------------------------------------------------------------------
@@ -363,8 +405,10 @@ def _persist_artifact(artifact_path: Path, text: str) -> None:
     try:
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(text, encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        # Never swallow this: a record that says "artifact_chars=N" over a file
+        # that was never written is exactly how predictions got corrupted.
+        print(f"[WARNING] could not persist artifact to {artifact_path}: {exc}", file=sys.stderr)
 
 
 def harvest_artifact(
@@ -548,6 +592,30 @@ def archive_stale_cell(
     return moved
 
 
+def score_text(raw_text: str, item: dict[str, Any]) -> tuple[float, dict[int, str]]:
+    """Completion rate and parsed blocks for one generation (single scorer for
+    the runner, the recompute script and the predictions)."""
+    blocks = to_output_blocks(raw_text, item)
+    parsed = parse_blocks(blocks, str(item.get("type", "")))
+    return calculate_completion_rate(parsed, int(item.get("number", 0))), parsed
+
+
+def next_attempt(
+    records: list[dict[str, Any]], task_id: str, arm: str, seed: int, *, real_run: bool
+) -> int:
+    """Attempt number for a new row of a cell: a real run opens a new attempt,
+    a ``--score-only`` rescore stays in the latest one (see assign_attempts)."""
+    prior = [
+        int(r.get("attempt") or 1)
+        for r in records
+        if r.get("task_id") == task_id and r.get("arm") == arm and r.get("seed") == seed
+        and not r.get("dry_run")
+    ]
+    if not prior:
+        return 1
+    return max(prior) + 1 if real_run else max(prior)
+
+
 def run_one(
     *,
     index: int,
@@ -656,7 +724,7 @@ def run_one(
         timed_out = False
         import signal
         proc = subprocess.Popen(
-            cmd,
+            with_caffeinate(cmd, enabled=not getattr(args, "no_caffeinate", False)),
             cwd=str(_REPO_ROOT),
             env=env,
             stdout=subprocess.PIPE,
@@ -757,28 +825,63 @@ def run_one(
         seed=seed,
         run_id=run_id,
     )
-    blocks = to_output_blocks(raw_text, item)
-    parsed = parse_blocks(blocks, str(item.get("type", "")))
-    completion = calculate_completion_rate(parsed, int(item.get("number", 0)))
+    completion, parsed = score_text(raw_text, item)
 
     halt_reason = record.get("halt_reason") or (stderr[-300:] if returncode != 0 else None)
-    halt_category = classify_halt(halt_reason)
-    # PLAN-SWEEP-REPAIR.md §C2: "unknown" (escalation with no detail) is
-    # quarantined like transport/budget — not a capability measurement.
-    #
-    # §P4: unless the document was already finished when the halt landed. All
-    # three 000-week armC seeds wrote 52/52 blocks; seed1 then died in review
-    # on a truncated response and seed3 on a miscounted gate. Quarantining
-    # those discards a completion measurement that is fully on disk and, worse,
-    # discards exactly the runs where the harness (not the model) failed —
-    # which biases the arm-C mean upward. A halt after completion is a harness
-    # defect to fix, so it is recorded and surfaced, not excluded.
+
+    # §4.3.8 / §4.3.9: arm A's tokens and provider errors live in OpenCode's own
+    # store, not in anything `opencode run` prints. Read-only; a missing store
+    # degrades to "not recorded", loudly, never to a crash.
+    tokens_by_role = record.get("tokens_by_role", {}) or {}
+    arm_a_extras: dict[str, Any] = {}
+    if arm == "A" and not score_only:
+        sids = list(record.get("bare_session_ids") or [])
+        if sids:
+            try:
+                tk = opencode_session_tokens(sids)
+                if tk["total"] > 0:
+                    tokens_by_role = {"bare": tk["total"]}
+                arm_a_extras["tokens_detail"] = tk
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARNING] arm A tokens not recorded for {stem}: {exc}", file=sys.stderr)
+            try:
+                perr = opencode_provider_errors(sids)
+                arm_a_extras["provider_errors"] = perr
+                if completion < 100.0 and not halt_reason:
+                    halt_reason = provider_error_halt_reason(perr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARNING] arm A provider errors not checked for {stem}: {exc}", file=sys.stderr)
+        arm_a_extras["tokens_by_role"] = tokens_by_role
+    # §4.3.1: write the scored outcome back into bench/<stem>.json.
+    write_back_scored_record(
+        record_path,
+        arm=arm,
+        completion_rate=completion,
+        blocks_found=len(parsed),
+        blocks_expected=int(item.get("number", 0)),
+        halt_reason=halt_reason,
+        timed_out=timed_out,
+        extras=arm_a_extras or None,
+    )
+
     expected_blocks = int(item.get("number", 0) or 0)
     complete = expected_blocks > 0 and len(parsed) >= expected_blocks
-    quarantined = halt_category in ("transport", "budget", "unknown")
-    is_valid = (not quarantined) or complete
-    invalid_reason = halt_category if not is_valid else None
+    # PLAN-SWEEP-REPAIR.md §C2 / §P4 / 2026-09-30: only transport and budget
+    # halts are quarantined, and never a run whose document is already
+    # complete. An "unknown" halt ("escalated in execute: no detail") says
+    # nothing about the provider, so it counts against the arm.
+    is_valid, invalid_reason = record_validity(
+        {
+            "halt_reason": halt_reason,
+            "completion_rate": completion,
+            "blocks_found": len(parsed),
+            "blocks_expected": expected_blocks,
+        }
+    )
     halt_after_complete = bool(halt_reason) and complete
+
+    # §4.3.7: which code really ran. Historic rows can only say "unknown".
+    provenance = code_provenance() if not score_only else dict(UNKNOWN_PROVENANCE)
 
     return {
         "benchmark": "longgenbench",
@@ -793,7 +896,7 @@ def run_one(
         "tier_measured": record.get("tier_measured"),
         "tier_final": record.get("tier_final"),
         "calls_by_role": record.get("calls_by_role", {}),
-        "tokens_by_role": record.get("tokens_by_role", {}),
+        "tokens_by_role": tokens_by_role,
         "wall_clock_s": record.get("wall_clock_s", wall_clock_s),
         "harness_wall_clock_s": wall_clock_s,
         "returncode": returncode,
@@ -813,6 +916,8 @@ def run_one(
         "dispatch_policy": record.get("dispatch_policy"),
         "commit": record.get("commit"),
         "stale_archived": stale_archived,
+        **provenance,
+        **({"provider_errors": arm_a_extras["provider_errors"]} if arm_a_extras.get("provider_errors") else {}),
     }
 
 
@@ -837,6 +942,13 @@ def _read_records_file(path: Path) -> list[dict[str, Any]]:
         if isinstance(rec, dict):
             records.append(rec)
     return records
+
+
+def latest_rows(records: list[dict[str, Any]]) -> dict[tuple[str, str, int], dict[str, Any]]:
+    """Final row of the final attempt per cell (all attempts stay in records.jsonl)."""
+    from longgen_integrity import latest_per_cell
+
+    return latest_per_cell(records)
 
 
 def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -874,9 +986,13 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             },
         )
         bucket["runs"] += 1
-        is_valid = rec.get("valid", True)
+        # Validity is recomputed from the halt reason and the document, never
+        # read from a stored flag: stored `valid` values from before 2026-09-30
+        # quarantined "unknown" halts with an incomplete document (it moved arm
+        # C's mean from 93.9 % to 99.0 %).
+        is_valid, invalid_reason = record_validity(rec)
         if not is_valid:
-            reason = rec.get("invalid_reason") or classify_halt(rec.get("halt_reason"))
+            reason = invalid_reason or classify_halt(rec.get("halt_reason"), float(rec.get("completion_rate") or 0.0))
             bucket["excluded_by_reason"][reason] = bucket["excluded_by_reason"].get(reason, 0) + 1
         else:
             bucket["valid_runs"] += 1
@@ -942,12 +1058,29 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+class PredictionArtifactError(RuntimeError):
+    """A record points at an artifact that cannot be read."""
+
+
 def write_predictions(
     records: list[dict[str, Any]],
     tasks: list[tuple[int, dict[str, Any]]],
     results_dir: Path,
+    *,
+    strict: bool = True,
 ) -> list[Path]:
-    """Write one upstream-format prediction file per (arm, seed)."""
+    """Write one upstream-format prediction file per (arm, seed).
+
+    Artifact paths resolve through ``resolve_artifact_path`` (recorded path,
+    then ``<results_dir>/raw/<basename>``, then ``raw/<stem>.*``): rows written
+    from a VM carry paths that do not exist here, and the old code turned
+    every ``OSError`` into an empty prediction (28 files held 37 characters).
+    A record that claims an artifact (``artifact_path`` set or
+    ``artifact_chars > 0``) whose file cannot be found raises
+    ``PredictionArtifactError`` when ``strict``; with ``strict=False`` it is
+    logged loudly and written empty. A record that legitimately holds nothing
+    (``artifact_chars == 0``, no path) is written empty with a note.
+    """
     by_index = {i: item for i, item in tasks}
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for rec in records:
@@ -961,6 +1094,7 @@ def write_predictions(
             continue
         grouped.setdefault((rec["arm"], rec["seed"]), []).append(rec)
 
+    problems: list[str] = []
     written: list[Path] = []
     pred_dir = results_dir / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -968,19 +1102,39 @@ def write_predictions(
         entries = []
         for rec in sorted(recs, key=lambda r: r["dataset_index"]):
             item = by_index[rec["dataset_index"]]
-            path = rec.get("artifact_path")
+            stem = cell_stem(rec["task_id"], arm, seed)
+            claims_artifact = bool(rec.get("artifact_path")) or (rec.get("artifact_chars") or 0) > 0
+            path = resolve_artifact_path(rec, results_dir)
             raw = ""
-            if path:
+            if path is None:
+                if claims_artifact and not rec.get("artifact_absent"):
+                    msg = (
+                        f"{stem}: record claims an artifact "
+                        f"(artifact_path={rec.get('artifact_path')!r}, "
+                        f"artifact_chars={rec.get('artifact_chars')}) but no file exists under "
+                        f"{results_dir / 'raw'}"
+                    )
+                    problems.append(msg)
+                    print(f"[ERROR] {msg}", file=sys.stderr)
+                else:
+                    print(f"[note] {stem}: no artifact; prediction is empty", file=sys.stderr)
+            else:
                 try:
-                    raw = Path(path).read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    raw = ""
+                    raw = path.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    msg = f"{stem}: cannot read {path}: {exc}"
+                    problems.append(msg)
+                    print(f"[ERROR] {msg}", file=sys.stderr)
             entry = build_prediction_record(item, raw)
             entry["task_id"] = rec["task_id"]
             entries.append(entry)
         out = pred_dir / f"predictions_arm{arm}_seed{seed}.json"
         out.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
         written.append(out)
+    if problems and strict:
+        raise PredictionArtifactError(
+            f"{len(problems)} prediction artifact(s) unreadable:\n  " + "\n  ".join(problems)
+        )
     return written
 
 
@@ -1056,6 +1210,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "artifact already on disk (finished or parked run) "
                         "and run the identical harvest + score + predictions "
                         "+ summary path. No generation, no API calls.")
+    p.add_argument("--no-caffeinate", action="store_true",
+                   help="Do not wrap each run in `caffeinate -ims` (macOS; the wrap is skipped "
+                        "automatically where caffeinate is absent).")
+    p.add_argument("--reconcile", action="store_true",
+                   help="Check that bench/, records.jsonl and raw/ agree for the selected "
+                        "matrix, print the report and exit (non-zero on a mismatch). Also run "
+                        "automatically at the end of every sweep.")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="Summarize a matrix that has cells without a record. The summary is "
+                        "then flagged partial and lists the missing cells; without this flag "
+                        "an incomplete matrix is refused.")
     p.add_argument("--list-tasks", action="store_true", help="Print the selection and exit.")
     p.add_argument("--dry-run", action="store_true", help="Print the matrix and exit.")
     p.add_argument("--verbose", action="store_true", help="Echo subprocess stderr.")
@@ -1119,6 +1284,14 @@ def main() -> int:
 
     records: list[dict[str, Any]] = []
     records_path = results_dir / "records.jsonl"
+    matrix = expected_cells(
+        [task_id_for(i, item) for i, item in tasks], args.arms, args.seeds
+    )
+    if args.reconcile:
+        prior = assign_attempts(read_records_jsonl(records_path))
+        report = reconcile_cells(results_dir, matrix, prior)
+        print(format_reconcile(report))
+        return 0 if report["ok"] else 1
     total = len(tasks) * len(args.arms) * len(args.seeds)
     done = 0
 
@@ -1138,6 +1311,12 @@ def main() -> int:
                     index=index, item=item, arm=arm, seed=seed,
                     args=args, results_dir=results_dir,
                 )
+                if not args.dry_run:
+                    rec["attempt"] = next_attempt(
+                        read_records_jsonl(records_path),
+                        rec["task_id"], rec["arm"], rec["seed"],
+                        real_run=not args.score_only,
+                    )
                 records.append(rec)
                 if not args.dry_run:
                     with open(records_path, "a", encoding="utf-8") as fh:
@@ -1162,11 +1341,26 @@ def main() -> int:
     # summarize silently folds another task's runs into this arm's stats.
     selected = {i for i, _ in tasks}
     all_records = [
-        r for r in dedupe_records(read_records_jsonl(records_path) + records)
+        r for r in dedupe_records(
+            assign_attempts(read_records_jsonl(records_path) + records),
+            key_fields=("task_id", "arm", "seed", "attempt"),
+        )
         if r.get("dataset_index") in selected
     ]
-    preds = write_predictions(all_records, tasks, results_dir)
-    summary = summarize(all_records)
+    final_rows = list(latest_rows(all_records).values())
+    preds = write_predictions(final_rows, tasks, results_dir)
+    report = reconcile_cells(results_dir, matrix, all_records)
+    print(format_reconcile(report))
+    legacy = summarize(final_rows)
+    try:
+        matrix_summary = summarize_matrix(all_records, matrix, allow_partial=args.allow_partial)
+    except IncompleteMatrixError as exc:
+        print(f"\n[ERROR] {exc}", file=sys.stderr)
+        print("summary.json not written.", file=sys.stderr)
+        return 3
+    summary = {**matrix_summary, "arms_legacy": legacy["arms"], "reconcile": report}
+    if "suspect_identical_seeds" in legacy:
+        summary["suspect_identical_seeds"] = legacy["suspect_identical_seeds"]
     (results_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

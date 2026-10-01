@@ -101,6 +101,18 @@ def make_verdict_schema(
     return schema
 
 
+_LOCATION_ONLY_RE = re.compile(
+    r"(?:§|section|sections|unit|units|block|blocks|floor|floors|week|weeks|"
+    r"entry|entries|item|items|part|parts|line|lines|lines?|chapter|chapters|"
+    r"day|days|step|steps|para|paragraph|paragraphs)?"
+    r"[\s§:.,;\-\u2010-\u2015#*]*"
+    r"(?:(?:section|sections|unit|units|block|blocks|floor|floors|week|weeks|entry|entries|"
+    r"item|items|part|parts|line|lines|chapter|chapters|day|days|step|steps|"
+    r"paragraph|paragraphs|and|to|through|of)\b[\s§:.,;\-\u2010-\u2015#*]*|\d+[\s§:.,;\-\u2010-\u2015#*]*)+",
+    re.IGNORECASE,
+)
+
+
 def is_malformed_defect(item_id: str, defect: Any) -> bool:
     """PLAN-REVIEW-READ-LOOP.md §R4.2: detect empty, none, or id-repeating defect text."""
     if not isinstance(defect, str):
@@ -109,6 +121,13 @@ def is_malformed_defect(item_id: str, defect: Any) -> bool:
     if not d or d.lower() in ("none", "n/a", "no defect", "null", "false", "undefined"):
         return True
     if d == item_id or d.strip("'\"") == item_id or d.lower() == item_id.lower():
+        return True
+    # LONGGENBENCH-RESULTS-2026-09 §4.1 item 9: a defect that names only a
+    # place ("§ Blocks 51-75", "unit 3") says nothing a writer can fix —
+    # 323-s1 unit-03 failed three times on one. Re-ask once, then
+    # `unavailable`. (Only a pure location is rejected: a word-count floor
+    # would also reject terse but real remarks such as "missing intro".)
+    if _LOCATION_ONLY_RE.fullmatch(d):
         return True
     return False
 

@@ -9,6 +9,10 @@ run traces and the OpenCode store:
   writing systems in one short span. (U+FFFD alone is not a signal: a
   writer that reads a binary file quotes plenty of it.)
 - **Think-tag storms.** 12k characters of ``</think></think>...``.
+- **Latin word salad.** Real words in no syntax at all (``Let of fromells
+  ...``, 294-s2): one script, so ``script_soup`` misses it, and no repeats, so
+  ``repetition_loop`` does too. Ordinary English is 30-50 % function words;
+  the salad is nearly none. See ``_word_salad`` for the guards.
 - **Loops.** ``0. 0. 0. ...``, ``n. \\nn. ...``, or one sentence repeated
   for 30k characters.
 
@@ -44,6 +48,25 @@ _REPEAT_MIN_CHARS = 1200
 _REPEAT_UNIQUE_MAX = 0.3
 _SHINGLE = 20
 _SHINGLE_STEP = 10
+
+# Word salad: long, newline-poor, letters-only prose with almost no function
+# words. Measured on every 3000-char window of this repo's docs and sources
+# (tests/test_longgen_41_fixes.py): healthy prose sits at 0.25+ function
+# words, so the 0.12 line leaves a wide margin.
+_SALAD_MIN_CHARS = 1500
+_SALAD_MIN_WORDS = 250
+_SALAD_LETTER_RATIO = 0.97
+_SALAD_STOPWORD_MAX = 0.12
+_SALAD_WORDS_PER_NEWLINE = 30
+_SALAD_DIGIT_MAX = 0.01
+_WORD_RE = re.compile(r"[A-Za-z']+")
+_STOPWORDS = frozenset(
+    "the of and to a in is that it for on with as are was be this by or from at an not have has had but "
+    "they you we he she his her their its which will would can could should there been were if so than "
+    "then them these those what when who how all any each more most other some such no nor only own same "
+    "too very do does did into out up about over after before between through during under again further "
+    "once here why where while because until against both few just now also i my your our me us him".split()
+)
 
 _EAST_ASIAN = {"CJK", "HIRAGANA", "KATAKANA", "KATAKANA-HIRAGANA", "HANGUL", "IDEOGRAPHIC", "HALFWIDTH", "FULLWIDTH", "BOPOMOFO"}
 _IGNORED = {"LATIN", "MODIFIER", "COMBINING", "SUPERSCRIPT", "SUBSCRIPT", "MATHEMATICAL", "DOUBLE-STRUCK", "SCRIPT", "BLACK-LETTER", "CIRCLED", "PARENTHESIZED", "SQUARED", "NEGATIVE"}
@@ -85,6 +108,41 @@ def _script_soup(window: str) -> bool:
     return sum(1 for n in counts.values() if n >= _SCRIPT_LETTERS_MIN) >= _SCRIPT_FAMILIES_MIN
 
 
+def _word_salad_window(window: str) -> bool:
+    if len(window) < _SALAD_MIN_CHARS:
+        return False
+    plain = sum(1 for ch in window if ch.isalpha() or ch in " \n'.,;!?-")
+    if plain < _SALAD_LETTER_RATIO * len(window):
+        return False
+    if sum(ch.isdigit() for ch in window) > _SALAD_DIGIT_MAX * len(window):
+        return False
+    words = _WORD_RE.findall(window)
+    if len(words) < _SALAD_MIN_WORDS:
+        return False
+    if window.count("\n") * _SALAD_WORDS_PER_NEWLINE > len(words):
+        return False
+    stop = sum(1 for w in words if w.lower() in _STOPWORDS)
+    return stop / len(words) < _SALAD_STOPWORD_MAX
+
+
+def _word_salad(text: str, window: int = _WINDOW) -> bool:
+    """Real-looking words with no function words (LONGGENBENCH-RESULTS-2026-09
+    §4.1 item 5, 294-s2).
+
+    Function words alone cannot tell salad from telegraphic text: a menu
+    written as ``fresh strawberries kiwi blueberries`` has 2 % of them, like
+    the salad. So this is deliberately narrow: **two** consecutive windows
+    must both be long, letters-only (no digits, colons or symbols),
+    newline-poor and nearly free of function words. Code, tables, numbered
+    lists, dates and short quoted drafts never qualify. Heuristic, tuned on
+    this repo's text rather than on a captured salad sample."""
+    if len(text) < 2 * _SALAD_MIN_CHARS:
+        return False
+    tail = text[-2 * window:]
+    half = len(tail) // 2
+    return _word_salad_window(tail[:half]) and _word_salad_window(tail[half:])
+
+
 def _unique_shingle_ratio(window: str) -> float:
     shingles = [window[i:i + _SHINGLE] for i in range(0, len(window) - _SHINGLE, _SHINGLE_STEP)]
     if not shingles:
@@ -107,6 +165,8 @@ def degeneration_reason(text: str, *, window: int = _WINDOW) -> str | None:
         return "script_soup"
     if len(tail) >= _REPEAT_MIN_CHARS and _unique_shingle_ratio(tail) < _REPEAT_UNIQUE_MAX:
         return "repetition_loop"
+    if _word_salad(text, window):
+        return "word_salad"
     return None
 
 
@@ -129,7 +189,7 @@ class DegenerationMonitor:
     def feed(self, chunk: str) -> str | None:
         if self.reason is not None or not chunk:
             return None
-        self._buf = (self._buf + chunk)[-self.window:]
+        self._buf = (self._buf + chunk)[-2 * self.window:]
         self._since_check += len(chunk)
         if self._since_check < self.check_every:
             return None

@@ -874,7 +874,7 @@ async def run_round_loop(
             # §11.10.5 in-place retry, unchanged except that it no longer
             # waits for the rest of the wave.
             while node.status == "pending" and node.attempts < max_attempts:
-                if getattr(node, "non_attempts", 0) >= int(os.getenv("KUSUDAEMON_MAX_NON_ATTEMPTS", "6")):
+                if non_attempt_cap_reached(node):
                     break
                 if is_node_bypassed(run_dir, node.id, "review") or is_node_bypassed(run_dir, node.id):
                     node.status = "awaiting_review"
@@ -1678,6 +1678,35 @@ def _writer_stall_nudge(
     )
 
 
+def non_attempt_cap_reached(node: TaskNode, now: float | None = None) -> bool:
+    """LONGGENBENCH-RESULTS-2026-09 §4.1 item 2: when a streak of throttled /
+    transport episodes blocks a node.
+
+    The cap used to be count-only (``KUSUDAEMON_MAX_NON_ATTEMPTS``, 6), so a
+    provider that throttled six times in a row blocked a node with ~3500 s of
+    wall clock left (294-s3). It now needs the count *and* a streak at least
+    ``KUSUDAEMON_NON_ATTEMPT_WINDOW_S`` (default 1800 s) old, with a hard
+    ceiling of ten times the count so a tight failure loop still ends. A
+    streak with no recorded start (a tree written before the field existed, or
+    a hand-built node) is treated as old enough, which keeps the count-based
+    behaviour for those.
+    """
+    count = int(getattr(node, "non_attempts", 0) or 0)
+    cap = int(os.getenv("KUSUDAEMON_MAX_NON_ATTEMPTS", "6"))
+    if count < cap:
+        return False
+    if count >= cap * 10:
+        return True
+    try:
+        window = float(os.getenv("KUSUDAEMON_NON_ATTEMPT_WINDOW_S", "1800"))
+    except ValueError:
+        window = 1800.0
+    since = float(getattr(node, "non_attempt_since", 0.0) or 0.0)
+    if window <= 0 or not since:
+        return True
+    return ((time.time() if now is None else now) - since) >= window
+
+
 async def _transition_after_writer(
     node: TaskNode,
     tree: TaskTree,
@@ -1698,6 +1727,11 @@ async def _transition_after_writer(
     # Nudges count consecutive stalls; every other outcome ends the streak.
     prior_nudges = getattr(node, "nudges", 0)
     node.nudges = 0
+    # §4.1 item 2: a streak of throttled/transport non-attempts ends with any
+    # episode that reached the provider and came back with something else.
+    if result_status not in ("throttled", "transport"):
+        node.non_attempts = 0
+        node.non_attempt_since = 0.0
 
     # PLAN-TOKEN-ACCOUNTING.md §O7 & §L4: artifact shrink check and accidental loss recovery
     # PLAN-SWEEP-REPAIR.md §B2/B4 option (a): current text resolves via
@@ -1791,8 +1825,11 @@ async def _transition_after_writer(
     # declared unit count is met and every hard gate passes, the work is done:
     # send it to review like any other finished episode.
     units_exp = node.budget.units_expected if node.budget else None
+    # §4.1 item 2: the same holds after a throttled or transport episode — the
+    # document is complete, so it must not be re-dispatched into the 429s
+    # (294-s2 had all 52 weeks on disk when it blocked).
     timeout_salvaged = (
-        result_status == "timeout"
+        result_status in ("timeout", "throttled", "transport")
         and not regressed_accidental
         and gates_passed
         and bool(units_exp)
@@ -1814,6 +1851,7 @@ async def _transition_after_writer(
 
     if (episode_ok or timeout_salvaged) and (gates_passed or bypassed):
         node.non_attempts = 0
+        node.non_attempt_since = 0.0
         node.status = "awaiting_review"
         node.last_defect = ""
         if timeout_salvaged:
@@ -1821,10 +1859,12 @@ async def _transition_after_writer(
                 {
                     "node_id": node.id,
                     "role": "harness",
-                    "round": 0,
-                    "type": "node_timeout_salvaged",
+                    # The timeout event keeps its original name; the new
+                    # throttled/transport cases are told apart by `episode_status`.
+                    "type": "node_timeout_salvaged" if result_status == "timeout" else "node_episode_salvaged",
+                    "episode_status": result_status,
                     "detail": (
-                        f"episode timed out with {current_units} of {units_exp} units "
+                        f"episode ended ({result_status}) with {current_units} of {units_exp} units "
                         "written and all gates passing; proceeding to review"
                     ),
                 }
@@ -1841,9 +1881,17 @@ async def _transition_after_writer(
                 }
             )
     elif result_status in ("throttled", "transport"):
+        # §4.1 item 2: an episode that added units is progress — the provider
+        # is letting work through — so it starts a new streak rather than
+        # extending the old one.
+        if current_units > prior_units:
+            node.non_attempts = 0
+            node.non_attempt_since = 0.0
+        if not getattr(node, "non_attempts", 0):
+            node.non_attempt_since = time.time()
         node.non_attempts = getattr(node, "non_attempts", 0) + 1
         max_non_attempts = int(os.getenv("KUSUDAEMON_MAX_NON_ATTEMPTS", "6"))
-        if node.non_attempts >= max_non_attempts:
+        if non_attempt_cap_reached(node):
             node.status = "blocked"
             node.last_defect = f"provider unavailable: hit {node.non_attempts} consecutive non-attempts ({result_status})"
             log.append(
@@ -1873,6 +1921,7 @@ async def _transition_after_writer(
             )
     elif restored_complete:
         node.non_attempts = 0
+        node.non_attempt_since = 0.0
         node.status = "awaiting_review"
         node.last_defect = ""
         log.append(

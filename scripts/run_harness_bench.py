@@ -354,7 +354,9 @@ def run_one(
             or f"harnessbench produced no result JSON (exit {proc.returncode}): "
                f"{proc.stderr.strip()[-300:] or proc.stdout.strip()[-300:]}"
         )
-    halt_category = classify_halt(record.get("halt_reason"))
+    # A "no detail" halt with an incomplete result is an agent failure, not a
+    # missing signal (results doc 4.1 item 3): pass the score as a percentage.
+    halt_category = classify_halt(record.get("halt_reason"), _score_pct(record))
     # PLAN-SWEEP-REPAIR.md §C2: "unknown" quarantined like transport/budget.
     is_valid = halt_category not in ("transport", "budget", "unknown")
     record["valid"] = is_valid
@@ -365,6 +367,12 @@ def run_one(
 # --------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------
+
+
+def _score_pct(rec: dict[str, Any]) -> float | None:
+    """The record's score as a percentage, for classify_halt(completion_pct=...)."""
+    score = rec.get("score")
+    return float(score) * 100.0 if isinstance(score, (int, float)) else None
 
 
 def _total_tokens(rec: dict[str, Any]) -> int:
@@ -388,7 +396,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         total_runs = len(recs)
         valid_recs = [
             r for r in recs
-            if r.get("valid", True) and classify_halt(r.get("halt_reason")) not in ("transport", "budget", "unknown")
+            if r.get("valid", True) and classify_halt(r.get("halt_reason"), _score_pct(r)) not in ("transport", "budget", "unknown")
         ]
         invalid_recs = [r for r in recs if r not in valid_recs]
         n = len(valid_recs)
@@ -400,7 +408,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 
         excluded_by_reason: dict[str, int] = {}
         for r in invalid_recs:
-            reason = r.get("invalid_reason") or classify_halt(r.get("halt_reason"))
+            reason = r.get("invalid_reason") or classify_halt(r.get("halt_reason"), _score_pct(r))
             excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
 
         arm_stats: dict[str, Any] = {

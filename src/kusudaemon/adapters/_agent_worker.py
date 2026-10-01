@@ -92,6 +92,10 @@ except Exception:  # noqa: BLE001
 # Prefix of the error a degeneration kill reports; cli_agent.classify_cli_failure
 # matches it to make the episode a non-attempt.
 DEGENERATE_ERROR_PREFIX = "degenerate model output"
+# LONGGENBENCH-RESULTS-2026-09 §4.1 item 10: NIM sometimes streams nothing for
+# ~600 s on a first turn and then returns HTTP 500. An opt-in watchdog
+# (``KUSUDAEMON_FIRST_OUTPUT_TIMEOUT_S``, 0 = off) ends such an episode early.
+FIRST_OUTPUT_ERROR_PREFIX = "no first output"
 
 CLAUDE = "claude"
 CODEX = "codex"
@@ -886,12 +890,43 @@ class _OutputGuard:
         return reason
 
 
+def _first_output_timeout_s() -> float:
+    try:
+        return max(0.0, float(os.getenv("KUSUDAEMON_FIRST_OUTPUT_TIMEOUT_S", "0")))
+    except ValueError:
+        return 0.0
+
+
+async def _first_output_watchdog(
+    proc: asyncio.subprocess.Process,
+    first_output: asyncio.Event,
+    fatal_event: asyncio.Event,
+    fatal_holder: dict[str, str],
+    timeout_s: float,
+) -> None:
+    """End the episode when the CLI has produced no model output (anything but
+    its bootstrap ``logdir`` line) within ``timeout_s``. Off unless
+    ``KUSUDAEMON_FIRST_OUTPUT_TIMEOUT_S`` > 0: OpenCode records a reasoning
+    part only when it finishes, so a long, healthy first turn is silent too;
+    pick a value comfortably above the longest first turn you expect."""
+    try:
+        await asyncio.wait_for(first_output.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        if proc.returncode is None and not fatal_event.is_set():
+            fatal_holder["error"] = (
+                f"{FIRST_OUTPUT_ERROR_PREFIX} within {timeout_s:.0f}s (provider stall)"
+            )
+            fatal_event.set()
+            _terminate_proc_group(proc)
+
+
 async def _pump(
     proc: asyncio.subprocess.Process,
     fmt: str,
     session_dir: str,
     fatal_event: asyncio.Event | None = None,
     fatal_holder: dict[str, str] | None = None,
+    first_output: asyncio.Event | None = None,
 ) -> None:
     # §D13: opencode's CLI emits one step-start per agent step, each
     # translated into a logdir line — without dedupe, a single episode's
@@ -930,6 +965,8 @@ async def _pump(
                         if key in emitted_sessions:
                             continue
                         emitted_sessions.add(key)
+                    if first_output is not None and rec.get("type") not in ("logdir", "heartbeat"):
+                        first_output.set()
                     if "ts" not in rec and "timestamp" not in rec and "time" not in rec and "created_at" not in rec:
                         rec["ts"] = time.time()
                         emitted = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
@@ -1120,7 +1157,14 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
     fatal_event = asyncio.Event()
     fatal_holder: dict[str, str] = {}
 
-    pump_task = asyncio.ensure_future(_pump(proc, fmt, session_dir, fatal_event, fatal_holder))
+    first_output = asyncio.Event()
+    pump_task = asyncio.ensure_future(_pump(proc, fmt, session_dir, fatal_event, fatal_holder, first_output))
+    watchdog_task = None
+    first_timeout = _first_output_timeout_s()
+    if first_timeout > 0:
+        watchdog_task = asyncio.ensure_future(
+            _first_output_watchdog(proc, first_output, fatal_event, fatal_holder, first_timeout)
+        )
     stderr_task = None
     log_watch_task = None
     killer_task = asyncio.ensure_future(_fatal_killer(proc, fatal_event))
@@ -1150,6 +1194,8 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
             log_watch_task.cancel()
         if killer_task:
             killer_task.cancel()
+        if watchdog_task:
+            watchdog_task.cancel()
         err = fatal_holder.get("error") or "opencode fatal stream error"
         print(json.dumps({"type": "message", "role": "system", "content": f"Error: {err}"}), flush=True)
         # cli_agent reports stderr as the episode's error.
@@ -1166,6 +1212,8 @@ async def _run(fmt: str, command: list[str], session_dir: str) -> int:
         log_watch_task.cancel()
     if killer_task:
         killer_task.cancel()
+    if watchdog_task:
+        watchdog_task.cancel()
     return proc.returncode or 0
 
 

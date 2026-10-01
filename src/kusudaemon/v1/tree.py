@@ -107,6 +107,9 @@ class TaskNode:
     status: NodeStatus = "pending"
     attempts: int = 0
     non_attempts: int = 0
+    # Wall-clock time (epoch s) the current non-attempt streak began, 0.0 when
+    # there is no streak (or the tree predates the field).
+    non_attempt_since: float = 0.0
     # 2026-09-27: consecutive same-session nudges since the last other
     # outcome (v1/round_loop.py::_writer_stall_nudge). Not an attempt count.
     nudges: int = 0
@@ -163,6 +166,7 @@ class TaskNode:
             status=data.get("status", "pending"),
             attempts=int(data.get("attempts", 0)),
             non_attempts=int(data.get("non_attempts", 0)),
+            non_attempt_since=float(data.get("non_attempt_since", 0.0) or 0.0),
             nudges=int(data.get("nudges", 0)),
             last_defect=str(data.get("last_defect", "")),
             parent=str(data.get("parent", "")),

@@ -152,9 +152,22 @@ def score_file(path: Path, judge: Judge | None, *, max_checks: int | None) -> di
             p, _ids = create_prompts(entry.get(f"checks_{kind}", {}) or {}, found)
             prompts_by_kind[kind].extend(p)
 
+    # A prediction file built from unreadable artifacts (dead VM paths, a
+    # swallowed OSError) holds a handful of characters per task; scoring it
+    # silently reads as "the model wrote nothing". Name those entries.
+    near_empty = [t["task_id"] for t in per_task if int(t.get("word_count") or 0) < 20]
+    if near_empty:
+        print(
+            f"[WARNING] {path.name}: {len(near_empty)} prediction(s) hold fewer than 20 words "
+            f"({', '.join(str(x) for x in near_empty[:6])}{' ...' if len(near_empty) > 6 else ''}); "
+            "if the artifact exists in raw/, regenerate predictions (scripts/longgen_recompute.py).",
+            file=sys.stderr,
+        )
+
     result: dict[str, Any] = {
         "file": str(path),
         "tasks": len(entries),
+        "near_empty_predictions": near_empty,
         "completion_rate": round(completion_total / len(entries), 3) if entries else 0.0,
         "mean_word_count": (
             round(sum(t["word_count"] for t in per_task) / len(per_task), 1) if per_task else 0.0

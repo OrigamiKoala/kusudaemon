@@ -70,22 +70,61 @@ def calculate_completion_rate(type_to_block: dict[int, str], total_number: int) 
     return (len(expected) - len(expected - identifiers)) / len(expected) * 100.0
 
 
+def _squash_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _is_prompt_echo(before_marker: str, prompt: str) -> bool:
+    """Is the text before a ``*** started ***`` marker an echoed prompt?
+
+    Some backends print the instruction before answering; that is prompt, not
+    generation, and must not be scored. But a model can also emit the marker
+    *between* units (247-menu-week armC seed2 wrote ``*** started ***`` after
+    every week), and a blind "cut everything up to the first marker" then
+    deletes real units: Week 1 vanished and was only "rescued" by the prefix
+    prepend below. The text before the marker is an echo only when its opening
+    occurs in the prompt itself. With no prompt on the item (hand-built items,
+    older callers) there is nothing to compare against, so the historical
+    behaviour (always treat it as an echo) stands.
+    """
+    head = _squash_ws(before_marker)
+    if not head or not prompt:
+        return True
+    return _squash_ws(head[:80]) in _squash_ws(prompt)
+
+
 def to_output_blocks(raw_text: str, item: dict[str, Any]) -> list[str]:
     """Turn one generation into upstream's ``output_blocks``.
 
     Deviation from ``Evalution/inference.py``, applied identically to every
     arm: upstream unconditionally prepends ``item['prefix']`` because its
-    prompts end mid-document ("*** started ***\\n#*# Week 1 (...):") and a
+    prompts end mid-document ("*** started ***\n#*# Week 1 (...):") and a
     base model *continues* them. A chat/agent backend restates the heading
     instead, so an unconditional prepend would duplicate block 1 and an
-    unconditional skip would lose it. Prepend only when block 1 is absent.
+    unconditional skip would lose it. The prefix is therefore prepended only
+    when block 1 is absent AND the generation has something standing in
+    block 1's place, i.e. a non-empty lead segment before the first ``#*#``
+    separator (a continuation of the prompt's block 1: the body of a unit whose
+    heading the model did not restate).
+
+    It is never prepended to an empty output or to unstructured narration, and
+    never to a document that simply starts at a later unit ("#*# Week 22 ...":
+    block 1 is truly absent, so it is not credited). Before 2026-09-30 the
+    prefix was prepended whenever block 1 was missing, so an empty output
+    scored ``1 / N`` (1-2 %, a free block) and "Let me analyze this task" scored
+    the same as a real first unit.
     """
     text = strip_ansi(raw_text or "").strip()
 
     # Some backends echo the instruction before answering; everything up to
-    # and including the '*** started ***' marker is prompt, not generation.
+    # and including the '*** started ***' marker is prompt, not generation
+    # (see ``_is_prompt_echo`` for when a marker is NOT an echo).
     started = STARTED_RE.match(text)
-    if started and started.end() < len(text):
+    if (
+        started
+        and started.end() < len(text)
+        and _is_prompt_echo(text[: started.end()], str(item.get("prompt") or ""))
+    ):
         text = text[started.end():].lstrip()
 
     # The trailing sentinel is a stop marker, never part of a block.
@@ -119,7 +158,8 @@ def to_output_blocks(raw_text: str, item: dict[str, Any]) -> list[str]:
     type_ = str(item.get("type") or "")
     if type_ and 1 not in parse_blocks(blocks, type_):
         prefix = str(item.get("prefix") or "")
-        if prefix:
+        lead = blocks[0].strip() if blocks else ""
+        if prefix and len(blocks) > 1 and lead:
             text = prefix + "\n" + text
             blocks = text.split(BLOCK_SEP)
     return blocks

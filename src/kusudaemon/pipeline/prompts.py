@@ -197,6 +197,58 @@ def _leaf_scope_block(node: TaskNode) -> str:
     )
 
 
+def _single_writer_clause(node: TaskNode, absolute_path: Path) -> str:
+    """LONGGENBENCH-RESULTS-2026-09 §4.1 item 5: rules for the T0/T1 writer,
+    whose whole document is one file written by one session.
+
+    - A non-empty file must never be hit with a whole-file ``write`` (247-s3:
+      one ``write`` per week, so only week 52 survived).
+    - Units go in small appended batches; a turn spent drafting the document
+      in reasoning before the first write is how 294-s1/s2 ran out of clock
+      with nothing on disk.
+    - Per-unit size ceiling derived from the node's own ``max_tokens`` gate and
+      declared unit count (177-s3 wrote about 10 KB per floor, so only 54
+      floors fit under the gate).
+    Empty for any other node.
+    """
+    from ..v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID
+
+    if node.id not in (SINGLE_NODE_ID, DIRECT_NODE_ID):
+        return ""
+    parts: list[str] = []
+    try:
+        existing = absolute_path.stat().st_size if absolute_path.is_file() else 0
+    except OSError:
+        existing = 0
+    if existing > 0:
+        parts.append(
+            f"`{absolute_path}` already holds {existing} bytes of finished work. Do not use "
+            "your `write` tool on it: a whole-file write replaces everything in it. Add to it "
+            f"with `cat >> {absolute_path} <<'EOF'` (a shell heredoc append) or make a targeted edit.\n"
+        )
+    parts.append(
+        "Work in small batches: at most 3 to 5 units per tool call, each appended to the file "
+        "(`cat >> <file> <<'EOF'`), and never re-emitting what is already there. Start writing "
+        "units right away instead of drafting the whole document in your reasoning first.\n"
+    )
+    units = node.budget.units_expected if node.budget else None
+    limit = None
+    for gate in node.gates:
+        m = re.fullmatch(r"max_tokens:(\d+)", gate)
+        if m:
+            limit = int(m.group(1))
+    if units and units >= 2 and limit:
+        per_tokens = max(1, int(limit * 0.9 / units))
+        parts.append(
+            f"Size: the whole artifact must stay under {limit} tokens (a hard gate) and has "
+            f"{units} units, so each unit should be about {per_tokens} tokens "
+            f"(~{int(per_tokens * 0.75)} words) and never more than about "
+            f"{int(per_tokens * 1.5)} tokens. A document that runs out of room before its "
+            "last unit fails; a unit that is a little short does not.\n"
+        )
+    return "".join(parts)
+
+
 def _artifact_instruction(
     node: TaskNode,
     run_dir: Path,
@@ -355,6 +407,7 @@ def _artifact_instruction(
                 "once and never rewritten, so no single write can carry more than "
                 "one part's worth of content.\n"
                 + length_clause
+                + _single_writer_clause(node, absolute_path)
                 + ascii_clause
             )
     if "refs_resolve" in node.gates or "refs_resolve" in node.warn_gates:

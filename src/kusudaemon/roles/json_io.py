@@ -84,6 +84,39 @@ def _looks_like_estimate(cand: dict[str, Any], props: dict[str, Any]) -> bool:
     return bool(_ESTIMATE_KEYS.intersection(cand) & set(props))
 
 
+def _repair_action_object(cand: Any, schema: dict[str, Any]) -> Any:
+    """Minimal repair for an ``{"action": ...}`` object: infer a missing
+    ``action`` from the keys present, normalise verdict items, drop unknown
+    keys when the schema forbids them. Never replaces the object."""
+    if isinstance(cand, list):
+        cand = {"action": "verdict", "items": cand}
+    if not isinstance(cand, dict):
+        return cand
+    props = schema.get("properties", {})
+    allowed = (props.get("action") or {}).get("enum") or []
+    cand = dict(cand)
+    if cand.get("action") not in allowed:
+        if cand.get("unit") is not None or cand.get("units"):
+            cand["action"] = "read"
+        elif cand.get("verdict") in ("pass", "fail") or isinstance(cand.get("items"), list):
+            cand["action"] = "verdict"
+    if cand.get("action") == "verdict" and isinstance(cand.get("items"), list):
+        sub = {
+            "required": ["items", "verdict"],
+            "properties": {"items": props.get("items", {}), "verdict": props.get("verdict", {})},
+        }
+        fixed = _repair_common_schema_omissions(
+            {"items": cand["items"], "verdict": cand.get("verdict")}, sub
+        )
+        if isinstance(fixed, dict):
+            cand["items"] = fixed.get("items", cand["items"])
+            if cand.get("verdict") not in ("pass", "fail"):
+                cand["verdict"] = fixed.get("verdict")
+    if schema.get("additionalProperties") is False:
+        cand = {k: v for k, v in cand.items() if k in props}
+    return cand
+
+
 def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = None) -> Any:
     """Auto-repair obvious schema omissions like missing 'pass' boolean on defect items, single item review dicts, missing verdict, extra keys."""
     if schema is None or not isinstance(schema, dict):
@@ -91,6 +124,15 @@ def _repair_common_schema_omissions(cand: Any, schema: dict[str, Any] | None = N
 
     req = set(schema.get("required", []))
     props = schema.get("properties", {})
+
+    # Case: an action schema (the review read loop's READ_LOOP_ACTION_SCHEMA).
+    # It also carries ``items`` and ``verdict``, so it used to fall into the
+    # REVIEW_SCHEMA branch below, which answers any dict without ``items`` with
+    # ``{"items": [], "verdict": "pass"}`` — wiping every ``{"action": "read",
+    # "unit": N}`` turn and producing "$.action: missing required property"
+    # (LONGGENBENCH-RESULTS-2026-09 §4.1 item 4, 13 final-era T1 cells).
+    if "action" in props and "action" in req:
+        return _repair_action_object(cand, schema)
 
     # Case: schema expects {"items": [...], "verdict": ...} (REVIEW_SCHEMA / DOC_REVIEW_SCHEMA)
     if {"items", "verdict"}.issubset(req) or ("items" in props and "verdict" in props):

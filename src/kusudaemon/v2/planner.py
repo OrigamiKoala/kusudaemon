@@ -613,6 +613,13 @@ def build_tree(
             if reason == slice_units[0].label
             else f"Produce the artifact for {slice_units[0].label} ({reason})."
         )
+        # LONGGENBENCH-RESULTS-2026-09 §4.1 item 11: when the plan collapses to
+        # one leaf covering the whole spine (a goal with no countable unit),
+        # that leaf's brief is the only thing the planner hands the writer, and
+        # "Produce the artifact for <label>" says nothing about the goal. Carry
+        # the goal itself, as the T1 direct node does (brief=goal).
+        if goal.strip() and len(slice_units) == spine_size and spine_size <= 1:
+            brief = f"{brief}\n\nGoal:\n{goal.strip()}"
         candidate = Candidate(
             id=node_id,
             brief=brief,
