@@ -3,21 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>Kusudaemon</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='4.5' fill='%23d9b45a'/%3E%3C/svg%3E" />
+  <script>
+    try {
+      var t = localStorage.getItem("kd.theme");
+      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+  <script type="module" crossorigin src="/static/app.js"></script>
+  <link rel="stylesheet" crossorigin href="/static/app.css">
 </head>
 <body>
-  <div id="app">
-    <div class="initial-loader">
-      <div class="spinner"></div>
-      <span>Connecting to kusudaemon…</span>
-    </div>
-  </div>
-  <script src="/static/morphdom.js"></script>
-  <script src="/static/app.js"></script>
+  <div id="app"></div>
 </body>
 </html>
-

@@ -28,6 +28,7 @@ resolves the same file, so no surface owns a run.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -246,6 +247,10 @@ class RunState:
         self._lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._attached: str | None = None
+        # Per-request run scope (``?run=<id>``): lets several browser views
+        # read and steer different runs through one server without fighting
+        # over the single global attachment. Unset = the global attachment.
+        self._scope = threading.local()
         self._hosts: dict[str, threading.Thread] = {}
         # §DASHBOARD-UX: per-job cancel events. A running job's thread may
         # be mid-provider-call (uninterruptible), but the cancel *record*
@@ -564,8 +569,33 @@ class RunState:
 
     @property
     def attached_run_id(self) -> str | None:
+        scoped = getattr(self._scope, "run_id", None)
+        if scoped:
+            return scoped
         with self._lock:
             return self._attached
+
+    def valid_run_id(self, run_id: str) -> bool:
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
+            return False
+        if self.runs_root is None:
+            return False
+        run_dir = (self.runs_root / run_id).resolve()
+        try:
+            run_dir.relative_to(self.runs_root.resolve())
+        except ValueError:
+            return False
+        return (run_dir / "events.jsonl").is_file()
+
+    @contextlib.contextmanager
+    def run_scope(self, run_id: str | None):
+        """Make this thread's ``attached_run_id`` be ``run_id`` for the block."""
+        previous = getattr(self._scope, "run_id", None)
+        self._scope.run_id = run_id or None
+        try:
+            yield
+        finally:
+            self._scope.run_id = previous
 
     def _attached_dir(self) -> Path | None:
         if self.runs_root is None:
@@ -1145,6 +1175,21 @@ class RunState:
             auto_probe_plan=bool(body.get("auto_probe_plan", True)),
             disable_review=bool(body.get("disable_review", body.get("no_review", False))),
         )
+        # Optional budgets and output controls (CLI: --budget-tokens, --output-dir, ...).
+        if body.get("budget_tokens") not in (None, ""):
+            options.max_total_tokens = int(body["budget_tokens"])
+        if body.get("max_cost_usd") not in (None, ""):
+            options.max_cost_usd = float(body["max_cost_usd"])
+        if body.get("output_dir"):
+            options.output_dir = str(body["output_dir"]).strip()
+        if body.get("wall_clock_budget") not in (None, ""):
+            options.wall_clock_budget = float(body["wall_clock_budget"])
+        if body.get("review_sample_rate") not in (None, ""):
+            options.review_sample_rate = float(body["review_sample_rate"])
+        if body.get("max_parallel_probes") not in (None, ""):
+            options.max_parallel_probes = int(body["max_parallel_probes"])
+        if "episode_cache" in body:
+            options.episode_cache = bool(body["episode_cache"])
         return options, workspace_root
 
     def _default_driver(self, run_dir: Path, options: RunOptions) -> RecursiveDriver:

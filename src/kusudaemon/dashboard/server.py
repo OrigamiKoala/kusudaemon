@@ -83,7 +83,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..pipeline.run_dir import looks_like_pdf, read_source_file
-from . import rendering
+from . import extras, rendering
 from .state import RunState
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -623,6 +623,160 @@ def _get_assembly(handler: "DashboardRequestHandler", match: Any, body: dict) ->
     return 200, handler.state.assembly()
 
 
+# ---------------------------------------------------------------------------
+# Read-only git / files / search, CLI jobs, capabilities (additive routes).
+# Every one reads the run selected for this request (``?run=<id>`` or the
+# global attachment) and never changes the shape of an existing route.
+# ---------------------------------------------------------------------------
+def _scoped_root(handler: "DashboardRequestHandler") -> tuple[Path | None, Path | None]:
+    """(run_dir, root) where ``root`` follows ``?root=run|workspace``."""
+    run_dir = handler.state._attached_dir()
+    if run_dir is None:
+        return None, None
+    which = (handler.query.get("root") or ["run"])[0]
+    return run_dir, extras.resolve_root(run_dir, "workspace" if which == "workspace" else "run")
+
+
+@_route("GET", r"^/api/capabilities$")
+def _get_capabilities(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    from .. import __version__
+    from ..pipeline.backends import WRITER_BACKENDS
+
+    run_dir = handler.state._attached_dir()
+    ws = extras.workspace_root(run_dir) if run_dir else None
+    return 200, {
+        "version": __version__,
+        "control_enabled": handler.control_enabled,
+        "max_concurrent_runs": handler.max_concurrent_runs,
+        "backends": list(WRITER_BACKENDS),
+        "tiers": ["T0", "T1", "T2", "T3"],
+        "dispatch_policies": ["orchestrator", "model", "document_order"],
+        "survey_modes": ["auto", "deterministic", "structural", "model"],
+        "git": extras.have_git(),
+        "workspace": str(ws) if ws else None,
+        "runs_root": str(handler.state.runs_root) if handler.state.runs_root else None,
+    }
+
+
+@_route("GET", r"^/api/git/status$")
+def _get_git_status(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir = handler.state._attached_dir()
+    if run_dir is None:
+        return 409, {"error": "no attached run"}
+    ws = extras.workspace_root(run_dir)
+    if ws is None:
+        return 200, {"repo": False, "root": None}
+    return 200, extras.git_status(ws)
+
+
+@_route("GET", r"^/api/git/diff$")
+def _get_git_diff(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir = handler.state._attached_dir()
+    if run_dir is None:
+        return 409, {"error": "no attached run"}
+    ws = extras.workspace_root(run_dir)
+    if ws is None:
+        return 200, {"repo": False, "files": []}
+    q = handler.query
+    return 200, extras.git_diff(
+        ws,
+        path=(q.get("path") or [""])[0],
+        staged=(q.get("staged") or [""])[0] in ("1", "true"),
+        ref=(q.get("ref") or [""])[0],
+    )
+
+
+@_route("GET", r"^/api/git/log$")
+def _get_git_log(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir = handler.state._attached_dir()
+    if run_dir is None:
+        return 409, {"error": "no attached run"}
+    ws = extras.workspace_root(run_dir)
+    if ws is None:
+        return 200, {"commits": []}
+    try:
+        limit = int((handler.query.get("limit") or ["40"])[0])
+    except ValueError:
+        limit = 40
+    return 200, {"commits": extras.git_log(ws, limit)}
+
+
+@_route("GET", r"^/api/files$")
+def _get_files(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir, root = _scoped_root(handler)
+    if root is None:
+        return 404, {"error": "no such root"}
+    listing = extras.list_dir(root, (handler.query.get("path") or [""])[0])
+    return (200, listing) if listing is not None else (404, {"error": "not a directory"})
+
+
+@_route("GET", r"^/api/file$")
+def _get_file(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir, root = _scoped_root(handler)
+    if root is None:
+        return 404, {"error": "no such root"}
+    data = extras.read_file(root, (handler.query.get("path") or [""])[0])
+    return (200, data) if data is not None else (404, {"error": "not a file"})
+
+
+@_route("GET", r"^/api/search$")
+def _get_search(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir, root = _scoped_root(handler)
+    if root is None:
+        return 404, {"error": "no such root"}
+    return 200, extras.search_text(root, (handler.query.get("q") or [""])[0])
+
+
+@_route("GET", r"^/api/cost$")
+def _get_cost(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    run_dir = handler.state._attached_dir()
+    if run_dir is None:
+        return 409, {"error": "no attached run"}
+    return 200, extras.cost_breakdown(run_dir)
+
+
+def _cli_jobs(handler: "DashboardRequestHandler") -> "extras.CliJobs":
+    jobs = getattr(handler.state, "_cli_jobs", None)
+    if jobs is None:
+        jobs = extras.CliJobs(handler.state.runs_root)
+        handler.state._cli_jobs = jobs
+    return jobs
+
+
+@_route("GET", r"^/api/cli$")
+def _get_cli_jobs(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    return 200, {"jobs": _cli_jobs(handler).list()}
+
+
+@_route("POST", r"^/api/cli$")
+def _post_cli_job(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    handler.require_control()
+    command = str(body.get("command", ""))
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    run_id = str(body.get("run_id") or handler.state.attached_run_id or "")
+    try:
+        return 200, _cli_jobs(handler).start(command, args, run_id)
+    except (ValueError, OSError) as exc:
+        return 400, {"error": str(exc)}
+
+
+@_route("GET", r"^/api/cli/([^/]+)$")
+def _get_cli_job(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    try:
+        since = int((handler.query.get("since") or ["0"])[0])
+    except ValueError:
+        since = 0
+    job = _cli_jobs(handler).tail(unquote(match.group(1)), since)
+    return (200, job) if job is not None else (404, {"error": "no such job"})
+
+
+@_route("POST", r"^/api/cli/([^/]+)/cancel$")
+def _post_cli_cancel(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    handler.require_control()
+    ok = _cli_jobs(handler).cancel(unquote(match.group(1)))
+    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "job is not running"})
+
+
 def _read_text_field(raw: Any) -> str:
     """Server-side ``@path`` resolution for the ``goal``/``source`` fields
     of ``POST /api/runs`` — safely resolves file paths without blocking
@@ -728,12 +882,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": "authentication required"})
             return
 
-        if method == "GET" and path == "/api/stream":
-            self._serve_stream()
-            return
-
         if not path.startswith("/api/"):
             self._send_json(404, {"error": "not found"})
+            return
+
+        scoped_run = (self.query.get("run") or [""])[0]
+        if scoped_run and not self.state.valid_run_id(scoped_run):
+            self._send_json(404, {"error": "no such run"})
+            return
+        with self.state.run_scope(scoped_run or None):
+            self._dispatch_scoped(method, path)
+
+    def _dispatch_scoped(self, method: str, path: str) -> None:
+        if method == "GET" and path == "/api/stream":
+            self._serve_stream()
             return
 
         body: dict[str, Any] = {}
@@ -828,6 +990,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
 

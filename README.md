@@ -270,7 +270,7 @@ kusudaemon serve
 ```
 *(Running `kusudaemon` without arguments is shorthand for `kusudaemon serve`.)*
 
-By default, the dashboard starts on `http://localhost:8000`. You can launch a specific run directly or run headless via the CLI:
+By default, the dashboard starts on `http://localhost:8765`. You can launch a specific run directly or run headless via the CLI:
 ```bash
 kusudaemon run --goal "Refactor the auth package" --workspace ./
 ```
@@ -282,149 +282,127 @@ kusudaemon resume <run-id>
 
 ---
 
-### Step 2: The 5 Regions of the Dashboard
+### Step 2: Layout
 
-The dashboard is designed for high-density visibility and minimal context switching across 5 main regions:
+The dashboard is a score-based operator console: a run is read left to right in time, and every part (node) is a line on that score.
 
 ```
-┌─ 1. RAIL ── (Fixed top bar: Tier, Phase, Progress Bar, Elapsed Time, Live Agents, Halt/Resume) ─┐
-├─ 2. NAV ───┬─ 3. STREAM ─────────────────────────┬─ 4. INSPECTOR ──────────────────────────────┤
-│ (Left)     │ (Center Feed)                       │ (Right Panel - 5 Tabs)                      │
-│ Runs       │ Chronological stream of events,     │  ⌗ Tree  ⬡ Node  ⧉ Doc  ⊞ Assembly  ⌸ Term│
-│ Subagents  │ live subagent thinking, tool        │                                             │
-│ Phases     │ output, diffs, & pinned approvals.  │ (Default view: Interactive Task Tree)       │
-├────────────┴─────────────────────────────────────┴─────────────────────────────────────────────┤
-│ 5. COMMAND BAR (Bottom bar: interject to live subagent or type >slash commands)               │
-└────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ RAIL ─────────┬─ CENTER ──────────────────────────────────┬─ INSPECTOR ────────────┐
+│ runs           │ open-run tabs                             │ node  changes artifact │
+│ node tree      │ goal · phases · tier · model · cost · ctl │ files docs cost events │
+│                │ waiting: blocked nodes, jobs, approvals   │ tools                  │
+│                │ SCORE  (node lines, episode bars, marks)  │                        │
+│                │ FEED   (thinking, tool calls, diffs)      │                        │
+│                │ composer (message agent, /commands)       │                        │
+└────────────────┴───────────────────────────────────────────┴────────────────────────┘
 ```
 
-1. **Rail (Top Bar):** Gives you an instant readout of run status, active phase, multi-segment progress bar, live agent count (`●`), blocked task warnings (`⚠`), and a toggle button to pause/resume (`⏸`/`▶`).
-2. **Nav (Left Panel):** Quick navigation between hosted runs, live subagent processes, and execution phases.
-3. **Stream (Center Feed):** Real-time, chronological stream showing agent actions, live `<think>` reasoning tags, tool outputs, and pinned pending approvals.
-4. **Inspector (Right Panel):** Your primary workspace, featuring 5 tabs:
-   - **`⌗ Tree`:** Interactive task tree displaying node hierarchies, shapes, gate pips, attempt counts, and artifact size.
-   - **`⬡ Node`:** Deep dive into a specific node (Chat subagent trace, Brief/Overview, Machine Gate details, Artifact text, Version history, and Diffs).
-   - **`⧉ Doc`:** View frozen project documents (`spec.md`, `contract.md`, `spine.json`, `manifest.jsonl`).
-   - **`⊞ Assembly`:** Post-execution verification checks (`checks.json`), compilation logs, and final document indices.
-   - **`⌸ Terminal`:** Raw `events.jsonl` log stream and equivalent CLI command generator.
-5. **Command Bar (Bottom Bar):** Allows you to send direct interjections to running agents or type slash commands starting with `/` or `>`.
+* **Rail:** every run with live status, token count and a filter; below it the node tree (dotted ids group into folders, status chips filter, gate pips and attempt counts per node).
+* **Run bar:** goal, phase strip, tier (with escalate), backend and model overrides, tokens, elapsed, pause/continue, restart driver, kill.
+* **Waiting tray:** blocked nodes, running background jobs, and pending approvals. Approvals are answered in place (intake questions, pilot editor with live diff, amend triage, redispatch/reopen confirmations).
+* **Score:** one line per node over time. Bars are agent episodes (accent = running, green = done, red = error, hatched = timeout), ticks are events (gate failures, nudges, throttling, review outcomes), the top lane is the pipeline phases. Zoom with the buttons or `Ctrl`/`⌘` + wheel; the accent line is *now*. Click a line to open that node.
+* **Feed:** the selected agent's reasoning, assistant messages, and tool calls with their results. Edit and write calls expand into diffs. A pinned todo list, context-size sparkline and token totals sit in the header; the split icon pins a second agent beside the first. With no node selected it shows the run feed (events and phase reasoning).
+* **Inspector:**
+  - **node** — brief, gates, review rubric, audit, inputs, budget; reopen, redispatch, bypass, message.
+  - **changes** — git status and diffs of the run's workspace (working tree, staged, commits), and every edit the selected node's tool calls made. Unified or split.
+  - **artifact** — rendered or raw, with version history and version diffs.
+  - **files** — browse and search the run directory or the workspace.
+  - **docs** — `spec`, `contract` (with token ceiling), `spine`, `manifest`, `assembly`.
+  - **usage** — token totals, a cumulative token curve, and breakdowns by role, phase, model and node. Prices are not shown: the ledger's `cost_usd` is an estimate from a built-in table, not a billed amount.
+  - **events** — the full `events.jsonl` with type filter and search, plus resolved approvals.
+  - **tools** — the CLI verbs that have no dedicated control (`status`, `resync`, `cache clear`, `eval`, `bench`), run as jobs with live output.
 
 ---
 
 ### Step 3: Steering the Agent & Handling Approvals
 
-When Kusudaemon reaches a point requiring human input, the system prompts you with structured approval cards:
+When Kusudaemon needs a human, the waiting tray opens:
 
-* **The Pilot Editor:** When a pilot subtask finishes, the Inspector switches to a side-by-side diff editor. You can edit the pilot output directly on the right pane and click **Save & Approve Edit**. Kusudaemon diffs your changes to automatically generate and freeze `contract.md`.
-* **Batched Intake Form:** If your goal has ambiguities or potential objections, Intake presents a single batched form with all questions and default assumptions.
-* **Amend Triage:** When amending a contract mid-run, Kusudaemon triages all existing subtasks into `clean`, `patchable`, or `regenerate` buckets before you confirm execution.
-* **Node Interventions:** You can right-click any node in the Task Tree or use the Command Bar to **Reopen** (trigger a repair), **Redispatch** (reset to pending), or **Interject** (send immediate guidance to a live agent).
+* **The Pilot Editor:** edit the pilot artifact; the diff against the frozen original is shown live and becomes contract rules on **save**.
+* **Batched Intake Form:** every ambiguity in one form, with the default assumption as each field's placeholder.
+* **Amend Triage:** subtasks are sorted into `clean`, `patchable` and `regenerate` before you confirm; the counts expand to node lists.
+* **Node Interventions:** reopen (repair), redispatch (reset to pending), bypass (cancel a running process) from the node tab, or type to message a live agent in the composer.
 
 ---
 
 ### Step 4: Command Palette & Slash Commands
 
-Type `/` or `>` in the bottom Command Bar (or press `⌘K` / `Ctrl+K`) to bring up the command palette:
+`⌘K` / `Ctrl+K` opens the palette: commands, nodes and runs in one fuzzy list. Commands that need arguments ask for them step by step, dangerous ones ask to confirm, and any command with a CLI equivalent shows it, ready to copy. The composer accepts the same commands as `/name args`.
 
-| Slash Command | Action |
+| Command | CLI equivalent |
 |---|---|
-| `/help` | Open the interactive command and keymap overlay. |
-| `/new` | Open the new run creation modal. |
-| `/amend <rule>` | Append a new rule to `contract.md` and re-validate past nodes. |
-| `/reopen [node]` | Reopen a completed or failed node for repair. |
-| `/redispatch [node]` | Reset a node back to pending status. |
-| `/model <role> <name>` | Change model routing mid-run (e.g. `/model writer claude-sonnet-5`). |
-| `/backend <gptme\|claude\|codex\|opencode\|default>` | Switch the subagent backend mid-run (takes effect at the next dispatch). |
-| `/escalate` | Escalate the execution tier by +1 (e.g. T2 → T3). |
-| `/halt` / `/resume` | Pause or resume the pipeline execution. |
-| `/approve` / `/deny` | Resolve the current pending approval. |
+| `new` | `kusudaemon run ...` |
+| `resume` | `kusudaemon resume <run>` |
+| `pause` / `continue` | `kusudaemon pause <run>` / clears `halt.flag` |
+| `kill` | `kusudaemon kill <run>` |
+| `escalate` | `kusudaemon escalate <run>` |
+| `tier T0..T3` | `kusudaemon tier <run> T2` |
+| `model <name\|default>` | `kusudaemon model <run> <name>` |
+| `backend <name\|default>` | `kusudaemon backend <run> <name>` |
+| `amend <rule>` | `kusudaemon amend <run> --text ...` |
+| `reopen <node> [defect]` | `kusudaemon reopen <run> <node>` |
+| `bypass <node> [process]` | `kusudaemon bypass <run> <node>` |
+| `redispatch <node>`, `say <text>`, `approve`, `delete` | dashboard-side |
+| `status`, `resync <path>`, `cache`, `eval` | `kusudaemon status\|resync\|cache clear\|eval` (as jobs) |
+| `node`, `changes`, `artifact`, `files`, `docs`, `usage`, `events`, `tools`, `both`, `score`, `feed`, `rail`, `inspector`, `theme` | view only |
 
 ---
 
 ### Step 5: Keyboard Navigation Reference
 
-You can control almost the entire dashboard using keyboard shortcuts:
-
 | Shortcut | Action |
 |---|---|
-| `⌘K` or `Ctrl+K` | Open Command Palette. |
-| `/` or `⌘L` | Focus the bottom Command Bar. |
-| `j` / `k` | Move up / down in the Task Tree. |
-| `h` / `l` | Collapse / expand a tree folder row. |
-| `Enter` | Open the selected node or run command. |
-| `g t` | Jump to Task Tree tab. |
-| `g p` | Cycle through Document tabs (`spec`, `contract`, etc.). |
-| `g a` | Instantly approve the top pending approval with default option. |
-| `Esc` | Close overlays, modals, or exit command mode. |
+| `⌘K` / `Ctrl+K` | Command palette. |
+| `/` | Focus the composer. |
+| `n` | New run. |
+| `[` / `]` | Previous / next open run. |
+| `j` / `k` | Next / previous node. |
+| `↑` `↓` `←` `→` in the tree | Move, collapse, expand. |
+| `1`–`8` | Inspector tabs. |
+| `s` | Cycle score + feed / score / feed. |
+| `p` | Pause or continue the run. |
+| `⌘\` / `⌘.` | Toggle rail / inspector. |
+| `Esc` | Close the palette or the new-run sheet. |
 
 ---
 
 ## 4. Symbol & Status Reference
 
-### Step 1: Node Status Glyphs
+### Step 1: Node Status Marks
 
-Every subtask node in the Task Tree and Dashboard displays a single status glyph:
+Status is carried by shape as well as colour:
 
-| Glyph | Name | Color / Visual | Description |
-|---|---|---|---|
-| `·` | **Pending** | Dim gray | Subtask is queued and waiting for dependencies to finish. |
-| `○` | **Ready** | Cyan | Dependencies have cleared; subtask is eligible for immediate dispatch. |
-| `◐` | **Dispatched** | Cyan *(Pulsing)* | Subtask Writer subagent is actively executing. |
-| `◑` | **Awaiting Review** | Amber | Writer submitted an artifact; machine gates and reviewer are auditing. |
-| `●` | **Passed** | Green | Artifact cleared all gates and semantic reviews successfully. |
-| `✕` | **Failed** | Red | Subtask failed a gate check; will automatically retry (up to max attempts). |
-| `⊘` | **Blocked** | Red *(Filled)* | Subtask exhausted all retries without passing; requires operator intervention. |
-| `◌` | **Stale** | Amber *(Hollow)* | Subtask was invalidated by a contract amendment and needs re-validation. |
-| `⑂` | **Split** | Purple | Parent subtask overran budget and was dynamically split into child nodes. |
-
----
-
-### Step 2: Execution Phase Glyphs
-
-Displayed in the Top Rail and Nav sidebar to indicate current pipeline phase:
-
-| Glyph | State | Description |
+| Mark | Status | Meaning |
 |---|---|---|
-| `▶` | **In Progress** | Phase is currently executing (slowly pulsing). |
-| `✓` | **Completed** | Phase completed successfully. |
-| `✕` | **Failed** | Phase hit an unrecoverable error. |
-| `⏸` | **Awaiting Approval** | Pipeline is paused waiting for operator input (Intake/Pilot/Triage). |
-| `·` | **Not Started** | Phase is queued for later execution. |
-| `☠` | **Stalled** | Process execution crashed or lost heartbeat; click to resume. |
+| dotted ring | **pending** | Waiting for dependencies. |
+| solid accent, pulsing | **dispatched** | Writer episode running. |
+| half-filled accent | **awaiting review** | Gates and reviewer are auditing. |
+| solid green | **passed** | Cleared every gate and review. |
+| red diamond | **failed** | Failed a gate; retries remain. |
+| amber square | **blocked** | Out of attempts; needs the operator. |
+| dashed ring | **stale / split** | Invalidated by an amendment, or split into children. |
+| solid blue | **waiting** | A pending approval. |
+
+The phase strip uses the same marks: an accent bar is running, green is done, red failed, blue waiting, amber halted, dashed skipped.
 
 ---
 
-### Step 3: Subagent Status & Explorer Glyphs
+### Step 2: Task Shapes
 
-Used in the Nav sidebar and inspector node header to track subagent episodes:
+Nodes are automatically classified by task **shape**; the node tab shows it as a chip:
 
-| Glyph | Role / Status | Description |
+| Chip | Shape | Description |
 |---|---|---|
-| `●` | **Live Dot** | Subagent currently has an active logdir process running. |
-| `◐` | **Running** | Subagent process is executing. |
-| `✓` | **Done** | Subagent finished its episode successfully. |
-| `✕` | **Error** | Subagent episode crashed or threw an exception. |
-| `⏱` | **Timeout** | Subagent exceeded its allotted execution time limit. |
-| `◇` | **Explorer Probe** | Lightweight, read-only structural probe gathering preliminary context. |
+| `prose-dominant` | **Prose** | Text heavy (documentation, essays, user guides). |
+| `derivation-dominant` | **Derivation** | Mathematical, formal logic, or algorithmic step-by-step derivations. |
+| `problem-set-dominant` | **Problem set** | Code tasks, bug fixes, or unit-test driven subtasks. |
+| `reference-dominant` | **Reference** | API reference sheets, glossaries, or index listings. |
 
 ---
 
-### Step 4: Task Shape Tags
+### Step 3: Tier & Escalation Indicators
 
-Nodes are automatically classified by task **shape** to match their domain type:
-
-| Tag | Shape | Description |
-|---|---|---|
-| `pr` | **Prose-Dominant** | Text heavy (documentation, essays, user guides). |
-| `de` | **Derivation-Dominant** | Mathematical, formal logic, or algorithmic step-by-step derivations. |
-| `ps` | **Problem-Set-Dominant** | Code tasks, bug fixes, or unit-test driven subtasks. |
-| `re` | **Reference-Dominant** | API reference sheets, glossaries, or index listings. |
-
----
-
-### Step 5: Tier & Escalation Indicators
-
-The Top Rail displays the execution Tier assigned by the classifier based on task scale:
+The run bar displays the execution Tier assigned by the classifier based on task scale:
 
 | Badge | Tier | Scope & Execution Behavior |
 |---|---|---|
@@ -432,7 +410,7 @@ The Top Rail displays the execution Tier assigned by the classifier based on tas
 | `T1` | **Single Node** | Single node task with basic review. No `plan` phase, so **no decomposition** — and no mid-run split either, since the split handler is only installed at T2 and above. |
 | `T2` | **Shallow Plan** | Multi-node flat plan (2–8 leaves); no pilot. Mid-run splits enabled. |
 | `T3` | **Full Pipeline** | Full recursive decomposition pipeline with pilot, contract freeze, & deep review. |
-| `T2↑T3` | **Escalated** | Tier was automatically promoted mid-run due to measured size overrun. |
+| `T3↑` | **Floored** | A tier override raised the tier. Mid-run escalations are listed in the node tab when no node is selected. |
 
 The classifier reads the *number of output files* a goal implies, not the amount
 of writing it implies, so a goal that produces one large document ("write 100
@@ -443,13 +421,9 @@ Making the classifier read declared output size is tracked in
 
 ---
 
-### Step 6: Machine Gate Pips
+### Step 4: Machine Gate Pips
 
-In the Task Tree view, each node displays a series of small pips representing code-evaluated gates:
-
-* `▪` **Solid Pip:** Machine gate passed (e.g. file exists, non-empty, token budget within limits, linters/compiles clean).
-* `▫` **Hollow Pip:** Machine gate unrun or failed.
-*(Hovering over any pip in the UI reveals the exact gate specification and failure detail.)*
+In the node tree each node shows a row of small squares, one per code-evaluated gate: filled green passed, outlined red failed. The node tab lists every gate with its detail.
 
 ---
 
