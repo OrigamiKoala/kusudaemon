@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "checkJs": false
+  },
+  "exclude": [
+    "node_modules",
+    "frontend/node_modules",
+    "src/kusudaemon/dashboard/static"
+  ]
+}

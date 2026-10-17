@@ -8,6 +8,7 @@ export default defineConfig(({ command }) => ({
   base: command === "build" ? "/static/" : "/",
   plugins: [svelte()],
   build: {
+    target: "es2021",
     outDir: "../src/kusudaemon/dashboard/static",
     emptyOutDir: true,
     sourcemap: false,
